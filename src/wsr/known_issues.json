@@ -1,0 +1,140 @@
+[
+  {
+    "id": "gemma4-repetition-collapse",
+    "title": "Gemma 4 instruct models collapse into tight repetition loops on long enumerations",
+    "model": "gemma[-_ ]?4",
+    "symptoms": [
+      "TAIL_LOOP",
+      "REPETITION",
+      "LOW_ENTROPY"
+    ],
+    "cause": "known_bug",
+    "level": "weight",
+    "fix": "Documented model-level behaviour, reproduced across Ollama, LM Studio, vLLM and Workers AI. Short term: cap enumeration length, use DRY / mild repeat controls. Long term: repetition entry in the surgery playbook.",
+    "source": "https://arxiv.org/abs/2606.13705"
+  },
+  {
+    "id": "gemma4-json-format-loop",
+    "title": "Gemma 4 loops only under format=json / JSON schema on Ollama",
+    "model": "gemma[-_ ]?4",
+    "backend": [
+      "ollama"
+    ],
+    "requires": [
+      "constrained"
+    ],
+    "symptoms": [
+      "TAIL_LOOP",
+      "REPETITION",
+      "LOW_ENTROPY",
+      "INVALID_JSON"
+    ],
+    "cause": "runtime",
+    "fix": "The grammar admits any string content, so degenerate tokens are not rejected. Relax the constraint (validate JSON afterwards) or post-process; penalties do not help.",
+    "source": "https://github.com/ollama/ollama/issues/15502"
+  },
+  {
+    "id": "ollama-runner-ignores-penalties",
+    "title": "Ollama's newer runner ignores repeat / frequency / presence penalties",
+    "model": "gemma[-_ ]?4|qwen3",
+    "backend": [
+      "ollama"
+    ],
+    "requires": [
+      "penalty_set"
+    ],
+    "symptoms": [
+      "TAIL_LOOP",
+      "REPETITION"
+    ],
+    "cause": "runtime",
+    "fix": "The penalty you set has no effect. Use temperature and min_p, keep Ollama updated, or run the model in llama.cpp to apply penalties.",
+    "source": "https://github.com/ollama/ollama/issues/15783"
+  },
+  {
+    "id": "vllm-gemma4-tool-parser-leak",
+    "title": "vLLM Gemma 4 tool-call parser leaks raw tokens into the stream",
+    "model": "gemma[-_ ]?4",
+    "backend": [
+      "vllm"
+    ],
+    "symptoms": [
+      "CONTROL_TOKEN_LEAK",
+      "TOOL_ARGS_UNPARSEABLE",
+      "TOOL_UNKNOWN"
+    ],
+    "cause": "runtime",
+    "fix": "Raw <|\" and \"|> tokens reach the client instead of parsed tool_calls. Upgrade vLLM past the fix or use the non-streaming path.",
+    "source": "https://github.com/vllm-project/vllm/issues/44522"
+  },
+  {
+    "id": "gemma4-early-gguf-template",
+    "title": "Early Gemma 4 GGUF uploads shipped a broken chat template",
+    "model": "gemma[-_ ]?4",
+    "requires": [
+      "gguf"
+    ],
+    "symptoms": [
+      "CONTROL_TOKEN_LEAK",
+      "INVENTED_TURN",
+      "REASONING_LEAK",
+      "EMPTY",
+      "EMPTY_OUTPUT"
+    ],
+    "cause": "config",
+    "fix": "Re-download the corrected GGUF upload (compare with `wsr config --upstream <repo>`).",
+    "source": "https://runaihome.com/blog/local-llm-repeating-gibberish-fix-2026/",
+    "excludes": [
+      "prefill_markup",
+      "reasoning_exhausted",
+      "template_verified"
+    ]
+  },
+  {
+    "id": "vulkan-gggg",
+    "title": "llama.cpp Vulkan backend emits 'GGGG' for some models",
+    "model": "qwen|mistral",
+    "requires": [
+      "vulkan"
+    ],
+    "symptoms": [
+      "SYMBOL_SOUP",
+      "LOW_ENTROPY"
+    ],
+    "cause": "runtime",
+    "fix": "Switch away from Vulkan (CUDA / ROCm / CPU) and compare; it is the backend, not the file.",
+    "source": "https://github.com/ggml-org/llama.cpp/issues/13310"
+  },
+  {
+    "id": "llama3-eot-vs-eos",
+    "title": "Llama 3 ends turns with <|eot_id|> but older configs stop only on <|end_of_text|>",
+    "model": "llama[-_ ]?3",
+    "symptoms": [
+      "INVENTED_TURN",
+      "CONTROL_TOKEN_LEAK",
+      "TAIL_LOOP",
+      "TRUNCATED"
+    ],
+    "cause": "config",
+    "fix": "List both ids in generation_config.json eos_token_id (128001 and 128009) or pass <|eot_id|> as a stop token.",
+    "source": "https://huggingface.co/meta-llama/Meta-Llama-3-70B-Instruct/discussions/2"
+  },
+  {
+    "id": "llama-server-no-penalty-default",
+    "title": "llama-server applies no repeat penalty or DRY by default",
+    "model": ".*",
+    "backend": [
+      "llama-server"
+    ],
+    "requires": [
+      "no_penalty"
+    ],
+    "symptoms": [
+      "TAIL_LOOP",
+      "REPETITION"
+    ],
+    "cause": "sampling",
+    "fix": "Enable DRY explicitly (dry_multiplier 0.8) and a mild repeat penalty (1.05).",
+    "source": "https://runaihome.com/blog/local-llm-repeating-gibberish-fix-2026/"
+  }
+]

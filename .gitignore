@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Model files, run outputs and caches (wsr writes these outside the repo by default)
+*.gguf
+*.safetensors
+*.bin
+*.pt
+agent_state/
+agent_proposals/
+*.heldout_log.jsonl
+
+# Secrets
+.env
+*.key
