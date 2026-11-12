@@ -15,8 +15,28 @@ ModelVet and Raschka's repetition checklist into one layered pipeline, with a ve
 that links symptoms to causes.
 
 **Documentation:** [docs/GUIDE.md](docs/GUIDE.md) covers every command, check, output file and option;
+[docs/RESULTS.md](docs/RESULTS.md) every result measured so far, with its control;
 [docs/LIMITATIONS.md](docs/LIMITATIONS.md) what is not tested or not built; [docs/DESIGN.md](docs/DESIGN.md)
-how each part was built and every measured result.
+how each part was built.
+
+## Results so far
+
+Held-out results from `wsr program`: the original and the fix answer the same held-out items with the same
+seeds, and a fix ships only when the paired gain is above 2 standard errors and every guardrail holds.
+
+| Goal | Model | Fix | Held-out | Verdict |
+|---|---|---|---|---|
+| Blank replies (a neuron planted in real weights) | Qwen2.5-0.5B | zero the neuron wsr found blind | 30% → 85% (z 4.82) | shipped |
+| The same, weights not allowed to change | Qwen2.5-0.5B | clamp steering at the planted layer | 30% → 85% (z 4.82) | steering recommended |
+| Over-refusal of safe prompts (XSTest) | Llama-3.2-1B | three gated neurons, built by the agent | 81.1% → 91.9% (z 2.09), no refusal of a harmful request lost | shipped |
+| Under-refusal of harmful prompts (XSTest) | Qwen2.5-0.5B | a learned low-rank edit, by the agent | 62.5% → 87.5% (z 3.21), safe prompts still answered | shipped |
+| The blank-reply patch on the served GGUF | Llama-3.2-1B | exported to Q8_0 and Q4_K_M | blank replies 53% → 0% on both | survives quantisation |
+| Reasoning loops (MATH-500) | Llama-3.2-1B | none passed (edits, steering, penalties) | — | no candidate: a capability limit |
+
+Every unsafe or overfitted candidate was stopped: an over-refusal fix that dropped refusals of harmful requests,
+an under-refusal steering that fitted the practice set (93.8% there, 71.9% held out), a learned edit that made
+safe prompts refused. Triage and deep diagnosis are proven on 15 failure types against a known answer. All of
+it, with the setups and the failures, is in [docs/RESULTS.md](docs/RESULTS.md).
 
 ## What it does
 
@@ -31,8 +51,8 @@ how each part was built and every measured result.
 | **Shipping** | apply, revert, or export a patch to GGUF through llama.cpp; a patch refuses weights it was not made for |
 | **Around it** | llama-server or batched PyTorch backends, results cached per model, questions before any download or server start |
 
-**Status: beta.** The weight-level stages are tested on models up to 1B parameters
-(Qwen2.5-0.5B, Llama-3.2-1B, Qwen3.5-0.8B) and run on a 4 GB GPU. Triage needs no GPU.
+**Status: beta.** Deep diagnosis is tested on models up to 1.5B parameters, repair and `wsr program`
+up to 1B (Qwen2.5-0.5B and 1.5B, Llama-3.2-1B, Qwen3.5-0.8B), all on a 4 GB GPU. Triage needs no GPU.
 
 ## Install
 

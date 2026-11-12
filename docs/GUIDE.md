@@ -1,8 +1,8 @@
 # wsr guide
 
 Everything wsr can do, how each part decides, and what it writes. The [README](../README.md) is the short
-version; [DESIGN.md](DESIGN.md) records how each part was built and every measured result;
-[LIMITATIONS.md](LIMITATIONS.md) lists what is not tested or not built. The command reference at the end is
+version; [RESULTS.md](RESULTS.md) has every measured result; [DESIGN.md](DESIGN.md) records how each part
+was built; [LIMITATIONS.md](LIMITATIONS.md) lists what is not tested or not built. The command reference at the end is
 generated from the CLI itself.
 
 ## Contents
@@ -38,8 +38,8 @@ generated from the CLI itself.
 | Ship a fix to the file people serve | `wsr patch apply`, `wsr patch export` | a patch from `repair` or `program` |
 | Public datasets, remembered answers, what wsr keeps | `wsr data`, `wsr consent`, `wsr cache` | nothing |
 
-Triage needs no GPU and no dependencies. Everything that touches weights needs the `deep` extra; the
-weight-level stages are tested on models up to 1B parameters and run on a 4 GB GPU.
+Triage needs no GPU and no dependencies. Everything that touches weights needs the `deep` extra; deep
+diagnosis is tested on models up to 1.5B parameters, repair and `wsr program` up to 1B, on a 4 GB GPU.
 
 ## Triage: what failed, and is it the model?
 

@@ -1,13 +1,15 @@
 # Limitations
 
 What wsr does not do, what is not tested, and what is open. Read this before trusting a result on a setup
-that differs from the ones below. Measured results and how each part was built are in [DESIGN.md](DESIGN.md).
+that differs from the ones below. Measured results are in [RESULTS.md](RESULTS.md); how each part was built is
+in [DESIGN.md](DESIGN.md).
 
 ## Scale and models
 
-- **Weight-level stages are tested on models up to 1B parameters:** Qwen2.5-0.5B-Instruct, Llama-3.2-1B-Instruct,
-  Qwen3.5-0.8B, and a tiny random Qwen3.5 for the hybrid linear-attention path. Nothing larger has been
-  verified. On a 4 GB GPU, models above about 1.5B do not fit for editing.
+- **Deep diagnosis is tested on models up to 1.5B parameters, repair and `wsr program` up to 1B:**
+  Qwen2.5-0.5B-Instruct, Qwen2.5-1.5B-Instruct (diagnosis only), Llama-3.2-1B-Instruct, Qwen3.5-0.8B, and a tiny
+  random Qwen3.5 for the hybrid linear-attention path. Nothing larger has been verified. On a 4 GB GPU, models
+  above about 1.5B do not fit for editing.
 - **Gemma and Mistral are untested** at the weight level. Writer shares assume a plain pre-norm residual;
   Gemma's extra norms rescale each write, so they are approximate there.
 - **Surgery removes, suppresses or redirects behaviour the model already has.** It cannot add knowledge or

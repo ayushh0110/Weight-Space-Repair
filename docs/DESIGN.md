@@ -1,8 +1,8 @@
 # wsr design notes and measured results
 
 How each part of wsr was built, why, and what it measured, in the order it was built. For what the tool
-does and how to use it, read [GUIDE.md](GUIDE.md); for what is not tested or not built,
-[LIMITATIONS.md](LIMITATIONS.md).
+does and how to use it, read [GUIDE.md](GUIDE.md); for every result in one place, [RESULTS.md](RESULTS.md);
+for what is not tested or not built, [LIMITATIONS.md](LIMITATIONS.md).
 
 How to read this: sections 1-3 design the triage layer from the tools it draws on; 4 is deep diagnosis;
 5 surgery; 6 the surgery agent; 7 scope; 8-9 goal files, profiles, the judge, `wsr program` and GGUF
