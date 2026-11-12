@@ -92,13 +92,14 @@ def served_original(*, model_dir: Path, consent: Consent, server_bin: Optional[s
     _cover_convert(consent)
     try:
         orig = original_gguf(model_dir, quant, consent=consent, server=server, log=say)
-        srv = ManagedServer(server, orig, ctx_per_slot=max_new * 2 + 2048, parallel=parallel)
+        srv = ManagedServer(server, orig, ctx_per_slot=max_new + 2048, parallel=parallel)
         srv.wait()
     except Exception as e:                              # noqa: BLE001 - optional: fall back to PyTorch
         if required:
             raise
         return None, f"llama-server could not be used ({str(e)[:160]}): profile on PyTorch (batched)"
-    return ServerBackend(srv.url, parallel=parallel, label=f"{orig.name}", owned=srv),         f"profile on llama-server ({orig.name})"
+    return (ServerBackend(srv.url, parallel=parallel, label=f"{orig.name}", owned=srv),
+            f"profile on llama-server ({orig.name})")
 
 
 def choose(kind: str, *, lm, model_dir: Optional[Path], patch, out: Path, consent: Consent, quant: str = "Q8_0",
@@ -136,7 +137,7 @@ def choose(kind: str, *, lm, model_dir: Optional[Path], patch, out: Path, consen
             finally:
                 import shutil
                 shutil.rmtree(pdir, ignore_errors=True)
-            ctx = max_new * 2 + 2048
+            ctx = max_new + 2048
             s1 = ManagedServer(server, orig, ctx_per_slot=ctx, parallel=parallel)
             s1.wait()
             try:

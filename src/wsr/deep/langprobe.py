@@ -19,16 +19,14 @@ dimensions), with leave-one-out accuracy per depth. On a failing prompt it gives
   language at the switch layer, must change the reply's language, and do so
   more than steering along an unrelated language pair (the null).
 
-The calibration is cached per model under ~/.cache/wsr/langprobe/.
+The calibration is cached with the model's other results (wsr/cache.py: keyed by the weights themselves, so an
+edited model is calibrated again; WSR_CACHE=off turns it off).
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -86,7 +84,7 @@ _CROSS_EN = ("Why is the sky blue?", "How do plants grow?", "Why do we need slee
 _ASK_EN = {"fr": "Réponds en anglais : {q}", "de": "Antworte auf Englisch: {q}", "es": "Responde en inglés: {q}",
            "ru": "Ответь по-английски: {q}", "zh": "请用英语回答：{q}", "hi": "अंग्रेज़ी में जवाब दो: {q}"}
 
-CACHE = Path(os.environ.get("WSR_CACHE", Path.home() / ".cache" / "wsr")) / "langprobe"
+CACHE_KIND = "langprobe"
 
 
 def calibration_prompts() -> list[tuple[str, str]]:
@@ -131,24 +129,16 @@ class LangProbe:
         lim = max(1, int(max_frac * (n - 1)))
         return max(range(1, lim + 1), key=lambda i: self.loo_accuracy[i])
 
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"langs": self.langs, "means": self.means, "var": self.var, "loo": self.loo_accuracy,
-                    "temperature": self.temperature,
-                    "counts": self.counts, "n_mismatch": self.n_mismatch, "meta": self.meta}, path)
+    def to_cache(self) -> tuple[dict, dict[str, torch.Tensor]]:
+        """(JSON part, tensors) for wsr/cache.py: plain data and safetensors, nothing that runs code on load."""
+        return ({"langs": self.langs, "loo": self.loo_accuracy, "temperature": self.temperature,
+                 "counts": self.counts, "n_mismatch": self.n_mismatch, "meta": self.meta},
+                {"means": self.means, "var": self.var})
 
     @classmethod
-    def load(cls, path: Path) -> "LangProbe":
-        z = torch.load(path, weights_only=False)
-        return cls(z["langs"], z["means"], z["var"], z["loo"], z["temperature"], z["counts"], z["n_mismatch"],
-                   z.get("meta", {}))
-
-
-def _key(lm: LM) -> str:
-    cfg = json.dumps({k: str(v) for k, v in sorted(lm.cfg.to_dict().items())}, sort_keys=True)
-    w = lm.unembed.weight
-    probe = f"{float(w[0, :8].float().sum()):.6f}{float(w[-1, -8:].float().sum()):.6f}"
-    return hashlib.sha1((cfg + probe + "v4").encode()).hexdigest()[:16]
+    def from_cache(cls, z: dict, tensors: dict[str, torch.Tensor]) -> "LangProbe":
+        return cls(list(z["langs"]), tensors["means"], tensors["var"], list(z["loo"]), list(z["temperature"]),
+                   dict(z["counts"]), int(z["n_mismatch"]), dict(z.get("meta") or {}))
 
 
 def _fit(X: torch.Tensor, y: list[int], k: int, shrink: float = 0.1) -> tuple[torch.Tensor, torch.Tensor]:
@@ -170,9 +160,20 @@ def calibrate(lm: LM, *, max_new: int = 32, cache: bool = True, min_per_class: i
     only: ..." answered in English read as French, p=1.00). Inside the reply the language being
     written is unambiguous. Leave-one-out holds out whole prompts.
     """
-    path = CACHE / f"{lm.name}-{_key(lm)}.pt"
-    if cache and path.exists():
-        return LangProbe.load(path)
+    from .. import cache as C
+
+    dep = {"max_new": max_new, "min_per_class": min_per_class, "in_reply": in_reply, "prompts": 5}
+    # Within a run the probe is asked for twice (the diagnosis, then the playbook): kept on the model object,
+    # for these weights, so a model without a folder (no disk cache) is not calibrated twice either.
+    memo_key = (getattr(lm, "_wver", 0), json.dumps(dep, sort_keys=True))
+    memo = getattr(lm, "_langprobe", None)
+    if cache and memo is not None and memo[0] == memo_key:
+        return memo[1]
+    hit = C.load(lm, CACHE_KIND, dep) if cache else None
+    if hit is not None:
+        probe = LangProbe.from_cache(*hit)
+        lm._langprobe = (memo_key, probe)
+        return probe
     rows: list[tuple[torch.Tensor, str, int, int, bool]] = []      # resid, answered, prompt, k, mismatch
     mismatch = 0
     prompts = calibration_prompts()
@@ -232,7 +233,8 @@ def calibrate(lm: LM, *, max_new: int = 32, cache: bool = True, min_per_class: i
                       {"prompts": len(prompts), "fit_samples": len(fit_rows), "decision_points": len(dec_rows),
                        "mismatch_accuracy": mis_acc, "max_new": max_new, "in_reply": in_reply})
     if cache:
-        probe.save(path)
+        C.save(lm, CACHE_KIND, dep, *probe.to_cache())
+        lm._langprobe = (memo_key, probe)
     return probe
 
 

@@ -33,7 +33,9 @@ FLOAT_TYPES = {"F16": "f16", "BF16": "bf16", "F32": "f32", "Q8_0": "q8_0"}   # t
 
 
 def cache_dir() -> Path:
-    return Path(os.environ.get("WSR_CACHE_DIR") or Path.home() / ".cache" / "wsr")
+    from ..cache import base
+
+    return base()
 
 
 def _has_converter(d: Path) -> bool:
@@ -75,7 +77,8 @@ def fetch_converter(consent: Consent, tag: str) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
         tgz = Path(td) / "src.tar.gz"
-        urllib.request.urlretrieve(url, tgz)
+        with urllib.request.urlopen(url, timeout=120) as r, open(tgz, "wb") as f:
+            shutil.copyfileobj(r, f)
         with tarfile.open(tgz) as tf:
             keep = []
             for m in tf.getmembers():
@@ -87,7 +90,10 @@ def fetch_converter(consent: Consent, tag: str) -> Path:
                         and ".." not in rel and not rel.startswith("/") and (m.isfile() or m.isdir()):
                     m.name = rel
                     keep.append(m)
-            tf.extractall(dest, members=keep)                       # noqa: S202 - members filtered above
+            try:                                                    # members filtered above; "data" refuses
+                tf.extractall(dest, members=keep, filter="data")    # links, devices and paths outside dest too
+            except TypeError:                                       # a Python without extraction filters
+                tf.extractall(dest, members=keep)                   # noqa: S202
     if not _has_converter(dest):
         raise ValueError(f"the llama.cpp {tag} source did not contain the converter where expected")
     return dest
@@ -215,6 +221,11 @@ def export(model_dir: Path, patch_dir: Optional[Path], out: Path, *, quant: str 
     # exactly the original plus the patch.
     if lm is not None and next(lm.model.parameters()).dtype != torch_float32():
         lm = None
+    from .. import resources
+
+    why = resources.check("converting to GGUF", int(1.2 * size))
+    if why:
+        raise ValueError(why)
     ram = _ram_available()
     # The steps run one after another, so the peak is the largest of them, with a 20 % margin: llama.cpp's
     # converter (measured: 0.93x the checkpoint, Llama-3.2-1B), one shard when the files are patched directly,

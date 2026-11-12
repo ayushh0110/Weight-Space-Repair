@@ -146,9 +146,11 @@ def fetch(name: str, consent: Consent, *, required: bool = True) -> Optional[Pat
         raw = Path(hf_hub_download(src.repo, src.file, repo_type="dataset"))
     rows = src.convert(raw)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", encoding="utf-8") as f:
+    tmp = out.with_suffix(".jsonl.tmp")                  # whole or not at all: an interrupted run leaves no half file
+    with open(tmp, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp.replace(out)
     return out
 
 

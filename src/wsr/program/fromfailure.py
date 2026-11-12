@@ -244,7 +244,7 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
             "protocol": {"template_kwargs": protocol.template_kwargs, "sampling": protocol.sampling,
                          "max_new_tokens": protocol.max_new_tokens, "system": protocol.system},
             "practice": "practice/practice.jsonl", "heldout": "heldout/heldout.jsonl", "grader": grader,
-            "guardrails": [{"suite": "wsr_regression"}], "budget": {"passes": 50, "verifications": 10, "usd": 20}}
+            "guardrails": [{"suite": "wsr_regression"}], "budget": {"practice_evals": 10, "verifications": 6, "usd": 5}}
     O.from_dict(goal)
     path = out_dir / "goal.json"
     path.write_text(json.dumps(goal, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")

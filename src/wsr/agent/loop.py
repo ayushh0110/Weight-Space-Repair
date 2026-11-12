@@ -114,7 +114,11 @@ def brief(res: Any, rep: P.Repair, wb: Workbench) -> str:
     lines += ["", f"Playbook verdict: {rep.summary}", f"Its suggested next step: {rep.next_step}", "",
               "## Checks your patch must pass",
               "- target: the original prompt and at least 2/3 of the failing prompts fixed, at least 2/3 of the "
-              "working prompts unchanged",
+              "working prompts unchanged (only prompts whose unedited reference run fails count as failing; "
+              "the original is required only when its own reference run fails)"
+              + (f"; judged at {res.contrast.reference.max_new} new tokens, because the failure starts past the "
+                 "cap in the reference runs" if res.contrast and res.contrast.reference
+                 and res.contrast.reference.extended else ""),
               f"- regression suite ({len(wb.ctx.base.replies)} prompts): no new failures, drift <= "
               f"{wb.ctx.budget.max_delta_nll} nats/token, top-token agreement >= {wb.ctx.budget.min_top1_agreement:.0%},"
               f" every harmful request refused before still refused"
@@ -123,9 +127,27 @@ def brief(res: Any, rep: P.Repair, wb: Workbench) -> str:
               "- fresh prompt variants (held out)" if wb.ctx.mode == "deep" else "",
               "- paired sampled runs" if wb.ctx.sampled else "",
               "", f"## Budget: {wb.budget.verifications} verifications, {wb.budget.screens} screens, "
-              f"{wb.budget.generations} generations, {wb.budget.reads} reads, {wb.budget.computes} computes; "
-              f"an edit may change at most {wb.budget.max_weights_changed:,} weights, rank {wb.budget.max_rank} "
-              f"per tensor, |delta| <= {wb.budget.max_rel_change:g} |W|.", "",
+              f"{wb.budget.generations} generations, {wb.budget.reads} reads, {wb.budget.computes} computes.",
+              ("\n**Weight edits are off for this run (--no-weight-edits).** build_edit and fit_edit are refused; "
+               "the deliverable is a steering (steer_eval) or serving settings (settings_eval). Use reads, "
+               "directions, attribution and generate to find what to steer with." if not wb.budget.weight_edits
+               else None),
+              "", "## Build checks (build_edit refuses an edit that fails one; they only bound the edit - whether it "
+              "is kept is decided by the checks above and, in a program, the held-out judge)",
+              f"- size: at most {wb.budget.max_free_params:,} free parameters (rank x (rows + columns) per tensor, "
+              "summed over tensors); a rank-1 projection out of every layer is well inside it",
+              f"- per tensor: rank <= {wb.budget.max_rank}, |delta| <= {wb.budget.max_rel_change:g} |W|, and not a "
+              "plain rescale of the whole tensor",
+              "- free-form deltas cannot touch the input embedding, output layer or final norm (request_capability "
+              "asks the user to unlock them); orthogonalise edits the embedding unless \"embed\": false",
+              f"- gate: must fire on at least half of the failing positions and on at most "
+              f"{wb.budget.gate_max_off:.0%} of the positions that must stay unchanged",
+              f"- fit_edit: up to {wb.budget.fits} fits, rank <= {wb.budget.max_fit_rank}, <= "
+              f"{wb.budget.max_fit_steps} steps and {wb.budget.fit_seconds:g} s each; the fitted change passes the same "
+              "checks as any edit",
+              f"- alpha, scale and strength: |value| <= {wb.budget.max_alpha:g}; combine refuses parts that both "
+              "overwrite the same weights (two gates at one layer take the same quiet neuron)"
+              + (f"\n- unlocked by the user: {', '.join(wb.budget.allow)}" if wb.budget.allow else ""), "",
               "Start with list_examples, then form a hypothesis about the mechanism."]
     return "\n".join(x for x in lines if x is not None)
 
@@ -283,7 +305,11 @@ def run(lm: Any, res: Any, rep: P.Repair, provider: Provider, *, budget: Optiona
             out_s, err = wb.call(call.name, call.input)
             results.append({"type": "tool_result", "tool_use_id": call.id, "content": out_s,
                             **({"is_error": True} if err else {})})
-            transcript.append({"role": "tool", "name": call.name, "input": call.input, "result": json.loads(out_s),
+            try:
+                shown = json.loads(out_s)
+            except json.JSONDecodeError:                  # a tool added by a program that returned plain text
+                shown = out_s
+            transcript.append({"role": "tool", "name": call.name, "input": call.input, "result": shown,
                                "is_error": err})
         if results:
             # The budget rides on the last result: the agent sees what is left and when to wrap up.
@@ -298,7 +324,8 @@ def run(lm: Any, res: Any, rep: P.Repair, provider: Provider, *, budget: Optiona
         checkpoint("running")
         if wb.done:
             stop_why = ("submitted" if "submit" in wb.done else "final choice" if "final" in wb.done
-                        else "gave up")
+                        else "final choice (settings)" if "final_settings" in wb.done
+                        else "final choice (steering)" if "final_steering" in wb.done else "gave up")
             break
         if cost >= limits.max_cost_usd:
             stop_why = f"spend cap ${limits.max_cost_usd:.2f} reached"
@@ -323,7 +350,7 @@ def run(lm: Any, res: Any, rep: P.Repair, provider: Provider, *, budget: Optiona
         out.mkdir(parents=True, exist_ok=True)
         checkpoint(stop_why)
         for pid, patch in wb.proposals.items():          # unverified: for the user to check, never applied
-            patch.save(out / "agent_proposals" / pid)
+            patch.save(out / "agent_proposals" / pid, lm)
         if wb.requests:
             (out / "capability_requests.json").write_text(json.dumps(wb.requests, indent=1, ensure_ascii=False),
                                                           encoding="utf-8")

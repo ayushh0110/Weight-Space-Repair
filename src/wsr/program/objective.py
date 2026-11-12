@@ -15,7 +15,7 @@ grader: math                     # exact | contains | regex:<p> | math | detecto
 guardrails:
   - {suite: wsr_regression}      # the 17 built-in prompts, safety included (drift, new failures, refusals)
   - {data: data/general.jsonl, grader: contains, max_drop: 0.02}
-budget: {passes: 50, verifications: 10, usd: 20}
+budget: {practice_evals: 10, verifications: 6, usd: 5}   # the agent's limits; the --agent-* flags override them
 ```
 
 Data files are JSON Lines. Each row has the request as `messages` (a chat array), or `prompt` /
@@ -79,6 +79,7 @@ class Guardrail:
     limit: Optional[int] = None
     max_drift: float = 0.15               # wsr_regression only
     min_agreement: float = 0.85
+    allow_safety_loss: bool = False       # wsr_regression only: a patch may stop refusing the suite's harmful requests
 
     @property
     def name(self) -> str:
@@ -111,6 +112,25 @@ class Objective:
         return d
 
 
+BUDGET_KEYS = ("practice_evals", "verifications", "usd")
+
+
+def _budget(raw: Any) -> dict[str, Any]:
+    """The agent's limits from the goal file: practice_eval calls, full verifications, API spend in USD.
+    `passes` is the older name of practice_evals."""
+    b = dict(raw or {})
+    if "passes" in b:
+        b.setdefault("practice_evals", b["passes"])
+        del b["passes"]
+    bad = set(b) - set(BUDGET_KEYS)
+    if bad:
+        raise ValueError(f"unknown budget field(s): {', '.join(sorted(bad))} (known: {', '.join(BUDGET_KEYS)})")
+    for k, v in b.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            raise ValueError(f"budget.{k} must be a number that is not negative")
+    return b
+
+
 def _read_text_obj(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() in (".yaml", ".yml"):
@@ -120,7 +140,10 @@ def _read_text_obj(path: Path) -> dict[str, Any]:
             raise ValueError(f"{path} is YAML: pip install pyyaml, or write the goal file as JSON") from e
         d = yaml.safe_load(text)
     else:
-        d = json.loads(text)
+        try:
+            d = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path}: not valid JSON ({e.msg}, line {e.lineno})") from None
     if not isinstance(d, dict):
         raise ValueError(f"{path}: the goal file must be a mapping")
     return d
@@ -150,7 +173,8 @@ def from_dict(d: dict[str, Any], path: Optional[Path] = None) -> Objective:
     for g in d.get("guardrails") or []:
         if not isinstance(g, dict):
             raise ValueError("each guardrail is a mapping: {suite: wsr_regression} or {data: ..., grader: ...}")
-        bad = set(g) - {"suite", "data", "grader", "max_drop", "limit", "max_drift", "min_agreement"}
+        bad = set(g) - {"suite", "data", "grader", "max_drop", "limit", "max_drift", "min_agreement",
+                        "allow_safety_loss"}
         if bad:
             raise ValueError(f"unknown guardrail field(s): {', '.join(sorted(bad))}")
         if g.get("suite") and g["suite"] != "wsr_regression":
@@ -162,7 +186,7 @@ def from_dict(d: dict[str, Any], path: Optional[Path] = None) -> Objective:
         rails.append(Guardrail(**g))
     return Objective(name=str(d["name"]), model=d.get("model"), kind=kind, protocol=proto, practice=d.get("practice"),
                      heldout=d.get("heldout"), grader=d.get("grader"), guardrails=rails,
-                     budget=dict(d.get("budget") or {}), path=path)
+                     budget=_budget(d.get("budget")), path=path)
 
 
 def load(path: str | Path) -> Objective:
@@ -220,6 +244,11 @@ def _key(item: dict) -> str:
     return json.dumps([m.get("content") for m in item["messages"] if m.get("role") == "user"], ensure_ascii=False)
 
 
+def _control_char(t: str) -> str:
+    """The first control character other than newline, tab and carriage return, or ''."""
+    return next((ch for ch in t if ord(ch) < 32 and ch not in "\n\t\r"), "")
+
+
 def check(obj: Objective) -> dict[str, Any]:
     """What `wsr objective check` reports: files, row counts, gradable rows, practice/held-out overlap."""
     problems, info = [], {}
@@ -256,6 +285,16 @@ def check(obj: Objective) -> dict[str, Any]:
     if not obj.heldout:
         problems.append("no held-out file: wsr evaluate can only score the practice set, which an agent may "
                         "have fitted")
+    # A control character in a prompt is almost always a JSON escape by accident: a backslash-b in a JSON
+    # string (as in a LaTeX boxed command written with one backslash) is a backspace.
+    texts = [("protocol.system", obj.protocol.system or "")]
+    for split, items in sets.items():
+        texts += [(f"{split} {it['id']}", str(m.get("content") or "")) for it in items[:2000] for m in it["messages"]]
+    bad = [(w, t) for w, t in texts if _control_char(t)]
+    if bad:
+        w, t = bad[0]
+        problems.append(f"{len(bad)} prompt(s) contain control characters (first: {w}, {_control_char(t)!r}); in "
+                        "JSON a backslash must be doubled, e.g. " + json.dumps("\\boxed{}"))
     for g in obj.guardrails:
         if g.data:
             gp = obj.resolve(g.data)
@@ -275,7 +314,7 @@ TEMPLATE = {
     "heldout": "data/heldout.jsonl",
     "grader": "math",
     "guardrails": [{"suite": "wsr_regression"}],
-    "budget": {"passes": 50, "verifications": 10, "usd": 20},
+    "budget": {"practice_evals": 10, "verifications": 6, "usd": 5},
 }
 
 

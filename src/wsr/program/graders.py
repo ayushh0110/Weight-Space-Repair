@@ -34,10 +34,19 @@ def check_name(name: Optional[str]) -> None:
     if head not in KNOWN:
         raise ValueError(f"unknown grader {name!r}: one of exact, contains, regex:<pattern>, math, "
                          "detector:<group>")
+    if head == "regex" and ":" in name:
+        _compiled(name.split(":", 1)[1])
     if head == "detector":
         g = name.split(":", 1)[1] if ":" in name else ""
         if g != "any" and g not in GROUPS:
             raise ValueError(f"detector grader needs a group: detector:any or one of {', '.join(sorted(GROUPS))}")
+
+
+def _compiled(pattern: str) -> "re.Pattern[str]":
+    try:
+        return re.compile(pattern, re.S | re.M)
+    except re.error as e:
+        raise ValueError(f"regex grader: {pattern!r} is not a valid regular expression ({e})") from None
 
 
 def _norm(s: str) -> str:
@@ -148,7 +157,7 @@ def grade(name: Optional[str], reply: str, item: dict[str, Any], groups: set[str
         return not gs if arg == "any" else arg not in gs
     if head == "regex":
         pat = arg or item.get("pattern")
-        return None if not pat else bool(re.search(pat, reply, re.S | re.M))
+        return None if not pat else bool(_compiled(str(pat)).search(reply))
     gold = item.get("answer")
     if gold is None or str(gold).strip() == "":
         return None

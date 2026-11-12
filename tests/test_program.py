@@ -204,7 +204,7 @@ def _goal(tmp_path, heldout, *, rails=()):
 
 
 def test_evaluate_the_fix_is_improved_paired_and_logged(lm, tmp_path):
-    obj = _goal(tmp_path, PLEASE + OTHER[:1], rails=[{"data": "g.jsonl", "grader": "detector:any", "max_drop": 0.5}])
+    obj = _goal(tmp_path, PLEASE + OTHER[:2], rails=[{"data": "g.jsonl", "grader": "detector:any", "max_drop": 0.5}])
     fix = E.scale_neurons(lm, [(PLANT_LAYER, PLANT_NEURON)], 0.0)
     res = EV.evaluate(lm, obj, patch=fix, patch_name="fix")
     p = res["paired"]
@@ -219,7 +219,7 @@ def test_evaluate_the_fix_is_improved_paired_and_logged(lm, tmp_path):
 
 
 def test_evaluate_a_harmless_nothing_is_no_clear_change_and_a_guardrail_can_fail(lm, tmp_path):
-    obj = _goal(tmp_path, PLEASE, rails=[{"data": "g.jsonl", "grader": "detector:any", "max_drop": -0.01}])
+    obj = _goal(tmp_path, PLEASE + OTHER[:2], rails=[{"data": "g.jsonl", "grader": "detector:any", "max_drop": -0.01}])
     noop = E.scale_neurons(lm, [(0, 1)], 1.0)                      # scale 1: changes nothing
     res = EV.evaluate(lm, obj, patch=noop, log=False)
     assert res["paired"]["diff"] == 0 and res["verdict"] == "no clear change"
@@ -371,3 +371,455 @@ def test_program_reuses_from_failure_labels_only_when_everything_matches(tmp_pat
     assert prior_labels(lm2, obj, items) is None
     lab = _json.loads((obj.resolve(obj.practice).parent / "labels.json").read_text(encoding="utf-8"))
     assert lab["model_key"] and lab["backend"].startswith("pytorch")
+
+
+def test_practice_eval_reuses_the_profile_baseline_exactly(lm, tmp_path):
+    """The profile's main pass, run on this model, is practice_eval's baseline: the result is the one a fresh
+    baseline gives, and the original is not regenerated."""
+    from types import SimpleNamespace as NS
+
+    from wsr.program.program import ObjectiveTools
+
+    obj = _program_goal(tmp_path)
+    items = O.load_items(obj.resolve(obj.practice), system=obj.protocol.system)
+    before = set(lm.batch_plans)
+    prof = P.profile(lm, items, obj.protocol, grader=obj.grader, test_k=0)
+    plans = {k: v for k, v in lm.batch_plans.items() if k not in before}
+    patch = E.scale_neurons(lm, [(PLANT_LAYER, PLANT_NEURON)], 0.0)
+    wb = NS(_edit=lambda eid: patch)
+    lm.batch_plans.clear()                                   # as if the diagnosis had filled the cache since
+    reused = ObjectiveTools(lm, obj, items, baseline=prof.replies, plans=plans)
+    assert reused.default_n == len(items) and "already measured" in reused.brief(None)
+    got = reused._practice_eval(wb, "e1", n=len(items))
+    fresh = ObjectiveTools(lm, obj, items)
+    want = fresh._practice_eval(wb, "e1", n=len(items))
+    assert got == want and got["diff"] > 0
+    assert reused.generations == len(items) and fresh.generations == 2 * len(items)
+    # a profile that did not run here (no plans), or on other items, is not reused
+    assert ObjectiveTools(lm, obj, items, baseline=prof.replies).base == {}
+    assert ObjectiveTools(lm, obj, items[1:], baseline=prof.replies, plans=plans).base == {}
+
+
+def test_settings_are_validated_before_anything_runs():
+    from wsr.program.program import settings_problem, settings_howto, with_settings
+    assert settings_problem({"repetition_penalty": 1.1}) == ""
+    assert "no PyTorch equivalent" in settings_problem({"presence_penalty": 0.5})
+    assert "unknown setting" in settings_problem({"dry_multiplier": 0.8})
+    assert "[1.0, 1.5]" in settings_problem({"repetition_penalty": 3})
+    assert "object" in settings_problem({})
+    p = O.Protocol(max_new_tokens=64, system="s")
+    q = with_settings(p, {"repetition_penalty": 1.1})
+    assert q.gen_kwargs() == {"repetition_penalty": 1.1} and q.system == "s" and q.max_new_tokens == 64 and not p.sampling
+    how = "\n".join(settings_howto(p, {"repetition_penalty": 1.1, "temperature": 0.7}))
+    assert "--repeat-penalty 1.1" in how and "--temp 0.7" in how and '"do_sample": true' in how
+
+
+def test_program_agent_settings_choice_is_judged_on_heldout(lm, tmp_path, monkeypatch):
+    """The agent measures serving settings on practice, chooses them, and the held-out judge compares current and
+    new settings on the same weights, with the suite generated under both as the guardrail; nothing is patched."""
+    from wsr.agent import AgentLimits, Budget, ScriptedProvider
+
+    monkeypatch.setattr(R, "SUITE", TOY_SUITE)
+    monkeypatch.setattr(PB, "candidates", lambda *a, **k: [])
+    obj = _program_goal(tmp_path)
+    script = [
+        [("settings_eval", {"settings": {"presence_penalty": 1.0}})],                 # refused: not on PyTorch
+        [("settings_eval", {"settings": {"repetition_penalty": 1.2}, "n": 7})],
+        [("final_choice", {"settings_id": "s9", "rationale": "typo"})],                # refused: unknown id
+        [("final_choice", {"settings_id": "s1", "rationale": "penalty"})],
+    ]
+    rec = run_program(lm, obj, out=tmp_path / "run", provider=ScriptedProvider(script), playbook=True,
+                      agent_budget=Budget(), agent_limits=AgentLimits(max_turns=10), log=None)
+    ag = rec["stages"]["agent"]
+    assert ag["stopped"] == "final choice (settings)" and ag["settings_evals"]["s1"]["n"] == 7
+    js = rec["stages"]["settings"]
+    assert js["settings"] == {"repetition_penalty": 1.2} and js["n"] == 5 and js["verdict"]
+    assert js["guardrails"][0]["prompts"] == len(TOY_SUITE)
+    assert rec["outcome"] in ("settings recommended", "no candidate") and "patch" not in rec
+    assert not (tmp_path / "run" / "patch").exists()
+    md = (tmp_path / "run" / "PROGRAM.md").read_text(encoding="utf-8")
+    assert "Settings" in md and "repetition_penalty" in md
+    tr = json.loads((tmp_path / "run" / "agent_transcript.json").read_text(encoding="utf-8"))
+    errs = [m for m in tr["transcript"] if m.get("role") == "tool" and m.get("is_error")]
+    assert len(errs) == 2
+
+
+def test_original_replies_are_kept_across_runs_but_never_for_an_edited_model(tmp_path, monkeypatch):
+    """The unedited model's replies on a fixed set are stored with their batch plan; a second process gets them
+    without generating, the plan is installed, and the edited model (other weights, other key) is never served
+    the stored original."""
+    monkeypatch.setenv("WSR_CACHE_DIR", str(tmp_path / "cache"))
+    m, t = planted_model()
+    m.save_pretrained(tmp_path / "m")
+    t.save_pretrained(tmp_path / "m")
+    lm = LM.load(tmp_path / "m", dtype="float32", device="cpu")
+    obj = _program_goal(tmp_path)
+    items = O.load_items(obj.resolve(obj.practice), system=obj.protocol.system)
+    r1 = P.Runner(lm, obj.protocol, obj.grader)
+    rows1 = EV.original_set(r1, items, samples=1, seed=0)
+    assert r1.generations == len(items)
+    lm2 = LM.load(tmp_path / "m", dtype="float32", device="cpu")             # a later run
+    r2 = P.Runner(lm2, obj.protocol, obj.grader)
+    assert EV.original_set(r2, items, samples=1, seed=0) == rows1 and r2.generations == 0
+    from wsr.program import origcache as OC
+    assert OC.plan_key(lm2, obj.protocol, items, 1) in lm2.batch_plans
+    patch = E.scale_neurons(lm2, [(PLANT_LAYER, PLANT_NEURON)], 0.0)
+    with E.applied(lm2, patch):
+        r3 = P.Runner(lm2, obj.protocol, obj.grader)
+        rows3 = EV.original_set(r3, items, samples=1, seed=0)
+    assert r3.generations == len(items) and rows3 != rows1                   # generated, not served the original
+    prof = P.profile(lm2, items, obj.protocol, grader=obj.grader, test_k=0)  # the profile's main pass: cached too
+    lm3 = LM.load(tmp_path / "m", dtype="float32", device="cpu")
+    again = P.profile(lm3, items, obj.protocol, grader=obj.grader, test_k=0)
+    assert [x["label"] for x in again.replies] == [x["label"] for x in prof.replies] and again.generations == 0
+
+
+def test_a_settings_system_prompt_reaches_the_model():
+    """The goal's system prompt is written into the items when they are loaded; a "system" setting must replace
+    it in the messages (or remove it with null), not only in the protocol (live run: two opposite system prompts
+    gave identical replies)."""
+    from wsr.program.program import items_for
+    items = [{"id": "a", "messages": [{"role": "system", "content": "old"}, {"role": "user", "content": "q"}]},
+             {"id": "b", "messages": [{"role": "user", "content": "q2"}]}]
+    new = items_for({"system": "new"}, items)
+    assert [m["messages"][0] for m in new] == [{"role": "system", "content": "new"}] * 2
+    assert [m["messages"][-1]["content"] for m in new] == ["q", "q2"] and items[0]["messages"][0]["content"] == "old"
+    assert all(m["role"] != "system" for it in items_for({"system": None}, items) for m in it["messages"])
+    assert items_for({"repetition_penalty": 1.1}, items) is items
+
+
+def test_a_rejected_playbook_candidate_hands_over_to_the_agent(lm, tmp_path, monkeypatch):
+    """The playbook's candidate passes its own checks but the held-out judge says no: the agent gets the objective
+    (told only that the candidate was rejected), and its choice is judged and can ship."""
+    from wsr.agent import AgentLimits, Budget, ScriptedProvider
+
+    monkeypatch.setattr(R, "SUITE", TOY_SUITE)
+    real = EV.evaluate
+    calls = []
+
+    def first_says_no(*a, **k):
+        ev = real(*a, **k)
+        calls.append(k.get("patch_name"))
+        if len(calls) == 1:
+            ev = {**ev, "verdict": "no clear change"}
+        return ev
+    monkeypatch.setattr(EV, "evaluate", first_says_no)
+    obj = _program_goal(tmp_path)
+    script = [
+        [("build_edit", {"spec": {"kind": "scale_neurons", "neurons": [[PLANT_LAYER, PLANT_NEURON]], "scale": 0}})],
+        [("practice_eval", {"edit_id": "e1", "n": 7})],
+        [("final_choice", {"edit_id": "e1", "rationale": "zero the planted neuron"})],
+    ]
+    rec = run_program(lm, obj, out=tmp_path / "run", provider=ScriptedProvider(script), playbook=True, mode="fast",
+                      agent_budget=Budget(), agent_limits=AgentLimits(max_turns=10), log=None)
+    assert len(calls) == 2 and rec["stages"]["judge_playbook"]["verdict"] == "no clear change"
+    assert rec["stages"]["agent"]["stopped"] == "final choice" and rec["outcome"] == "shipped"
+    assert (tmp_path / "run" / "candidate_playbook" / "patch.json").exists()
+    tr = json.loads((tmp_path / "run" / "agent_transcript.json").read_text(encoding="utf-8"))
+    brief = tr["transcript"][0]["content"]
+    assert "did not accept it" in brief and "h.jsonl" not in json.dumps(tr)
+    md = (tmp_path / "run" / "PROGRAM.md").read_text(encoding="utf-8")
+    assert "playbook's candidate (not accepted" in md
+
+
+def test_refusal_guardrail_is_strict_by_default_and_a_goal_can_turn_it_off(tmp_path):
+    """By default a patch that stops refusing the suite's harmful requests fails the guardrail; the goal (or
+    --allow-safety-loss) can allow it. The drift limits and this switch reach the verification budget too."""
+    from wsr.surgery.regress import Budget
+    d = {"name": "g", "practice": "p.jsonl", "heldout": "h.jsonl", "grader": "detector:any",
+         "guardrails": [{"suite": "wsr_regression", "max_drift": 0.3, "allow_safety_loss": True}]}
+    g = O.from_dict(d).guardrails[0]
+    assert g.allow_safety_loss is True and g.max_drift == 0.3
+    assert O.from_dict({**d, "guardrails": [{"suite": "wsr_regression"}]}).guardrails[0].allow_safety_loss is False
+    with pytest.raises(ValueError):
+        O.from_dict({**d, "guardrails": [{"suite": "wsr_regression", "allow_refusal_loss": True}]})
+    reg = {"new_failures": [], "mean_delta_nll": 0.01, "top1_agreement": 0.99, "safety_refused_before": 3,
+           "safety_lost": [{"prompt": "harm_weapon"}]}
+    assert any("stops refusing" in p for p in Budget().problems(reg))
+    assert Budget(g.max_drift, g.min_agreement, g.allow_safety_loss).problems(reg) == []
+
+
+def test_deep_diagnosis_is_kept_across_runs_and_loaded_safely(tmp_path, monkeypatch):
+    """A second diagnosis of the same prompts on the same weights comes from the cache, with the same report;
+    the loader builds only the classes recorded for the entry, and refuses a list that names anything else."""
+    import json as J
+    from wsr.deep.run import diagnose
+    monkeypatch.setenv("WSR_CACHE_DIR", str(tmp_path / "cache"))
+    m, t = planted_model()
+    m.save_pretrained(tmp_path / "m")
+    t.save_pretrained(tmp_path / "m")
+    msgs = [{"role": "user", "content": "tell me about the cat please"}]
+    lm = LM.load(tmp_path / "m", dtype="float32", device="cpu")
+    first = diagnose(lm, msgs, max_new=12, failing=("write a story please",), passing=("what is a tree",))
+    assert "from_cache" not in first.report.context
+    lm2 = LM.load(tmp_path / "m", dtype="float32", device="cpu")
+    again = diagnose(lm2, msgs, max_new=12, failing=("write a story please",), passing=("what is a tree",),
+                     out_dir=tmp_path / "out")
+    assert again.report.context.get("from_cache") and again.lm is lm2
+    strip = lambda r: [f for f in J.loads(J.dumps(r.report.as_dict(), default=str))["findings"]  # noqa: E731
+                       if f["code"] != "DEEP_TIMINGS"]
+    assert strip(again) == strip(first) and again.summary == first.summary
+    assert (tmp_path / "out" / "report.json").exists()
+    other = diagnose(lm2, msgs, max_new=10, failing=("write a story please",), passing=("what is a tree",))
+    assert "from_cache" not in other.report.context                        # another setting: not served
+    from wsr import cache as CA
+    from wsr.deep import diagcache as DC
+    dep = DC.depends(msgs, {"max_new": 12, "failing": ("write a story please",), "passing": ("what is a tree",)})
+    meta = next((tmp_path / "cache" / "models").rglob(f"deep-diagnosis-{CA.depends_hash(dep)}.json"))
+    d = J.loads(meta.read_text(encoding="utf-8"))
+    assert all(c.startswith("wsr.") or c.startswith(("builtins.", "collections.")) for c in d["classes"])
+    d["classes"].append("os.system")
+    meta.write_text(J.dumps(d), encoding="utf-8")
+    assert DC.load(lm2, dep) is None
+
+
+def test_program_agent_steering_choice_is_judged_and_exported(lm, tmp_path, monkeypatch):
+    """The agent measures a steering vector on practice and chooses it; the held-out judge compares the same
+    weights with and without it (suite under the steering as the guardrail); nothing is patched, and when it is
+    recommended the vector, its settings and how to apply it are written."""
+    from wsr.agent import AgentLimits, Budget, ScriptedProvider
+
+    monkeypatch.setattr(R, "SUITE", TOY_SUITE)
+    monkeypatch.setattr(PB, "candidates", lambda *a, **k: [])
+    obj = _program_goal(tmp_path)
+    script = [
+        [("make_direction", {"source": {"kind": "contrast"}})],
+        [("steer_eval", {"vector": "d1", "alpha": 0, "layers": [2]})],                      # refused: alpha 0
+        [("steer_eval", {"vector": "d1", "alpha": -4.0, "layers": [2, 3], "n": 7})],
+        [("final_choice", {"steering_id": "t1", "rationale": "push against the failure direction"})],
+    ]
+    rec = run_program(lm, obj, out=tmp_path / "run", provider=ScriptedProvider(script), playbook=True,
+                      agent_budget=Budget(), agent_limits=AgentLimits(max_turns=10), log=None)
+    ag = rec["stages"]["agent"]
+    assert ag["stopped"] == "final choice (steering)" and ag["steer_evals"]["t1"]["n"] == 7
+    js = rec["stages"]["steering"]
+    assert js["layers"] == [2, 3] and js["alpha"] == -4.0 and js["guardrails"][0]["kind"] == "suite"
+    assert "patch" not in rec and not (tmp_path / "run" / "patch").exists()
+    if rec["outcome"] == "steering recommended":
+        d = tmp_path / "run" / "steering"
+        assert (d / "steer.safetensors").exists() and (d / "APPLY.md").exists()
+    md = (tmp_path / "run" / "PROGRAM.md").read_text(encoding="utf-8")
+    assert "steering" in md.lower()
+
+
+@pytest.mark.parametrize("mode,alpha", [("add", 2.5), ("clamp", 0.1)])
+def test_exported_steering_hook_matches_wsr_steering(lm, mode, alpha):
+    """The forward hook written to APPLY.md gives the same logits as LM.steer, in both modes."""
+    import torch
+    from wsr.program.program import STEER_APPLY
+    v = torch.randn(lm.d_model)
+    spec = {"alpha": alpha, "layers": [1, 3], "mode": mode}
+    ids = lm.encode([{"role": "user", "content": "tell me about the cat please"}])
+    with torch.no_grad(), lm.steer(**{mode: (v, spec["alpha"], spec["layers"])}):
+        want = lm.model(input_ids=ids).logits
+    code = STEER_APPLY.split("```python", 1)[1].split("```", 1)[0]
+    body = code.split("def add_steering", 1)[1]
+    ns = {"spec": spec, "vec": v}
+    exec("def add_steering" + body.split("handles =", 1)[0], ns)
+    hs = [lm.model.model.layers[i].register_forward_hook(ns["add_steering"]) for i in spec["layers"]]
+    try:
+        with torch.no_grad():
+            got = lm.model(input_ids=ids).logits
+    finally:
+        for h in hs:
+            h.remove()
+    assert torch.allclose(got, want, atol=1e-5)
+
+
+def test_replies_cache_is_never_used_while_steering(lm, monkeypatch, tmp_path):
+    import torch
+    from wsr.program import origcache as OC
+    monkeypatch.setattr(OC, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("cache read")))
+    monkeypatch.setattr(OC, "save", lambda *a, **k: (_ for _ in ()).throw(AssertionError("cache write")))
+    obj = _program_goal(tmp_path)
+    items = O.load_items(obj.resolve(obj.practice), system=obj.protocol.system)[:2]
+    r = P.Runner(lm, obj.protocol, obj.grader)
+    with lm.steer(add=(torch.randn(lm.d_model), 1.0, [1])):
+        rows = EV.original_set(r, items, samples=1, seed=0)
+    assert len(rows) == 2 and r.generations == 2
+
+
+def test_cache_command_shows_and_clears_only_what_is_named(tmp_path, monkeypatch, capsys):
+    import io
+    from wsr import cache as C
+    from wsr.cli import main
+    monkeypatch.setenv("WSR_CACHE_DIR", str(tmp_path / "c"))
+    m1, m2 = "m1-" + "a" * 20, "m2-" + "b" * 20              # as cache.model_key names them
+    gg = "x-" + "c" * 12 + ".Q8_0.gguf"
+    mine = ("models/my-own-model/weights.bin", "datasets/mine.jsonl", "gguf/mine.gguf")   # not wsr's: must survive
+    for rel in (f"models/{m1}/regression-baseline-1.json", f"models/{m2}/profile-replies-2.json",
+                f"gguf/{gg}", "datasets/xstest.jsonl", *mine):
+        f = tmp_path / "c" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("x" * 100)
+    (tmp_path / "c" / "consent.json").write_text("{}")
+    shown = capsys.readouterr() and main(["cache", "show"]) == 0 and capsys.readouterr().out
+    assert shown and m1 in shown and "my-own-model" not in shown
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))            # not a terminal, no --yes: nothing deleted
+    assert main(["cache", "clear", "gguf"]) == 3 and (tmp_path / "c" / "gguf" / gg).exists()
+    assert main(["cache", "clear", "--model", "m1", "--yes"]) == 0
+    assert not (tmp_path / "c" / "models" / m1).exists() and (tmp_path / "c" / "models" / m2).exists()
+    assert main(["cache", "clear", "all", "--yes"]) == 0
+    assert not (tmp_path / "c" / "gguf" / gg).exists() and not (tmp_path / "c" / "datasets" / "xstest.jsonl").exists()
+    assert not (tmp_path / "c" / "models" / m2).exists()
+    # only what wsr wrote is deleted: a cache folder shared with the user's own models and data loses nothing
+    assert all((tmp_path / "c" / rel).exists() for rel in mine)
+    assert (tmp_path / "c" / "consent.json").exists()                # remembered answers are not cache
+    with pytest.raises(ValueError):
+        C.remove([tmp_path / "elsewhere.txt"])
+
+
+def test_judge_says_when_a_set_is_too_small_to_show_an_improvement():
+    """2 failing items of 30: even a perfect fix reaches z ~1.4 < 2, so 'no clear change' must say the set is
+    the limit (the over-refusal run: 93.3% -> 96.7% could never ship)."""
+    pw = EV.power([0.0, 0.0] + [1.0] * 28)
+    assert pw["failing"] == 2 and not pw["can_show_improvement"] and pw["best_z"] < 2 and "add items" in pw["note"]
+    assert EV.power([0.0] * 10 + [1.0] * 20)["can_show_improvement"]
+    assert EV.power([0.0] * 30)["can_show_improvement"]                  # all failing: a fix would be clear
+    assert not EV.power([1.0] * 30)["can_show_improvement"]
+
+
+def test_program_judges_the_playbooks_steering_on_heldout(lm, tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "SUITE", TOY_SUITE)
+    obj = _program_goal(tmp_path)
+    rec = run_program(lm, obj, out=tmp_path / "run", log=None, mode="fast", steering="only")
+    pb = rec["stages"]["playbook"]
+    if pb["status"] == "steered":
+        js = rec["stages"].get("steering") or rec["stages"].get("steering_playbook")
+        assert js["by"] == "playbook" and js["guardrails"][0]["kind"] == "suite"
+        assert rec["outcome"] in ("steering recommended", "no candidate") and "patch" not in rec
+        if rec["outcome"] == "steering recommended":
+            assert (tmp_path / "run" / "steering" / "APPLY.md").exists()
+        assert "steering" in (tmp_path / "run" / "PROGRAM.md").read_text(encoding="utf-8").lower()
+    else:
+        assert rec["outcome"] == "no candidate"
+
+
+def test_no_weight_edits_leaves_only_steering_and_settings(lm, tmp_path, monkeypatch):
+    """--no-weight-edits: the playbook only steers, the agent's build_edit and fit_edit are refused with the
+    reason, steer_eval works, and the report says weight edits were off."""
+    from wsr.agent import AgentLimits, Budget, ScriptedProvider
+
+    monkeypatch.setattr(R, "SUITE", TOY_SUITE)
+    monkeypatch.setattr(PB, "_try_steering", lambda *a, **k: None)          # the playbook's steering finds nothing
+    obj = _program_goal(tmp_path)
+    script = [
+        [("build_edit", {"spec": {"kind": "scale_neurons", "neurons": [[PLANT_LAYER, PLANT_NEURON]], "scale": 0}})],
+        [("fit_edit", {"params": [f"model.layers.{PLANT_LAYER}.mlp.down_proj.weight"],
+                       "targets": [{"item": "original", "weight": -1}]})],
+        [("make_direction", {"source": {"kind": "contrast"}})],
+        [("steer_eval", {"vector": "d1", "alpha": 0.0, "layers": [PLANT_LAYER], "mode": "clamp", "n": 7})],
+        [("final_choice", {"steering_id": "t1", "rationale": "clamp at the planted layer"})],
+    ]
+    rec = run_program(lm, obj, out=tmp_path / "run", provider=ScriptedProvider(script), playbook=True,
+                      agent_budget=Budget(), agent_limits=AgentLimits(max_turns=10), log=None, weight_edits=False)
+    assert rec["weight_edits"] is False and rec["stages"]["playbook"]["status"] == "could_not_fix"
+    tr = json.loads((tmp_path / "run" / "agent_transcript.json").read_text(encoding="utf-8"))
+    errs = [m for m in tr["transcript"] if m.get("role") == "tool" and m.get("is_error")]
+    assert {m["name"] for m in errs} >= {"build_edit", "fit_edit"}
+    assert all("--no-weight-edits" in json.dumps(m["result"]) for m in errs if m["name"] in ("build_edit", "fit_edit"))
+    assert "Weight edits are off" in tr["transcript"][0]["content"]
+    assert rec["stages"]["agent"]["stopped"] == "final choice (steering)" and "patch" not in rec
+    assert "weight edits were off" in (tmp_path / "run" / "PROGRAM.md").read_text(encoding="utf-8")
+
+
+# -- audit fixes -----------------------------------------------------------------------------------------
+
+def test_a_verdict_needs_five_scored_items_and_reports_the_exact_sign_test():
+    """One or two fixed items gave "improved" (their standard error is 0): too few items now give no verdict."""
+    for n in (1, 2, 4):
+        p = EV._paired([0.0] * n, [1.0] * n)
+        assert EV._verdict(p, True).startswith("too few items"), n
+        assert not EV.power([0.0] * n)["can_show_improvement"] and "at least 5" in EV.power([0.0] * n)["note"]
+    p = EV._paired([0.0] * 5, [1.0] * 5)
+    assert EV._verdict(p, True) == "improved" and p["sign_p"] == round(1 / 32, 4)
+    q = EV._paired([0.0] * 4 + [1.0] * 33, [1.0] * 37)        # the over-refusal run: 4 wins, no loss, z 2.09
+    assert q["wins"] == 4 and q["sign_p"] == 0.0625 and EV._verdict(q, True) == "improved"
+    assert EV._paired([1.0] * 6, [1.0] * 6)["sign_p"] is None  # nothing changed: no test to report
+    assert EV.sign_p(3, 1) == round(5 / 16, 4)
+
+
+def test_steering_and_settings_judges_count_as_looks_at_the_heldout_set(lm, tmp_path, monkeypatch):
+    from wsr.program.program import judge_settings, judge_steering
+    monkeypatch.setattr(R, "SUITE", TOY_SUITE)
+    obj = _program_goal(tmp_path)
+    js = judge_settings(lm, obj, {"repetition_penalty": 1.1})
+    assert js["heldout_looks"] == 1
+    v = torch.zeros(lm.d_model)
+    v[0] = 1.0
+    jt = judge_steering(lm, obj, {"_vector": v, "alpha": 0.01, "layers": [0], "vector": "test", "mode": "add"})
+    assert jt["heldout_looks"] == 2 and EV.HeldoutLog(obj).count() == 2
+    log = (tmp_path / "goal.heldout_log.jsonl").read_text(encoding="utf-8")
+    assert "settings: " in log and "steering: test" in log
+
+
+def test_goal_budget_is_checked_and_the_flags_override_it(tmp_path):
+    import argparse
+
+    from wsr.cli import _agent_limits
+    base = {"name": "g", "practice": "p.jsonl", "heldout": "h.jsonl"}
+    obj = O.from_dict({**base, "budget": {"passes": 50, "verifications": 10, "usd": 20}})
+    assert obj.budget == {"practice_evals": 50, "verifications": 10, "usd": 20}     # passes: the older name
+    with pytest.raises(ValueError, match="unknown budget"):
+        O.from_dict({**base, "budget": {"dollars": 5}})
+    with pytest.raises(ValueError, match="not negative"):
+        O.from_dict({**base, "budget": {"usd": -1}})
+    ns = dict(agent_allow="", agent_turns=80, agent_max_tokens=1000)
+    none = argparse.Namespace(agent_verifications=None, agent_budget_usd=None, practice_evals=None, **ns)
+    b, lim, pe = _agent_limits(none, obj.budget)
+    assert (b.verifications, lim.max_cost_usd, pe) == (10, 20.0, 50)               # the goal file's
+    b, lim, pe = _agent_limits(none, {})
+    assert (b.verifications, lim.max_cost_usd, pe) == (6, 5.0, 10)                 # the built-in defaults
+    flags = argparse.Namespace(agent_verifications=2, agent_budget_usd=1.5, practice_evals=3, **ns)
+    b, lim, pe = _agent_limits(flags, obj.budget)
+    assert (b.verifications, lim.max_cost_usd, pe) == (2, 1.5, 3)                  # a flag wins
+    with pytest.raises(ValueError, match="--agent-allow"):
+        _agent_limits(argparse.Namespace(**{**vars(none), "agent_allow": "embed,everything"}))
+    assert O.TEMPLATE["budget"] == {"practice_evals": 10, "verifications": 6, "usd": 5}
+
+
+def test_a_bad_regex_grader_is_a_clear_error_not_a_traceback():
+    from wsr.program import graders as G
+    with pytest.raises(ValueError, match="not a valid regular expression"):
+        G.check_name("regex:(unclosed")
+    with pytest.raises(ValueError, match="not a valid regular expression"):
+        G.grade("regex", "text", {"pattern": "["})
+    assert G.grade("regex:^ok", "ok then", {}) is True
+
+
+def test_cli_usage_errors_exit_2_and_recommended_fixes_exit_0(tmp_path, capsys):
+    from wsr.cli import FIX_OUTCOMES, main
+    assert main(["triage"]) == 2 and "wsr: give at least one of" in capsys.readouterr().err
+    assert main(["triage", "--endpoint", "http://127.0.0.1:9"]) == 2
+    bad = tmp_path / "bad.json"
+    bad.write_text("{bad")
+    assert main(["response", str(bad)]) == 2 and "bad.json: not valid JSON" in capsys.readouterr().err
+    assert main(["objective", "check", str(bad)]) == 2 and "bad.json" in capsys.readouterr().err
+    assert set(FIX_OUTCOMES) == {"shipped", "steering recommended", "settings recommended"}
+
+
+def test_wsr_cache_works_without_torch(tmp_path):
+    """`pip install wsr-triage` has no dependencies: the cache command must not import torch."""
+    import os
+    import subprocess
+    import sys
+    code = ("import sys; sys.modules['torch'] = None; sys.modules['safetensors'] = None\n"
+            "from wsr.cli import main; sys.exit(main(['cache', 'show']))")
+    env = {**os.environ, "WSR_CACHE_DIR": str(tmp_path), "PYTHONPATH": "src"}
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert r.returncode == 0 and "wsr cache:" in r.stdout, r.stderr[-400:]
+
+
+def test_probe_caches_use_the_model_cache_not_a_folder_named_after_wsr_cache(lm, tmp_path, monkeypatch):
+    """WSR_CACHE is the on/off switch: the probes once took its value as a folder name ("off/langprobe")."""
+    from wsr.deep import copyheads as CH
+    from wsr.deep import langprobe as LP
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WSR_CACHE", "off")
+    CH.induction_scores(lm, seq_len=8, n_seqs=1)
+    assert not (tmp_path / "off").exists() and not hasattr(LP, "CACHE") and not hasattr(CH, "CACHE")
+    probe = LP.LangProbe(["en", "fr"], torch.randn(3, 2, 4), torch.rand(3, 4) + 0.1, [0.5, 0.9, 0.8], [1.0, 1.0, 1.0],
+                         {"en": 5, "fr": 5}, 1, {"mismatch_accuracy": [float("nan"), 1.0, 1.0]})
+    meta, tensors = probe.to_cache()
+    back = LP.LangProbe.from_cache(json.loads(json.dumps(meta)), tensors)       # plain JSON + tensors, no pickle
+    assert back.langs == probe.langs and torch.equal(back.means, probe.means) and back.counts == probe.counts

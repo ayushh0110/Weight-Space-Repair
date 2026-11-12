@@ -42,7 +42,7 @@ from typing import Any, Callable, Optional
 import torch
 
 from ..deep import analysis as A
-from ..deep.contrast import Classifier, _with_last_user, fresh_variants
+from ..deep.contrast import Classifier, _with_last_user, fresh_variants, Reference
 from ..deep.lm import LM
 from . import edits as E
 from . import pairs as PR
@@ -106,6 +106,31 @@ class Repair:
     checks: dict = field(default_factory=dict)     # serving, fresh, control, sampled, continuations, sites
     ctx: Any = field(default=None, repr=False)     # the verification context (for the agent); not saved
     sitemap: Any = field(default=None, repr=False)
+    steering: Optional["Steering"] = None          # status "steered": an inference-time fix, not a patch
+
+
+@dataclass
+class Steering:
+    """An inference-time intervention after each of `layers`, at every position; the weights do not change.
+    mode "add": alpha x vector added (LM.steer(add=...)). mode "clamp": the component along the unit vector is
+    lowered to `alpha` wherever it is above it, and left alone elsewhere (LM.steer(clamp=...)): it acts only where
+    the failure's direction is present, so healthy text passes through unchanged."""
+    vector: torch.Tensor                           # [d_model], unit length
+    alpha: float                                   # add: per layer; clamp: the level
+    layers: list[int]
+    label: str
+    source: str = ""
+    mode: str = "add"
+
+    def kwargs(self) -> dict[str, Any]:
+        return {self.mode: (self.vector, self.alpha, self.layers)}
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"label": self.label, "mode": self.mode, "alpha": round(self.alpha, 4), "layers": self.layers,
+                "source": self.source, "vector_norm": round(float(self.vector.norm()), 6)}
+
+
+STEER_SCALES = (0.5, 1.0, 1.5, 2.0)                # x the failing-minus-working gap at the chosen depth
 
 
 # -- candidates ------------------------------------------------------------------------------------
@@ -473,7 +498,8 @@ def _judge(kind: str, before_fail: list, before_pass: list, clf: Classifier, usu
     keep = [(r, a) for r, a in zip(rp, after[nf:])]
     fixed = [n for n, e in fail if kind not in e.groups and e.groups <= usual]
     broke = [e0.name.removesuffix("+patch") for e0, e in keep if e.groups - e0.groups]
-    return {"fixed": len(fixed), "of": len(fail), "fixed_names": fixed, "passing_kept": len(keep) - len(broke),
+    return {"fixed": len(fixed), "of": len(fail), "fixed_names": fixed, "failing_names": [n for n, _ in fail],
+            "passing_kept": len(keep) - len(broke),
             "passing": len(keep), "broke": broke,
             "samples": [{"prompt": n, "after": e.text[:120], "groups": sorted(e.groups)} for n, e in fail[:4]]}
 
@@ -483,7 +509,47 @@ def _agreement(kind: str, fail: list, keep: list, ref: list) -> dict[str, int]:
     nf = len(fail)
     same_f = sum((kind in r.groups or kind == "other") for r in ref[:nf])
     same_p = sum(not r.groups for r in ref[nf:])
-    return {"failing": same_f, "of_failing": nf, "passing": same_p, "of_passing": len(keep)}
+    orig = [(kind in r.groups or kind == "other") for e, r in zip(fail, ref[:nf]) if getattr(e, "name", "") == "original"]
+    return {"failing": same_f, "of_failing": nf, "passing": same_p, "of_passing": len(keep),
+            **({"original_fails": orig[0]} if orig else {})}
+
+
+LONG_KINDS = ("loop",)          # failures that build up over a reply: a later start can pass the token limit
+MAX_REF_NEW = 4096
+
+
+def _longer_reference(kind: str, clf: Classifier, fail: list, keep: list, agrees: dict[str, int],
+                      say: Callable[[str], None], what: str):
+    """When fewer than 2/3 of the failing examples fail again in their unedited reference run, and the failure
+    builds up over the reply (a loop), the cause is usually the token limit: greedy replies diverge a little
+    between batch layouts and the loop starts later, past the cap. Run the reference once more at twice the
+    limit; keep it (and judge every edit at that length) only if more examples fail there. Returns
+    (classifier, reference, agreement at the cap, agreement at the longer length) or None."""
+    nf = agrees.get("of_failing", 0)
+    if kind not in LONG_KINDS or not nf or _share_ok(agrees.get("failing", 0), nf) or clf.max_new >= MAX_REF_NEW:
+        return None
+    long_clf = Classifier(clf.lm, expect_lang=clf.expect_lang, max_new=min(2 * clf.max_new, MAX_REF_NEW),
+                          template_kwargs=clf.template_kwargs, expect_refuse=getattr(clf, "expect_refuse", False))
+    ref = reference(long_clf, fail, keep)
+    got = _agreement(kind, fail, keep, ref)
+    say(f"reference runs ({what}): {agrees.get('failing', 0)}/{nf} failing examples fail again at "
+        f"{clf.max_new} tokens, {got['failing']}/{nf} at {long_clf.max_new}"
+        + ("; judging at the longer length" if got["failing"] > agrees.get("failing", 0) else "; keeping the cap"))
+    if got["failing"] <= agrees.get("failing", 0):
+        return None
+    return long_clf, ref, {**agrees, "max_new": clf.max_new}, {**got, "max_new": long_clf.max_new}
+
+
+def _prepared_reference(kind: str, clf: Classifier, fail: list, keep: list, say: Callable[[str], None],
+                        what: str) -> Reference:
+    """The reference run at the cap, redone at a longer length when the cap hides a loop (see below)."""
+    replies = reference(clf, fail, keep)
+    ref = Reference(replies, clf, _agreement(kind, fail, keep, replies))
+    longer = _longer_reference(kind, clf, fail, keep, ref.agrees, say, what)
+    if longer is not None:
+        long_clf, long_replies, at_cap, agrees = longer
+        ref = Reference(long_replies, long_clf, agrees, agrees_at_cap=at_cap)
+    return ref
 
 
 def _usual(c: Any) -> set[str]:
@@ -491,9 +557,14 @@ def _usual(c: Any) -> set[str]:
 
 
 def _target(lm: LM, c: Any, clf: Classifier) -> dict[str, Any]:
-    # Judged against the model's own behaviour (see _judge).
-    t = _judge(c.kind, c.failing, c.passing, clf, _usual(c), ref=getattr(c, "_ref", None))
+    # Judged against the model's own behaviour (see _judge), at the length its reference was run with.
+    ref = c.reference
+    t = _judge(c.kind, c.failing, c.passing, ref.clf if ref else clf, _usual(c), ref=ref.replies if ref else None)
     t["original_fixed"] = "original" in t.pop("fixed_names")
+    # Only an example whose unedited reference run fails can count as fixed. When the original's own reference
+    # run does not show the failure (long greedy replies can diverge between batch layouts), its fix cannot be
+    # measured here: say so instead of reporting it as still failing, which no edit could ever change.
+    t["original_measured"] = "original" in t.pop("failing_names")
     return t
 
 
@@ -509,9 +580,11 @@ def _share_ok(got: int, of: int) -> bool:
 
 def _target_ok(t: dict[str, Any]) -> list[str]:
     out = []
-    if not t["original_fixed"]:
+    if not t["original_fixed"] and t.get("original_measured", True):
         out.append("the original prompt still fails")
-    if not _share_ok(t["fixed"], t["of"]):
+    if not t["of"]:
+        out.append("no failing prompt shows the failure in its unedited reference run, so no fix can be measured")
+    elif not _share_ok(t["fixed"], t["of"]):
         out.append(f"fixes only {t['fixed']}/{t['of']} failing prompts")
     if t["passing"] and not _share_ok(t["passing_kept"], t["passing"]):
         out.append(f"breaks {t['passing'] - t['passing_kept']}/{t['passing']} working prompts")
@@ -624,9 +697,9 @@ class _Ctx:
     sel0: Optional[dict] = None
 
 
-def _verify(x: _Ctx, patch: E.Patch, step: dict[str, Any]) -> list[str]:
-    """Every check of the mode, cheapest first, with the patch applied by the caller. Fills `step`;
-    returns the problems (empty: the patch passes)."""
+def _verify(x: _Ctx, patch: Optional[E.Patch], step: dict[str, Any]) -> list[str]:
+    """Every check of the mode, cheapest first, with the patch (or steering hooks) applied by the caller. Fills
+    `step`; returns the problems (empty: it passes). patch None = steering: no weights to round."""
     lm, c = x.lm, x.res.contrast
     tg = _target(lm, c, x.clf)
     step["target"] = tg
@@ -642,8 +715,11 @@ def _verify(x: _Ctx, patch: E.Patch, step: dict[str, Any]) -> list[str]:
     if x.mode == "deep" and x.fresh is not None:
         if x.fresh["failing"]:
             x.fresh["consulted"] += 1
-            fr = _judge(c.kind, x.fresh["failing"], x.fresh["passing"], x.clf, _usual(c), ref=x.fresh.get("ref"))
+            fref = x.fresh.get("reference")
+            fr = _judge(c.kind, x.fresh["failing"], x.fresh["passing"], fref.clf if fref else x.clf, _usual(c),
+                        ref=fref.replies if fref else None)
             fr.pop("fixed_names")
+            fr.pop("failing_names", None)
             step["fresh"] = fr
             fb = []
             if not _share_ok(fr["fixed"], fr["of"]):
@@ -667,7 +743,9 @@ def _verify(x: _Ctx, patch: E.Patch, step: dict[str, Any]) -> list[str]:
         if sp:
             return ["passes the greedy checks, but " + "; ".join(sp)]
     # Serving precision last: it rounds the touched tensors in place (restored by `applied`).
-    if x.serve is not None:
+    if patch is None:
+        step["serving"] = {"note": "steering adds a vector at inference; no weights change, nothing to round"}
+    elif x.serve is not None:
         loaded = next(lm.model.parameters()).dtype
         name = str(x.serve).replace("torch.", "")
         if loaded == x.serve:
@@ -727,12 +805,11 @@ def _prepare(lm: LM, res: Any, *, mode: str, clf: Classifier, confirm: tuple[str
             elif not e.groups:
                 fresh["passing"].append(e)
         say(f"fresh variants: {len(fresh['failing'])} failing, {len(fresh['passing'])} working of {len(cand)}")
-        fresh["ref"] = reference(clf, fresh["failing"], fresh["passing"])
-        fresh["ref_agrees"] = _agreement(c.kind, fresh["failing"], fresh["passing"], fresh["ref"])
+        fresh["reference"] = _prepared_reference(c.kind, clf, fresh["failing"], fresh["passing"], say,
+                                                 "fresh variants")
     # The unpatched reference for the target check (see `reference`): same list, same chunks as the
     # patched runs, so noise from batching cannot count as a fix.
-    c._ref = reference(clf, c.failing, c.passing)
-    c._ref_agrees = _agreement(c.kind, c.failing, c.passing, c._ref)
+    c.reference = _prepared_reference(c.kind, clf, c.failing, c.passing, say, "target prompts")
     sb = None
     if sampled:
         cfg = {"n": sampled.get("n", 4), "max_new": sampled.get("max_new", 512), "seed": sampled.get("seed", 0),
@@ -769,9 +846,16 @@ def _site_summary(sm: Optional[S.SiteMap]) -> Optional[dict]:
 def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int = 48,
            template_kwargs: Optional[dict] = None, budget: Optional[R.Budget] = None, keep: tuple[str, ...] = (),
            mode: str = "fast", confirm: tuple[str, ...] = (), sampled: Optional[dict] = None,
-           serve: str = "auto", playbook: bool = True, log: Optional[Callable[[str], None]] = print) -> Repair:
+           serve: str = "auto", playbook: bool = True, steering: str = "fallback",
+           log: Optional[Callable[[str], None]] = print) -> Repair:
     """Search the candidates for the first step passing every check of `mode` ("fast" | "deep");
-    `sampled` (deep only): {"n", "max_new", "prompts", "params"} for paired sampled runs."""
+    `sampled` (deep only): {"n", "max_new", "prompts", "params"} for paired sampled runs.
+
+    steering: "fallback" (default) tries activation steering against the diagnosed direction when no weight edit
+    passes; "only" tries steering and no weight edit (for comparing the two); "off" never steers. A steering that
+    passes the same checks returns status "steered" with `Repair.steering` set (no patch)."""
+    if steering not in ("fallback", "only", "off"):
+        raise ValueError(f"steering must be fallback, only or off, not {steering!r}")
     t0 = time.perf_counter()
     say = log or (lambda s: None)
     budget = budget or R.Budget()
@@ -782,21 +866,22 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
     if why:
         return Repair("not_indicated", entry.name, f"surgery not indicated: {why[0]}", next_step=why[1],
                       seconds=time.perf_counter() - t0, mode=mname)
-    clf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs)
+    clf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs,
+                     expect_refuse=bool(res.contrast) and res.contrast.kind == "complied")
     fresh, sb, prs, sel0, sm = _prepare(lm, res, mode=mode, clf=clf, confirm=confirm,
                                         sampled=sampled if mode == "deep" else None, say=say)
     checks: dict[str, Any] = {}
     # How often the unpatched reference run kept each example's label (expected: always). A difference
     # is batching-level noise on a near tie; the checks count against the reference either way.
-    ra = {"target": getattr(res.contrast, "_ref_agrees", None),
-          "fresh": (fresh or {}).get("ref_agrees")}
+    tref, fref = res.contrast.reference, (fresh or {}).get("reference")
+    ra = {"target": tref.describe() if tref else None, "fresh": fref.describe() if fref else None}
     checks["reference_runs"] = {k: v for k, v in ra.items() if v is not None}
     if prs:
         checks["continuations"] = {"pairs": len(prs), "before": {k: round(v, 4) for k, v in sel0.items()}}
     if sm is not None:
         checks["sites"] = _site_summary(sm)
-    cands = candidates(lm, res, mode=mode, sitemap=sm) if playbook else []
-    if mode == "deep" and len(prs) >= 4 and playbook:
+    cands = candidates(lm, res, mode=mode, sitemap=sm) if playbook and steering != "only" else []
+    if mode == "deep" and len(prs) >= 4 and playbook and steering != "only":
         sc, sinfo = screened_candidate(lm, prs)
         checks["layer_screen"] = sinfo
         say("layer screen: " + (f"layers {sinfo['layers']} confirmed on held-out pairs" if sc else sinfo["why"]))
@@ -805,10 +890,16 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
     if not cands:
         base = R.baseline(lm, keep=keep, keep_lang=expect_lang or "en", template_kwargs=template_kwargs)
         x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0)
+        trials: list[dict] = []
+        if playbook and steering != "off":
+            got = _try_steering(x, A.targets(lm, c), trials, say)
+            if got is not None:
+                return _steered(entry, *got, trials, checks, mname, x, time.perf_counter() - t0)
         return Repair("could_not_fix", entry.name, "the diagnosis named no direction or component to edit"
+                      + ("; steering against the diagnosed direction did not pass either" if trials else "")
                       if playbook else "the rule-based playbook was skipped (--agent-only)",
-                      next_step=entry.could_not_fix, seconds=time.perf_counter() - t0, mode=mname, checks=checks,
-                      ctx=x, sitemap=sm)
+                      trials=trials, next_step=entry.could_not_fix, seconds=time.perf_counter() - t0, mode=mname,
+                      checks=checks, ctx=x, sitemap=sm)
     ts = A.targets(lm, c)
     say(f"surgery ({entry.name}, {mname} mode): {len(cands)} candidate(s); regression baseline on "
         f"{len(R.SUITE) + len(keep)} prompts")
@@ -868,6 +959,11 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
             say(f"  {cand.label} {strength}: fixed {tg['fixed']}/{tg['of']}, every {mname} check passed "
                 f"({_drift(reg)})")
             return _fixed(entry, patch, tg, reg, step, trials, checks, c, mname, x, time.perf_counter() - t0)
+    # No weight edit passed: try steering against the diagnosed direction (an inference-time fix).
+    if steering != "off":
+        got = _try_steering(x, ts, trials, say)
+        if got is not None:
+            return _steered(entry, *got, trials, checks, mname, x, time.perf_counter() - t0)
     # Nothing passed: say what came closest and why it failed.
     # Closest: fixed the target with the fewest regression problems, else fixed the most prompts.
     def rank(st: dict) -> tuple:
@@ -885,6 +981,217 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
     return Repair("could_not_fix", entry.name, f"{entry.name}: could not fix inside the regression budget ({reason})",
                   trials=trials, next_step=entry.could_not_fix, seconds=time.perf_counter() - t0, mode=mname,
                   checks=checks, ctx=x, sitemap=sm)
+
+
+def causal_layers(res: Any, top: int = 2) -> list[tuple[int, float]]:
+    """(layer, impact) of the layers that cause the failure most, from the diagnosis's own activation patching
+    (deep/analysis.localise): how much of the failure goes away when that layer's attention and MLP outputs are
+    replaced by a working run's. Already computed; no extra forward pass."""
+    loc = getattr(res, "loc", None)
+    if loc is None or not loc.attn:
+        return []
+    impact = [max(0.0, a) + max(0.0, m) for a, m in zip(loc.attn, loc.mlp)]
+    order = sorted(range(len(impact)), key=lambda i: -impact[i])
+    return [(i, round(impact[i], 4)) for i in order[:top] if impact[i] > 0]
+
+
+def steering_candidates(res: Any, n_layers: int, keep_refusals: bool = False) -> list[dict[str, Any]]:
+    """What to steer with, most selective first. Each: {source, placement, layers, u (unit), per (gap per layer),
+    sign (-1: against the direction, +1: toward it)}.
+
+    0. At the layers the diagnosis measured as most causal (activation patching, `causal_layers`): the most
+       causal layer alone, the second alone, then both; the failing-minus-working direction at that depth.
+       Steering one layer moves the least of what must stay, so it comes first.
+    1. The diagnosed direction at its chosen depth, after that layer or over the three layers up to it.
+    2. For refusal failures, the known refusal direction (harmful minus harmless prompts): at the causal layers,
+       then over three layers around the middle and two thirds of the depth; against it for over-refusal,
+       toward it for under-refusal ("complied").
+
+    keep_refusals (the safety rule is on) for over-refusal: first, the diagnosed direction with its component along
+    the known refusal direction removed, at the causal layers. Steering along what is left cannot push the harmful-
+    request refusal one way or the other, so real refusals stay (found by the agent: held-out 81% -> 92%, no refusal
+    lost)."""
+    out: list[dict[str, Any]] = []
+    d = getattr(res, "directions", None)
+    kind = res.contrast.kind if getattr(res, "contrast", None) else None
+    kv = getattr(res, "known_vectors", None)
+    ref = (getattr(kv, "by_name", {}) or {}).get("refusal") if kv is not None else None
+    cl = causal_layers(res)
+
+    def at(vec_by_depth, layers, source, sign):
+        v = vec_by_depth[layers[-1] + 1].float().cpu()
+        if float(v.norm()) == 0:
+            return None
+        placement = (f"after layer {layers[0]}" if len(layers) == 1 else
+                     f"after layers {', '.join(map(str, layers))}")
+        return {"source": source, "placement": placement + " (most causal)" if layers == [cl[0][0]] else placement,
+                "layers": layers, "u": v / v.norm(), "per": float(v.norm()) / len(layers), "sign": sign}
+    sets = [[cl[0][0]]] if cl else []
+    if len(cl) > 1:
+        sets += [[cl[1][0]], sorted({cl[0][0], cl[1][0]})]
+    if keep_refusals and kind == "refusal" and ref is not None and d is not None:
+        orth = d.by_depth.clone().float()
+        for k in range(orth.shape[0]):
+            r = ref[k].float()
+            if float(r.norm()) > 0:
+                r = r / r.norm()
+                orth[k] = orth[k] - (orth[k] @ r) * r
+        for ls in sets:
+            c = at(orth, ls, "the diagnosed direction without its refusal part", -1)
+            if c:
+                out.append(c)
+    if d is not None:
+        for ls in sets:
+            c = at(d.by_depth, ls, "the diagnosed direction", -1)
+            if c:
+                out.append(c)
+    if d is not None and d.best_depth >= 1 and float(d.by_depth[int(d.best_depth)].norm()) > 0:
+        depth = int(d.best_depth)
+        gap = float(d.by_depth[depth].norm())
+        u = d.unit(depth).float().cpu()
+        last = depth - 1                            # depth k is the output of layer k - 1
+        out.append({"source": "the diagnosed direction", "placement": f"after layer {last}", "layers": [last],
+                    "u": u, "per": gap, "sign": -1})
+        if last >= 2:
+            out.append({"source": "the diagnosed direction", "placement": f"over layers {last - 2}-{last}",
+                        "layers": [last - 2, last - 1, last], "u": u, "per": gap / 3, "sign": -1})
+    if kind in ("refusal", "complied") and ref is not None:
+        for ls in sets:
+            c = at(ref, ls, "the known refusal direction", -1 if kind == "refusal" else 1)
+            if c:
+                out.append(c)
+        for frac in (0.5, 2 / 3):
+            depth = max(2, min(n_layers - 1, round(frac * n_layers)))
+            v = ref[depth].float().cpu()
+            if float(v.norm()) == 0:
+                continue
+            layers = [depth - 2, depth - 1, depth]
+            out.append({"source": "the known refusal direction", "placement": f"over layers {layers[0]}-{layers[-1]}",
+                        "layers": layers, "u": v / v.norm(), "per": float(v.norm()) / 3,
+                        "sign": -1 if kind == "refusal" else 1})
+    # The most causal layer is often the diagnosis's chosen depth too: the same direction at the same layers is
+    # tried once (each trial costs a full verification).
+    seen: set[tuple] = set()
+    uniq = []
+    for cd in out:
+        key = (cd["source"], tuple(cd["layers"]), cd["sign"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(cd)
+    return uniq
+
+
+def _working_levels(lm: LM, res: Any, u: torch.Tensor, layers: list[int]) -> list[float]:
+    """The working examples' component along u after each layer, at their decision positions: where a clamp
+    lowers the failing ones to (the largest of them, so no working example is touched at its decision)."""
+    vals = []
+    for e in res.contrast.passing[:8]:
+        ids = getattr(e, "decision_ids", None)
+        if ids is None:
+            continue
+        r = lm.run(ids, capture=("resid",)).resid           # [n_layers + 1, d]
+        vals.append([float(r[i + 1] @ u) for i in layers])
+    return [max(v[j] for v in vals) for j in range(len(layers))] if vals else []
+
+
+def _try_steering(x: _Ctx, ts: list, trials: list, say: Callable[[str], None]):
+    """Steering candidates, weakest first, through the same screen and checks as a weight edit (no rounding
+    check: steering changes no weights). Returns (Steering, step) for the first that passes, or None."""
+    lm = x.lm
+    cl = causal_layers(x.res)
+    if cl:
+        say("  steering starts at the most causal layers (diagnosis patching): " +
+            ", ".join(f"layer {i} (patching it removes {v:.2f} of the failure's lead" +
+                      (", more than all of it: the layer drives it" if v > 1 else "") + ")" for i, v in cl))
+    for cd in steering_candidates(x.res, lm.n_layers, keep_refusals=not x.budget.allow_safety_loss):
+        u, layers, per, sign, src, placement = cd["u"], cd["layers"], cd["per"], cd["sign"], cd["source"], \
+            cd["placement"]
+        # 1. clamp (conditional), only when steering against: the component is lowered to the working level
+        lv = _working_levels(lm, x.res, u, layers) if sign < 0 else []
+        if lv:
+            row = {"candidate": f"clamp {src} to the working level, {placement}", "scope": "steering",
+                   "kind": "steering", "evidence": f"working examples' component along it at most {max(lv):.2f}; "
+                                                   "lowered only where above that", "steps": []}
+            trials.append(row)
+            for margin in (0.0, -0.5):
+                level = max(lv) + margin * per * len(layers)
+                st = Steering(u, level, layers, f"clamp {src} to {level:.2f} {placement}", src, mode="clamp")
+                got = _steer_step(x, ts, row, st, f"level {level:.2f}", last=margin == -0.5, say=say)
+                if got is not None:
+                    return got
+        # 2. add: a constant shift against (or toward) the direction
+        toward = "toward" if sign > 0 else "against"
+        row = {"candidate": f"steering {toward} {src}, {placement}", "scope": "steering", "kind": "steering",
+               "evidence": f"gap {per * len(layers):.2f} at depth {layers[-1] + 1}; added at every position",
+               "steps": []}
+        trials.append(row)
+        for k, sc in enumerate(STEER_SCALES):
+            st = Steering(u, sign * sc * per, layers, f"steer {'+' if sign > 0 else '-'}{sc:g} x gap {toward} {src} "
+                          f"{placement}", src)
+            got = _steer_step(x, ts, row, st, f"{sc:g} x gap", last=k == len(STEER_SCALES) - 1, say=say)
+            if got is not None:
+                return got
+    return None
+
+
+def _steer_step(x: _Ctx, ts: list, row: dict, st: "Steering", strength: str, *, last: bool,
+                say: Callable[[str], None]):
+    """One steering trial: the screen (a step that flips nothing is skipped unless it is the last), then the same
+    checks as a weight edit. Returns (Steering, step) when it passes."""
+    lm = x.lm
+    step: dict[str, Any] = {"strength": strength, "steering": st.as_dict()}
+    row["steps"].append(step)
+    with lm.steer(**st.kwargs()):
+        sc = _screen(lm, ts)
+        step["screen"] = sc
+        if not last and sc["flipped"] == 0:
+            step["result"] = "no failing prompt flips at the decision token"
+            say(f"  {row['candidate']} {strength}: {step['result']}")
+            return None
+        probs = _verify(x, None, step)
+        rows = step.pop("_regression_rows", None)
+    if probs:
+        step["problems"] = probs
+        step["result"] = "; ".join(probs)
+        say(f"  {row['candidate']} {strength}: {step['result']}")
+        return None
+    step["result"] = "fixed"
+    step["control"] = _steer_control(x, st, step["target"])
+    say(f"  {row['candidate']} {strength}: fixed {step['target']['fixed']}/{step['target']['of']}, every check "
+        f"passed ({_drift(step['regression'])})")
+    step["_rows"] = rows
+    return st, step
+
+
+def _steer_control(x: _Ctx, st: Steering, tg: dict[str, Any]) -> dict[str, Any]:
+    """A random direction of the same size at the same layers: reported, never used to reject."""
+    g = torch.Generator().manual_seed(0)
+    r = torch.randn(st.vector.shape[0], generator=g)
+    r = r - (r @ st.vector) * st.vector
+    r = r / r.norm()
+    with x.lm.steer(**{st.mode: (r, st.alpha, st.layers)}):
+        t = _target(x.lm, x.res.contrast, x.clf)
+    out = {"label": "random direction, same size and layers", "fixed": t["fixed"], "of": t["of"],
+           "passing_kept": t["passing_kept"], "passing": t["passing"]}
+    out["specific"] = t["fixed"] * 2 < max(1, tg["fixed"])
+    out["verdict"] = (f"specific: a random direction fixes {t['fixed']}/{t['of']} against {tg['fixed']}/{tg['of']}"
+                      if out["specific"] else f"not specific: a random direction also fixes {t['fixed']}/{t['of']}")
+    return out
+
+
+def _steered(entry: Entry, st: Steering, step: dict, trials: list, checks: dict, mname: str, x: _Ctx,
+             seconds: float) -> Repair:
+    tg, reg = step["target"], dict(step["regression"], rows=step.pop("_rows", None) or [])
+    summ = (f"{entry.name} fixed by steering ({st.label}; {mname} checks, no weights changed): {tg['fixed']}/"
+            f"{tg['of']} failing prompts pass, {tg['passing_kept']}/{tg['passing']} working prompts still pass; on "
+            f"{reg['prompts']} regression prompts {_drift(reg)}, harmful requests still refused "
+            f"{reg['safety_refused_before'] - len(reg['safety_lost'])}/{reg['safety_refused_before']}")
+    for key in ("fresh", "sampled", "control"):
+        if key in step:
+            checks[key] = step[key]
+    checks["steering"] = st.as_dict()
+    return Repair("steered", entry.name, summ, trials=trials, regression=reg, target=tg, seconds=seconds, mode=mname,
+                  checks=checks, ctx=x, steering=st)
 
 
 def _fixed(entry: Entry, patch: E.Patch, tg: dict, reg: dict, step: dict, trials: list, checks: dict, c: Any,
@@ -927,7 +1234,7 @@ def _fixed(entry: Entry, patch: E.Patch, tg: dict, reg: dict, step: dict, trials
                  "samples in REPAIR.md before shipping the patch")
     patch.checks = {"mode": mname, "status": status, **{k: v for k, v in checks.items() if k != "sites"}}
     return Repair(status, entry.name, summ, patch=patch, trials=trials, regression=reg, target=tg,
-                  seconds=seconds, mode=mname, checks=checks)
+                  seconds=seconds, mode=mname, checks=checks, ctx=x)
 
 
 def check(lm: LM, res: Any, patch: E.Patch, *, expect_lang: Optional[str] = None, max_new: int = 48,
@@ -942,7 +1249,8 @@ def check(lm: LM, res: Any, patch: E.Patch, *, expect_lang: Optional[str] = None
     c = res.contrast
     entry = ENTRIES.get(c.kind, GENERIC) if c else GENERIC
     mname = _mode_name(mode, sampled)
-    clf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs)
+    clf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs,
+                     expect_refuse=bool(res.contrast) and res.contrast.kind == "complied")
     fresh, sb, prs, sel0, _ = _prepare(lm, res, mode=mode, clf=clf, confirm=confirm,
                                        sampled=sampled if mode == "deep" else None, say=say)
     base = R.baseline(lm, keep=keep, keep_lang=expect_lang or "en", template_kwargs=template_kwargs)
@@ -1067,6 +1375,11 @@ def save_patched_model(lm: LM, patch: E.Patch, out: Path, dtype: Optional[torch.
             lm.model.config.dtype = dtype
         try:
             lm.model.save_pretrained(str(out), state_dict=sd)
+        except Exception as e:                           # noqa: BLE001 - safetensors raises its own error type
+            if "space" in str(e).lower() or "StorageFull" in str(e):
+                raise OSError(f"the disk filled up while writing the patched model to {out}: free some space, "
+                              "delete that folder and run again") from e
+            raise
         finally:
             if dtype is not None:
                 lm.model.config.dtype = prev
@@ -1086,6 +1399,12 @@ def write(rep: Repair, out: Path, lm: Optional[LM] = None, save_model: bool = Fa
     lines = [f"# Surgery: {rep.entry}", "", f"**{rep.status.replace('_', ' ')}** ({rep.mode} mode) - {rep.summary}", ""]
     if rep.next_step:
         lines += [f"Next step: {rep.next_step}", ""]
+    if rep.steering is not None:
+        from . import steer as SV
+        d = SV.save(rep.steering.vector, rep.steering.alpha, rep.steering.layers, rep.steering.label, out,
+                    mode=rep.steering.mode)
+        lines += [f"Steering: {rep.steering.label} ({rep.steering.mode}, alpha {rep.steering.alpha:.3f}, layers "
+                  f"{rep.steering.layers}); no weights change. Files in `{d}` (vector, settings, APPLY.md).", ""]
     if rep.patch:
         lines += [f"Patch: `{rep.patch.label}` ({len(rep.patch.deltas)} matrices, {rep.patch.n_weights_changed:,} "
                   f"weights changed, stored as {rep.patch.size_floats:,} floats). "
@@ -1109,6 +1428,6 @@ def write(rep: Repair, out: Path, lm: Optional[LM] = None, save_model: bool = Fa
             lines.append(f"  - {st['strength']}: {st.get('result', '')}{extra}")
     (out / "REPAIR.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if rep.patch:
-        rep.patch.save(out / "patch")
+        rep.patch.save(out / "patch", lm)
         if save_model and lm is not None:
             save_patched_model(lm, rep.patch, out / "model", serve_dtype(lm, "auto"))

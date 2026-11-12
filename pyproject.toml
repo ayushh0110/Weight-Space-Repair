@@ -5,20 +5,41 @@ build-backend = "hatchling.build"
 [project]
 name = "wsr-triage"
 version = "0.1.0"
-description = "Triage layer of the Weight-Space Repair CLI: find out why a model failed, and say how to fix it."
+description = "Weight-Space Repair: find out why an open-weight model failed, and fix it at the right level, from a setting to a verified weight edit."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+authors = [{ name = "Ayush" }]
+keywords = ["llm", "debugging", "triage", "interpretability", "model-editing", "gguf", "safetensors"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = []
 
 [project.optional-dependencies]
 templates = ["jinja2>=3.1"]
 modelvet = ["modelvet>=0.1.1"]
-deep = ["torch>=2.2", "transformers>=4.45", "safetensors>=0.4", "numpy>=1.24"]
+deep = ["torch>=2.2", "transformers>=4.45", "safetensors>=0.4", "numpy>=1.24", "psutil>=5.9"]
 agent = ["anthropic>=0.101"]
 agent-openai = ["openai>=1.40"]
-all = ["jinja2>=3.1", "modelvet>=0.1.1", "torch>=2.2", "transformers>=4.45", "safetensors>=0.4", "numpy>=1.24"]
-dev = ["pytest>=8", "jinja2>=3.1"]
+data = ["huggingface_hub>=0.23", "pyarrow>=15"]      # wsr data fetch (gsm8k and mgsm are parquet)
+yaml = ["pyyaml>=6"]                                 # goal files written as YAML
+all = ["jinja2>=3.1", "modelvet>=0.1.1", "torch>=2.2", "transformers>=4.45", "safetensors>=0.4", "numpy>=1.24",
+       "psutil>=5.9", "huggingface_hub>=0.23", "pyarrow>=15", "pyyaml>=6"]
+dev = ["pytest>=8", "ruff>=0.5", "jinja2>=3.1"]
+
+[project.urls]
+Repository = "https://github.com/ayushh0110/Weight-Space-Repair"
+Issues = "https://github.com/ayushh0110/Weight-Space-Repair/issues"
 
 [project.scripts]
 wsr = "wsr.cli:main"

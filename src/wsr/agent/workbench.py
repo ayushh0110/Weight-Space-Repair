@@ -47,10 +47,16 @@ class Budget:
     reads: int = 80                 # teacher-forced reads (up to 64 texts each)
     computes: int = 300             # workspace runs (the paper's editor had 300 code runs)
     compute_seconds: float = 120.0  # wall clock per workspace run
-    max_weights_changed: int = 5_000_000
+    max_free_params: int = 5_000_000     # rank x (rows + cols) per tensor, summed (Patch.n_free_params)
+    gate_max_off: float = 0.02       # a gate may fire on at most this share of positions that must stay unchanged
     max_alpha: float = 10.0
     max_rank: int = 1024            # per changed tensor
     max_rel_change: float = 1.0     # |delta| / |W| per changed tensor
+    fits: int = 8                   # fit_edit runs (each trains a low-rank change)
+    fit_seconds: float = 300.0      # wall clock per fit
+    max_fit_steps: int = 300
+    max_fit_rank: int = 32
+    weight_edits: bool = True       # False (--no-weight-edits): only steering and settings may fix it
     allow: tuple = ()               # opt-in unlocks from the user (UNLOCKS): embed, unembed, final_norm, rescale, large
 
 
@@ -67,7 +73,7 @@ class Workbench:
     verified: dict[str, dict] = field(default_factory=dict)    # edit id -> the verify step that passed
     results: dict[str, dict] = field(default_factory=dict)     # edit id -> last verify step
     used: dict[str, int] = field(default_factory=lambda: {"verifications": 0, "screens": 0, "generations": 0,
-                                                          "reads": 0, "computes": 0})
+                                                          "reads": 0, "computes": 0, "fits": 0})
     done: Optional[dict] = None                                 # {"submit": id, ...} or {"give_up": ...}
     pairsets: dict[str, list] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
@@ -286,6 +292,13 @@ class Workbench:
     def _cap(x: Any, n: int) -> int:
         return max(1, min(int(x), n))
 
+    def _max_new_cap(self) -> int:
+        """generate may run as long as verify_edit judges: 512 tokens, or the longer length the target check
+        uses when the failure starts past the cap (playbook._longer_reference). Otherwise the agent could not
+        see what its edit is judged on."""
+        ref = self.res.contrast.reference if self.res.contrast else None
+        return max(512, ref.max_new if ref else 0)
+
     # -- tools ---------------------------------------------------------------------------------------
     def compute(self, code: str, why: str = "") -> dict[str, Any]:
         """Run workspace code (lab.py). Variables persist across calls."""
@@ -347,7 +360,9 @@ class Workbench:
                 rows.append(row)
                 summary.append({"tokens": T, "continuation_tokens": len(conts),
                                 "continuation_mean_logprob": round(float(tok_lp.mean()), 4) if conts else None,
-                                "continuation_logprobs": [round(float(v), 3) for v in tok_lp[:32]],
+                                # per token only for a few texts (all of them are in the workspace either way)
+                                **({"continuation_logprobs": [round(float(v), 3) for v in tok_lp[:32]]}
+                                   if len(items) <= 16 else {}),
                                 "next_top5": [[lm.token_str(int(i)), round(float(v), 3)]
                                               for v, i in zip(nxt.values.exp(), nxt.indices)]})
         self.lab.put(name, rows)
@@ -530,28 +545,52 @@ class Workbench:
                                      "note": "held out for the final check; prefer not to tune on them"}
         return out
 
-    def generate(self, prompt: Any, edit_id: Optional[str] = None, max_new: int = 64, samples: int = 1,
-                 temperature: Optional[float] = None, top_p: Optional[float] = None, seed: int = 0,
-                 compare: bool = False, intervene: Optional[dict] = None) -> dict[str, Any]:
-        """Replies (greedy, or `samples` sampled ones seeded per sample), classified by the triage
-        detectors; with `compare`, the original model and the edit on the same seeds."""
-        n = self._cap(samples, 8)
-        runs = [None, edit_id] if (compare and edit_id) else [edit_id]
-        for _ in range(n * len(runs)):
-            if (err := self._spend("generations")):
-                return {"error": err}
+    def _messages(self, prompt: Any) -> list[dict]:
         ex = self._examples()
         if isinstance(prompt, str) and prompt in ex and hasattr(ex[prompt], "messages"):
-            msgs = ex[prompt].messages
-        elif isinstance(prompt, dict) and prompt.get("messages"):
-            msgs = list(prompt["messages"])
-        else:
-            msgs = [{"role": "user", "content": str(prompt)}]
-        clf = self.ctx.clf
-        ids = self.lm.encode(msgs, **(clf.template_kwargs or {}))
-        kw = self._interventions(intervene)
+            return ex[prompt].messages
+        if isinstance(prompt, str) and prompt in ex and isinstance(getattr(ex[prompt], "prompt", None), str):
+            return [{"role": "user", "content": ex[prompt].prompt}]        # a regression-suite reply
+        if isinstance(prompt, dict) and prompt.get("messages"):
+            return list(prompt["messages"])
+        return [{"role": "user", "content": str(prompt)}]
+
+    def _row(self, gen: list[int], msgs: list[dict]) -> dict[str, Any]:
+        ended = bool(gen) and gen[-1] in self.lm.eot_ids
+        text = self.lm.tok.decode(gen[:-1] if ended else gen, skip_special_tokens=True)
+        groups = self.ctx.clf.groups_of(text, gen, request=msgs[-1].get("content"))
+        return {"reply": text[:600], "groups": sorted(groups), "tokens": len(gen), "ended": ended}
+
+    def generate(self, prompt: Any = None, edit_id: Optional[str] = None, max_new: int = 64, samples: int = 1,
+                 temperature: Optional[float] = None, top_p: Optional[float] = None, seed: int = 0,
+                 compare: bool = False, intervene: Optional[dict] = None,
+                 repetition_penalty: Optional[float] = None, prompts: Optional[list] = None) -> dict[str, Any]:
+        """Replies (greedy, or `samples` sampled ones seeded per sample), classified by the triage
+        detectors; with `compare`, the original model and the edit on the same seeds. `prompts` (up to 8):
+        all of them in one call, batched to the free GPU memory (LM.generate_batch plans the batch and halves
+        it on an out-of-memory error); the original and the edit run in the same chunks, so they stay paired."""
+        n = self._cap(samples, 8)
+        runs = [None, edit_id] if (compare and edit_id) else [edit_id]
+        if prompts is not None:
+            if not isinstance(prompts, list) or not 1 <= len(prompts) <= 8:
+                return {"error": "prompts: a list of 1-8 prompts (example names, texts or {messages})"}
+        elif prompt is None:
+            return {"error": "give prompt (one) or prompts (a list of up to 8)"}
         sample = temperature is not None and float(temperature) > 0
         gen_kw = {"do_sample": True, "temperature": float(temperature), "top_p": float(top_p or 1.0)} if sample else {}
+        if repetition_penalty is not None:
+            if not 1.0 <= float(repetition_penalty) <= 1.5:
+                return {"error": "repetition_penalty must be in [1.0, 1.5]"}
+            gen_kw["repetition_penalty"] = float(repetition_penalty)
+        for _ in range((len(prompts) if prompts is not None else 1) * (n if sample else 1) * len(runs)):
+            if (err := self._spend("generations")):
+                return {"error": err}
+        kw = self._interventions(intervene)
+        if prompts is not None:
+            return self._generate_many(prompts, runs, n if sample else 1, int(seed), max_new, gen_kw, kw)
+        msgs = self._messages(prompt)
+        clf = self.ctx.clf
+        ids = self.lm.encode(msgs, **(clf.template_kwargs or {}))
         out: dict[str, Any] = {}
         for eid in runs:
             ctx = E.applied(self.lm, self._edit(eid)) if eid else contextlib.nullcontext()
@@ -559,7 +598,7 @@ class Workbench:
             with ctx, self.lm.steer(**kw):
                 for k in range(n if sample else 1):
                     torch.manual_seed(int(seed) + k)
-                    gen = self.lm.generate(ids, self._cap(max_new, 512), **dict(gen_kw))
+                    gen = self.lm.generate(ids, self._cap(max_new, self._max_new_cap()), **dict(gen_kw))
                     ended = bool(gen) and gen[-1] in self.lm.eot_ids
                     text = self.lm.tok.decode(gen[:-1] if ended else gen, skip_special_tokens=True)
                     groups = clf.groups_of(text, gen, request=msgs[-1].get("content"))
@@ -567,6 +606,24 @@ class Workbench:
             out["edited" if eid else "original"] = rows if len(rows) > 1 else rows[0]
         out["generations_left"] = self.remaining()["generations"]
         return out
+
+    def _generate_many(self, prompts: list, runs: list, k: int, seed: int, max_new: int, gen_kw: dict,
+                       kw: dict) -> dict[str, Any]:
+        msgs = [self._messages(p) for p in prompts]
+        tk = self.ctx.clf.template_kwargs or {}
+        ids = [self.lm.encode(m, **tk) for m in msgs for _ in range(k)]
+        seeds = [seed + j for _ in msgs for j in range(k)]
+        mx = self._cap(max_new, self._max_new_cap())
+        hooks = (lambda: self.lm.steer(**kw)) if kw else None
+        results = [{"prompt": p if isinstance(p, str) else "messages"} for p in prompts]
+        for eid in runs:
+            ctx = E.applied(self.lm, self._edit(eid)) if eid else contextlib.nullcontext()
+            with ctx:
+                gens = self.lm.generate_batch(ids, mx, seeds=seeds, hooks=hooks, **dict(gen_kw))
+            for i, m in enumerate(msgs):
+                rows = [self._row(g, m) for g in gens[i * k:(i + 1) * k]]
+                results[i]["edited" if eid else "original"] = rows if len(rows) > 1 else rows[0]
+        return {"results": results, "generations_left": self.remaining()["generations"]}
 
     def make_direction(self, source: dict[str, Any]) -> dict[str, Any]:
         sts = self._states(source)
@@ -632,6 +689,137 @@ class Workbench:
                         "neuron that causes the failure can rank lower - check candidates with inspect_neuron and "
                         "screen_edit"}
 
+    def _attribution_texts(self) -> tuple[list, str]:
+        c = self.res.contrast
+        if self.ctx.pairs:
+            texts = [(torch.cat([p.prefix, torch.tensor([cont], dtype=torch.long)], 1), p.prefix.shape[1], w)
+                     for p in self.ctx.pairs for cont, w in ((p.bad, 1.0), (p.good, -1.0))]
+            return texts, "matched continuations (repeat + / working -)"
+        texts = []
+        for side, w in ((c.failing[:6], 1.0), (c.passing[:6], -1.0)):
+            for e in side:
+                if e.decision_ids is not None and e.decision_tok is not None:
+                    texts.append((torch.cat([e.decision_ids, torch.tensor([[e.decision_tok]])], 1),
+                                  e.decision_ids.shape[1], w))
+        return texts, "the decision tokens of the failing (+) and working (-) runs"
+
+    def attribute_heads(self, top: int = 20, first_only: bool = True) -> dict[str, Any]:
+        """Causal ranking (activation x gradient) of attention heads, like attribute_neurons."""
+        if (err := self._spend("screens")):
+            return {"error": err}
+        texts, src = self._attribution_texts()
+        if not texts:
+            return {"error": "no failing / working texts to attribute on"}
+        A = S.attribute_heads(self.lm, texts, first_only=bool(first_only)) / max(1, len(texts) // 2)
+        flat = A.flatten()
+        idx = torch.argsort(flat, descending=True)[:self._cap(top, 200)].tolist()
+        ls = A.clamp(min=0).sum(1)
+        order = sorted(range(len(ls)), key=lambda i: -float(ls[i]))[:8]
+        return {"source": src, "heads": [[i // A.shape[1], i % A.shape[1], round(float(flat[i]), 4)] for i in idx],
+                "layers": [[i, round(float(ls[i] / (ls.sum() + 1e-12)), 3)] for i in order],
+                "note": "edit a head with build_edit scale_heads; check it with screen_edit"}
+
+    def _fit_text(self, item: Any, *, own_reply: bool) -> tuple[torch.Tensor, int]:
+        """(ids, start of the trained continuation). An example name with no continuation uses that example's
+        own reply (own_reply); reply_prefix is fed before the continuation without being trained on."""
+        ex = self._examples()
+        name = item if isinstance(item, str) else (item.get("prompt") if isinstance(item, dict) else None)
+        if own_reply and isinstance(name, str) and name in ex and not (isinstance(item, dict) and
+                                                                        item.get("continuation")):
+            e = ex[name]
+            pids = e.prompt_ids if hasattr(e, "prompt_ids") else e.ids
+            gen = [t for t in (e.gen or []) if t not in self.lm.eot_ids][:300]
+            if not gen:
+                raise ValueError(f"{name} has no reply to train on")
+            return torch.cat([pids, torch.tensor([gen], dtype=torch.long)], 1), pids.shape[1]
+        if isinstance(item, dict) and item.get("reply_prefix"):
+            base = {k: v for k, v in item.items() if k not in ("continuation", "reply_prefix")}
+            ids, _ = self._text_ids(base)
+            ids = torch.cat([ids, torch.tensor([self._ids(str(item["reply_prefix"]))], dtype=torch.long)], 1)
+            P0 = ids.shape[1]
+            if item.get("continuation"):
+                ids = torch.cat([ids, torch.tensor([self._ids(str(item["continuation"]))], dtype=torch.long)], 1)
+            return ids, P0
+        return self._text_ids(item)
+
+    def fit_edit(self, params: list, targets: list, keep: Optional[list] = None, rank: int = 4, steps: int = 60,
+                 lr: float = 0.01, kl_weight: float = 1.0, why: str = "") -> dict[str, Any]:
+        """Learn a low-rank change of a few weight matrices from texts (surgery/fit.py)."""
+        from ..surgery import fit as F
+
+        if not self.budget.weight_edits:
+            return {"error": NO_WEIGHT_EDITS}
+        if not isinstance(params, list) or not params or len(params) > 4:
+            return {"error": "params: a list of 1-4 weight matrix names (e.g. model.layers.12.mlp.down_proj.weight)"}
+        frozen = self._forbidden()
+        bad = [p for p in params if p in frozen]
+        if bad:
+            return {"error": f"{bad[0]} is frozen (input embedding, output layer and final norm); request_capability "
+                             "asks the user to unlock it"}
+        rank = int(rank)
+        if not 1 <= rank <= min(self.budget.max_fit_rank, self.budget.max_rank):
+            return {"error": f"rank must be 1-{min(self.budget.max_fit_rank, self.budget.max_rank)}"}
+        steps = int(steps)
+        if not 1 <= steps <= self.budget.max_fit_steps:
+            return {"error": f"steps must be 1-{self.budget.max_fit_steps}"}
+        if not 0 < float(lr) <= 0.1 or not 0 <= float(kl_weight) <= 100:
+            return {"error": "lr must be in (0, 0.1] and kl_weight in [0, 100]"}
+        if not isinstance(targets, list) or not targets or len(targets) > 32:
+            return {"error": "targets: 1-32 objects {item, weight}; weight > 0 makes the continuation more likely, "
+                             "< 0 less likely"}
+        ts = []
+        for t in targets:
+            if not isinstance(t, dict) or "item" not in t:
+                return {"error": "each target is {item, weight}; item as in read (an example name uses its own reply "
+                                 "when no continuation is given), optionally with reply_prefix"}
+            w = float(t.get("weight", 1.0))
+            if w == 0 or abs(w) > 10:
+                return {"error": "a target weight must be non-zero and at most 10 in size"}
+            ids, P0 = self._fit_text(t["item"], own_reply=True)
+            if ids.shape[1] <= P0:
+                return {"error": "a target needs a continuation to train on"}
+            ts.append((ids, P0, w))
+        if keep is None:
+            ks = P._full_texts(self.ctx.base.replies)[:8]
+            for e in self.res.contrast.passing[:4]:
+                gen = [x for x in (e.gen or []) if x not in self.lm.eot_ids][:300]
+                if gen:
+                    ks.append(torch.cat([e.prompt_ids, torch.tensor([gen], dtype=torch.long)], 1))
+        else:
+            if not isinstance(keep, list) or len(keep) > 32:
+                return {"error": "keep: up to 32 items (as in read; an example name keeps its own reply)"}
+            ks = [self._fit_text(k, own_reply=True)[0] for k in keep]
+        if (err := self._spend("fits")):
+            return {"error": err}
+        try:
+            r = F.fit_lowrank(self.lm, params, ts, ks, rank=rank, steps=steps, lr=float(lr),
+                              kl_weight=float(kl_weight), seconds=self.budget.fit_seconds,
+                              max_rel_change=self.budget.max_rel_change if "large" not in self.budget.allow else 1e9)
+        except ValueError as e:
+            return {"error": str(e)}
+        if not r.deltas:
+            return {"error": "the fit changed nothing (the targets may already be met)", "loss_start": r.loss_start}
+        deltas = []
+        for name, U, V in r.deltas:
+            problem = self._check_delta(name, U, V)
+            if problem:
+                return {"error": f"the fitted change fails a build check on {name}: {problem}; try a lower lr, fewer "
+                                 "steps or a higher kl_weight", "loss_start": r.loss_start, "loss_end": r.loss_end}
+            deltas.append(E.Delta(name, U.contiguous(), V.contiguous()))
+        patch = E.Patch(f"fitted rank-{rank} change on " + ", ".join(sorted({d.name for d in deltas})), "agent_fit",
+                        {"why": why, "rank": rank, "steps": r.steps, "targets": len(ts), "keep": len(ks),
+                         "lr": float(lr), "kl_weight": float(kl_weight)}, deltas)
+        if patch.n_free_params > self.budget.max_free_params and "large" not in self.budget.allow:
+            return {"error": f"the fitted change has {patch.n_free_params:,} free parameters, over the cap "
+                             f"{self.budget.max_free_params:,}: lower the rank or fit fewer matrices"}
+        eid = f"e{len(self.edits) + 1}"
+        self.edits[eid] = patch
+        return {"edit_id": eid, "label": patch.label, "steps": r.steps, "stopped": r.stopped, "seconds": r.seconds,
+                "loss_start": r.loss_start, "loss_end": r.loss_end, "weights_changed": patch.n_weights_changed,
+                "free_params": patch.n_free_params, "fits_left": self.remaining()["fits"],
+                "note": "target loss down and keep_kl small is the aim; check the edit with screen_edit / generate, "
+                        "then verify_edit or practice_eval"}
+
     @torch.no_grad()
     def inspect_neuron(self, layer: int, neuron: int) -> dict[str, Any]:
         lm, c = self.lm, self.res.contrast
@@ -657,8 +845,12 @@ class Workbench:
         if example not in ex:
             return {"error": f"unknown example {example!r}"}
         e = ex[example]
-        ids = getattr(e, "decision_ids", None)
-        ids = ids if ids is not None else getattr(e, "prompt_ids", None)
+        ids = next((x for x in (getattr(e, a, None) for a in ("decision_ids", "prompt_ids", "ids")) if x is not None),
+                   None)
+        if ids is None:
+            return {"error": f"{example!r} has no prompt to read"}
+        if not 0 <= int(depth) <= self.lm.n_layers:
+            return {"error": f"depth must be 0-{self.lm.n_layers} (0 = the embeddings, k = after layer k - 1)"}
         r = self.lm.run(ids, capture=("resid",))
         lg = self.lm.logits_of(r.resid[int(depth)][None])[0]
         p = lg.softmax(-1)
@@ -667,6 +859,8 @@ class Workbench:
                                                                   for v, i in zip(top.values, top.indices)]}
 
     def build_edit(self, spec: dict[str, Any]) -> dict[str, Any]:
+        if not self.budget.weight_edits:
+            return {"error": NO_WEIGHT_EDITS}
         lm = self.lm
         spec = _normalise_spec(spec)
         kind = spec.get("kind")
@@ -696,10 +890,15 @@ class Workbench:
                                  f"\"scale\" (0 removes, 0.5 halves, 2 doubles)", "example": EDIT_EXAMPLES["scale_neurons"]
                         if kind == "scale_neurons" else {"kind": "scale_heads", "heads": [[3, 7]], "scale": 0}}
             pairs = [tuple(int(x) for x in n) for n in items]
+            scale = float(spec.get("scale", 0))
+            if abs(scale) > self.budget.max_alpha:
+                return {"error": f"scale {scale} is beyond the allowed {self.budget.max_alpha}"}
             fn = E.scale_neurons if kind == "scale_neurons" else E.scale_heads
-            patch = fn(lm, pairs, float(spec.get("scale", 0)))
+            patch = fn(lm, pairs, scale)
         elif kind == "gate":
             L = int(spec["layer"])
+            if abs(float(spec.get("strength", 1.0))) > self.budget.max_alpha:
+                return {"error": f"strength {spec.get('strength')} is beyond the allowed {self.budget.max_alpha}"}
             src = spec.get("read_source") or {"kind": "contrast"}
             if isinstance(src, str):                      # "contrast" | "continuations"; a direction id is not a source
                 if src in self.directions:
@@ -715,7 +914,8 @@ class Workbench:
                            if (nm == "suite" and r.kind != "safety") or (nm == "harmful" and r.kind == "safety"
                                                                          and r.refused) or nm == f"suite:{r.name}"]
             ref = P._full_texts(self.ctx.base.replies)[:8]
-            plan = S.gate_plan(lm, L, [s for s in sts if s.bad], [s for s in sts if not s.bad], silent, ref)
+            plan = S.gate_plan(lm, L, [s for s in sts if s.bad], [s for s in sts if not s.bad], silent, ref,
+                               max_off=self.budget.gate_max_off)
             if not plan["ok"]:
                 return {"error": "no gate: " + plan["why"]}
             w = self._direction(spec["write_direction_id"], L + 1)
@@ -729,22 +929,28 @@ class Workbench:
             patch = self._free_edit(spec)
         elif kind == "combine":
             parts = [self._edit(i) for i in spec["edit_ids"]]
+            clash = E.overwrite_clash(parts)
+            if clash:
+                return {"error": clash}
             patch = E.Patch(" + ".join(p.label for p in parts), "combined",
                             {"parts": [p.label for p in parts], "kinds": [p.kind for p in parts]},
                             [d for p in parts for d in p.deltas], untie=any(p.untie for p in parts))
         else:
             return {"error": f"unknown edit kind {kind!r}: spec needs \"kind\", one of {', '.join(EDIT_KINDS)}",
                     "example": EDIT_EXAMPLES}
-        if patch.n_weights_changed > self.budget.max_weights_changed:
+        if patch.n_free_params > self.budget.max_free_params and "large" not in self.budget.allow:
             why = ""
             if kind == "orthogonalise" and spec.get("embed", True):
                 why = (" - orthogonalise also edits the input embedding (vocabulary x d_model) unless \"embed\": "
                        "false; or edit fewer layers, or use project / scale_neurons for a local edit")
-            return {"error": f"edit changes {patch.n_weights_changed:,} weights, over the cap "
-                             f"{self.budget.max_weights_changed:,}{why}"}
+            return {"error": f"edit has {patch.n_free_params:,} free parameters (rank x (rows + columns) per "
+                             f"tensor), over the cap {self.budget.max_free_params:,}{why}"}
         eid = f"e{len(self.edits) + 1}"
         self.edits[eid] = patch
-        out = {"edit_id": eid, "label": patch.label, "weights_changed": patch.n_weights_changed}
+        out = {"edit_id": eid, "label": patch.label, "weights_changed": patch.n_weights_changed,
+               "free_params": patch.n_free_params}
+        if patch.n_weights_changed == 0:
+            out["warning"] = "this edit changes no weight: it is the original model"
         if kind == "gate":
             out["gate"] = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in patch.spec["plan"].items()}
         return out
@@ -755,9 +961,9 @@ class Workbench:
         return self.edits[eid]
 
     def screen_edit(self, edit_id: str, pairs_id: Optional[str] = None) -> dict[str, Any]:
+        patch = self._edit(edit_id)
         if (err := self._spend("screens")):
             return {"error": err}
-        patch = self._edit(edit_id)
         ts = A.targets(self.lm, self.res.contrast)
         prs = self._pairs(pairs_id)
         base = self.ctx.sel0 if pairs_id is None else PR.selectivity(self.lm, prs)
@@ -771,9 +977,9 @@ class Workbench:
         return out
 
     def verify_edit(self, edit_id: str) -> dict[str, Any]:
+        patch = self._edit(edit_id)
         if (err := self._spend("verifications")):
             return {"error": err}
-        patch = self._edit(edit_id)
         step: dict[str, Any] = {"strength": "agent", "weights_changed": patch.n_weights_changed}
         with E.applied(self.lm, patch):
             probs = P._verify(self.ctx, patch, step)
@@ -784,7 +990,7 @@ class Workbench:
         if not probs:
             self.verified[edit_id] = step
         return {"passed": not probs, "problems": probs,
-                "target": {k: step["target"][k] for k in ("fixed", "of", "passing_kept", "passing", "original_fixed")
+                "target": {k: step["target"][k] for k in ("fixed", "of", "passing_kept", "passing", "original_fixed", "original_measured")
                            if k in step.get("target", {})},
                 "target_samples": step.get("target", {}).get("samples", [])[:3],
                 "regression": {k: step["regression"].get(k) for k in
@@ -829,12 +1035,27 @@ class Workbench:
             return json.dumps({"error": f"missing field {e} in the input of {name}",
                                "schema": schema.get("input_schema")}, default=str), True
         except (ValueError, TypeError, IndexError, RuntimeError, LabError) as e:
-            return json.dumps({"error": f"{type(e).__name__}: {e}"}), True
+            return json.dumps({"error": f"{type(e).__name__}: {str(e)[:1000]}"}), True
+        except Exception as e:                            # noqa: BLE001 - a fault inside a tool must not end a paid run
+            # Every trial edit and steering hook is undone by its own context manager, so the model is as it was.
+            return json.dumps({"error": f"{name} failed inside wsr ({type(e).__name__}: {str(e)[:500]}); the model "
+                                        "is unchanged. Try the step another way"}), True
         if ignored and isinstance(out, dict):
             out = {**out, "ignored_arguments": ignored}
         bad = isinstance(out, dict) and "error" in out
-        return json.dumps(out, default=str, ensure_ascii=False)[:20000], bad
+        text = json.dumps(out, default=str, ensure_ascii=False)
+        if len(text) > MAX_RESULT:                        # always valid JSON, also when it is cut
+            text = json.dumps({"truncated": f"the result had {len(text):,} characters; its start follows as text. "
+                                            "Ask for less at a time (fewer items or fields)",
+                               "start": text[:MAX_RESULT * 2 // 3]}, ensure_ascii=False)
+        return text, bad
 
+
+MAX_RESULT = 20_000                # characters of one tool result
+
+
+NO_WEIGHT_EDITS = ("weight edits are off for this run (--no-weight-edits: the weights must not change): fix it with "
+                   "steer_eval (add or clamp) or settings_eval, then final_choice with its steering_id or settings_id")
 
 TOOLS: dict[str, Callable[..., dict]] = {
     "list_examples": Workbench.list_examples, "generate": Workbench.generate,
@@ -844,6 +1065,7 @@ TOOLS: dict[str, Callable[..., dict]] = {
     "verify_edit": Workbench.verify_edit, "submit_patch": Workbench.submit_patch, "give_up": Workbench.give_up,
     "compute": Workbench.compute, "read": Workbench.read, "make_pairs": Workbench.make_pairs,
     "screen_layers": Workbench.screen_layers, "note": Workbench.note,
+    "attribute_heads": Workbench.attribute_heads, "fit_edit": Workbench.fit_edit,
     "request_capability": Workbench.request_capability,
 }
 
@@ -997,11 +1219,18 @@ SCHEMAS: list[dict[str, Any]] = [
      "the same random stream). Optional interventions. Costs one generation per reply.",
      "input_schema": {"type": "object", "properties": {
          "prompt": {"description": "an example name, a prompt text, or {messages: [...]}"},
-         "edit_id": {"type": "string"}, "max_new": {"type": "integer", "minimum": 1, "maximum": 512},
+         "prompts": {"type": "array", "maxItems": 8,
+                     "description": "up to 8 prompts at once (instead of prompt): batched to the free GPU memory, "
+                                    "far faster than one call each"},
+         "edit_id": {"type": "string"},
+         "max_new": {"type": "integer", "minimum": 1, "description": "up to 512, or the length verify_edit judges "
+                                                                    "at when that is longer (see the brief)"},
          "samples": {"type": "integer", "minimum": 1, "maximum": 8}, "temperature": {"type": "number"},
          "top_p": {"type": "number"}, "seed": {"type": "integer"}, "compare": {"type": "boolean"},
+         "repetition_penalty": {"type": "number", "minimum": 1.0, "maximum": 1.5,
+                                "description": "a quick decoding probe; measure settings with settings_eval"},
          "intervene": _INTERVENE},
-         "required": ["prompt"]}},
+         "required": []}},
     {"name": "make_direction", "description": "Failing-minus-working direction at every depth from a source, plus "
      "which layers write it (share of the difference per attention / MLP output) and which MLP neurons carry it. "
      "Returns a direction_id for build_edit.",
@@ -1013,6 +1242,33 @@ SCHEMAS: list[dict[str, Any]] = [
          "top": {"type": "integer", "minimum": 1, "maximum": 200},
          "first_only": {"type": "boolean", "description": "loops: score only the step where the continuations part"}},
          "required": []}},
+    {"name": "attribute_heads", "description": "Causal ranking of attention heads (activation x gradient on each "
+     "head's output), like attribute_neurons: which heads raise the failure over the working text. Edit one with "
+     "build_edit scale_heads. Costs one screen.",
+     "input_schema": {"type": "object", "properties": {
+         "top": {"type": "integer", "minimum": 1, "maximum": 200},
+         "first_only": {"type": "boolean"}}, "required": []}},
+    {"name": "fit_edit", "description": "LEARN an edit from texts instead of building it by hand: a rank-r change "
+     "U V^T of 1-4 weight matrices, fitted by gradient descent (U starts at zero) to make target continuations more "
+     "likely (weight > 0) or less likely (weight < 0, unlikelihood), while keeping the next-token distribution on "
+     "the keep texts close to the original (KL; default keep: the regression replies and working replies). For "
+     "failures that no single neuron, head or direction carries. You may write the target continuations yourself "
+     "(e.g. a correct, complete answer for a practice prompt), or use an example's own reply (an example name with "
+     "no continuation). Same build checks as any edit; returns an edit_id for screen_edit / verify_edit / "
+     "practice_eval. Guarded: step and time caps, a free-memory check, out-of-memory ends the fit cleanly.",
+     "input_schema": {"type": "object", "properties": {
+         "params": {"type": "array", "items": {"type": "string"},
+                    "description": "weight matrices, e.g. model.layers.12.mlp.down_proj.weight"},
+         "targets": {"type": "array", "items": {"type": "object"},
+                     "description": "{item, weight}: item as in read ({prompt | messages | raw, reply_prefix?, "
+                                    "continuation?} or an example name); reply_prefix is fed before the continuation "
+                                    "without being trained on"},
+         "keep": {"type": "array", "description": "texts whose behaviour must not move (default: regression + working "
+                                                  "replies)"},
+         "rank": {"type": "integer", "minimum": 1, "maximum": 32},
+         "steps": {"type": "integer", "minimum": 1, "maximum": 300},
+         "lr": {"type": "number"}, "kl_weight": {"type": "number"}, "why": {"type": "string"}},
+         "required": ["params", "targets"]}},
     {"name": "inspect_neuron", "description": "What an MLP neuron writes (tokens its output column promotes / "
      "suppresses through the unembedding) and its activation on failing vs working decision points.",
      "input_schema": {"type": "object", "properties": {"layer": {"type": "integer"}, "neuron": {"type": "integer"}},

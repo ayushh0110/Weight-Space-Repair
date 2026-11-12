@@ -410,6 +410,7 @@ class LM:
                            patch_heads: Optional[dict[tuple[int, int], torch.Tensor]] = None,
                            ablate: Optional[torch.Tensor] = None, ablate_all_positions: bool = True,
                            add: Optional[tuple[torch.Tensor, float, Sequence[int]]] = None,
+                           clamp: Optional[tuple[torch.Tensor, float, Sequence[int]]] = None,
                            zero_heads: Optional[Sequence[tuple[int, int]]] = None,
                            zero_neurons: Optional[Sequence[tuple[int, int]]] = None,
                            project_sites: Optional[tuple[Sequence[Any], float]] = None
@@ -507,6 +508,19 @@ class LM:
             for i in at_layers:
                 regs.append((self.layers[i], "post",
                              lambda m, a, o: _replace_first(o, _first(o) + alpha * vec.to(_first(o).device, _first(o).dtype))))
+        if clamp is not None:
+            # Conditional steering: after each listed layer, wherever the residual's component along the unit u
+            # exceeds `level`, lower it to `level`; positions at or below it are untouched. (u, level, layers).
+            cu, level, at_layers = clamp
+            cu = cu / cu.norm()
+
+            def clamp_hook(m, a, o, u=cu, lv=float(level)):
+                h = _first(o)
+                uu = u.to(h.device, h.dtype)
+                excess = ((h * uu).sum(-1, keepdim=True) - lv).clamp(min=0)
+                return _replace_first(o, h - excess * uu)
+            for i in at_layers:
+                regs.append((self.layers[i], "post", clamp_hook))
         return regs
 
     @property
@@ -608,8 +622,11 @@ class LM:
         ids = ids.to(self.device)
         self._count("fwd")
         self._count("rows")
+        # Only the hooked activations are used: compute the vocabulary projection for one row, not all of them
+        # (the captured activations come before it, so they are identical).
+        extra = {"logits_to_keep": 1} if self._keeps_logits else {}
         with self._hooks(regs):
-            self.model(input_ids=ids, attention_mask=torch.ones_like(ids))
+            self.model(input_ids=ids, attention_mask=torch.ones_like(ids), **extra)
         return got
 
     def neuron_attribution(self, ids: torch.Tensor, metric: Callable[[torch.Tensor], torch.Tensor],
@@ -656,7 +673,8 @@ class LM:
         """[n_layers, n_heads, seq] attention weights from position `pos` to every position (CPU, float32)."""
         ids = ids.to(self.device)
         with self.eager_attention(), self._hooks(self.intervention_hooks(pos=pos, **interventions)):
-            out = self.model(input_ids=ids, attention_mask=torch.ones_like(ids), output_attentions=True)
+            out = self.model(input_ids=ids, attention_mask=torch.ones_like(ids), output_attentions=True,
+                             **({"logits_to_keep": 1} if self._keeps_logits else {}))    # logits unused
         return torch.stack([a[0, :, pos].float().cpu() for a in self.attentions_by_layer(out.attentions)])
 
     @torch.no_grad()

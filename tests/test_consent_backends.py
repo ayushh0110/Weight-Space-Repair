@@ -314,3 +314,111 @@ def test_any_failure_in_the_fast_judge_falls_back_instead_of_ending_the_run(tmp_
     assert j.kind == "pytorch" and "Weird" in j.notes[0]
     src, note = JG.served_original(model_dir=tmp_path, consent=Consent(assume="yes"), server_bin=None)
     assert src is None and "could not be used" in note
+
+
+def test_llama_server_goes_where_it_fits(tmp_path, monkeypatch):
+    from wsr.program import backends as B
+
+    g = tmp_path / "m.gguf"
+    g.write_bytes(b"x" * (300 * 2**20 // 100))                 # a 3 MB stand-in; sizes below are set by hand
+    monkeypatch.setattr(B.Path, "stat", lambda self: type("S", (), {"st_size": 1300 * 2**20})())
+    monkeypatch.setattr(B, "_vram_free", lambda: 4000 * 2**20)
+    assert B.plan_offload(g, 4096)[0] == 99                      # room on the GPU
+    monkeypatch.setattr(B, "_vram_free", lambda: 600 * 2**20)  # the PyTorch model holds most of it
+    monkeypatch.setattr(B, "_ram_free", lambda: 8000 * 2**20)
+    layers, why = B.plan_offload(g, 4096)
+    assert layers == 0 and why.startswith("CPU")
+    monkeypatch.setattr(B, "_ram_free", lambda: 500 * 2**20)
+    with pytest.raises(B.ServerResources, match="does not fit"):
+        B.plan_offload(g, 4096)
+    monkeypatch.setattr(B, "_vram_free", lambda: None)          # no CUDA: llama-server decides
+    assert B.plan_offload(g, 4096)[0] == 99
+
+
+def test_watchdog_stops_the_server_when_the_disk_runs_low(monkeypatch):
+    import shutil as sh
+    from collections import namedtuple
+
+    from wsr.program import backends as B
+
+    class Proc:
+        alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.alive = False
+
+    srv = B.ManagedServer.__new__(B.ManagedServer)
+    srv.proc, srv.stopped_why = Proc(), None
+    monkeypatch.setattr(sh, "disk_usage", lambda p: namedtuple("U", "total used free")(0, 0, 100 * 2**20))
+    srv._watchdog()
+    assert not srv.proc.alive and "free disk" in srv.stopped_why
+    port = B._free_port()                                          # nothing listens there now
+    be = B.ServerBackend(f"http://127.0.0.1:{port}", owned=srv, timeout=2)
+    with pytest.raises(RuntimeError, match="free disk"):            # requests say why the server is gone
+        be._post({})
+
+
+def test_heavy_optional_steps_are_skipped_when_the_machine_cannot_take_them(tmp_path, monkeypatch):
+    from wsr import resources as RS
+    from wsr.program import backends as B
+    from wsr.surgery import export as X
+
+    monkeypatch.setattr(RS, "headroom", lambda: 500 * 2**20)        # 0.5 GB before the page file would fill the disk
+    g = tmp_path / "m.gguf"
+    g.write_bytes(b"x" * 1000)
+    with pytest.raises(B.ServerResources, match="page file"):
+        B.plan_offload(g, 4096)
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"x" * (1 << 30) if False else b"x" * 10)
+    monkeypatch.setattr(X, "_model_bytes", lambda d: 2 * 2**30)
+    with pytest.raises(ValueError, match="page file"):
+        X.export(model, None, tmp_path / "o.gguf", consent=Consent(assume="yes"))
+    monkeypatch.setattr(RS, "headroom", lambda: None)                # cannot measure: not blocked
+    assert RS.check("x", 10**12) is None
+
+
+def test_headroom_is_spare_commit_plus_disk_above_the_floor(monkeypatch):
+    import shutil as sh
+    from collections import namedtuple
+
+    from wsr import resources as RS
+
+    monkeypatch.setattr(RS, "_windows_commit", lambda: (21 * 2**30, 26 * 2**30))       # 5 GB of commit left
+    monkeypatch.setattr(sh, "disk_usage", lambda p: namedtuple("U", "total used free")(0, 0, 13 * 2**30))
+    assert RS.headroom() == 5 * 2**30 + (13 * 2**30 - RS.DISK_FLOOR)
+    monkeypatch.setattr(sh, "disk_usage", lambda p: namedtuple("U", "total used free")(0, 0, 2**30))
+    assert RS.headroom() == 5 * 2**30                                 # below the floor: no disk counted
+
+
+def test_evaluate_runs_one_server_at_a_time_and_keeps_partial_results(fake_server, tmp_path):
+    from wsr.program import evaluate as EV
+
+    srv = fake_server(_reply, threaded=True)
+    (tmp_path / "h.jsonl").write_text("\n".join(json.dumps({"prompt": p, "answer": "4"}) for p in
+                                                ["what is 2+2", "long one", "blank please"]) + "\n")
+    (tmp_path / "g.json").write_text(json.dumps({"name": "g", "heldout": "h.jsonl", "grader": "math"}))
+    obj = O.load(tmp_path / "g.json")
+    events = []
+
+    class Orig(B.ServerBackend):
+        def close(self):
+            events.append("original closed")
+
+    def start_patched():
+        events.append("patched started")
+        return B.ServerBackend(srv.url, parallel=2)
+
+    res = EV.evaluate(Orig(srv.url, parallel=2), obj, patched_source=start_patched, log=False)
+    assert events == ["original closed", "patched started"] and res["paired"]["n"] == 3
+
+    def broken():
+        raise RuntimeError("stopped by wsr: free disk low")
+
+    part = EV.evaluate(Orig(srv.url, parallel=2), obj, patched_source=broken, log=False, partial_ok=True)
+    assert part["verdict"].startswith("incomplete") and part["rates_before"]
+    with pytest.raises(RuntimeError):
+        EV.evaluate(Orig(srv.url, parallel=2), obj, patched_source=broken, log=False)

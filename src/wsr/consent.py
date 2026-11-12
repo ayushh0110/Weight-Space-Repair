@@ -56,7 +56,9 @@ class NeedsConsent(ValueError):
 
 
 def memory_path() -> Path:
-    return Path(os.environ.get("WSR_CACHE_DIR") or Path.home() / ".cache" / "wsr") / "consent.json"
+    from .cache import base
+
+    return base() / "consent.json"
 
 
 def remembered() -> dict[str, bool]:

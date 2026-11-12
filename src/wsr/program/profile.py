@@ -27,6 +27,7 @@ import math
 import shlex
 import time
 from collections import Counter
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -44,7 +45,8 @@ GLOSS = {"EMPTY": "empty reply", "TRUNCATED_LOOP": "cut at the cap, looping tail
          "GARBAGE": "garbage", "TEMPLATE_LEAK": "template leak", "REFUSAL": "refused", "LANGUAGE": "wrong language",
          "TRUNCATED_WORKING": "cut at the cap, still working", "WRONG_ANSWER": "wrong answer",
          "correct": "correct", "ok": "healthy (not graded)", "COMPLIED": "answered a request it should refuse"}
-DEEP_KIND = {"EMPTY": "blank", "TRUNCATED_LOOP": "loop", "LOOP": "loop", "REFUSAL": "refusal", "LANGUAGE": "language"}
+DEEP_KIND = {"EMPTY": "blank", "TRUNCATED_LOOP": "loop", "LOOP": "loop", "REFUSAL": "refusal", "LANGUAGE": "language",
+             "COMPLIED": "complied"}
 SAMPLED_PROBE = {"do_sample": True, "temperature": 0.7, "top_p": 0.9}
 
 
@@ -154,6 +156,31 @@ class Runner:
         return out  # type: ignore[return-value]
 
 
+def _cached_main_pass(r: "Runner", items: list[dict], protocol: Protocol, grader: Optional[str], samples: int,
+                      seed: int) -> Optional[list["Reply"]]:
+    """The unedited PyTorch model's main pass from an earlier run (origcache.py), with its batch plan."""
+    from . import origcache as OC
+    from .backends import TorchBackend
+
+    if not isinstance(r.backend, TorchBackend) or getattr(r.backend.lm, "_steering", 0):
+        return None
+    rows = OC.load(r.backend.lm, "profile-replies", protocol, grader, items, samples, seed)
+    if rows is None:
+        return None
+    return [Reply(d["id"], d["text"], d["n_tokens"], d["ended"], d["cut"], set(d["groups"]), d["correct"], d["label"],
+                  d["seed"]) for d in rows]
+
+
+def _save_main_pass(r: "Runner", items: list[dict], protocol: Protocol, grader: Optional[str], samples: int,
+                    seed: int, reps: list["Reply"]) -> None:
+    from . import origcache as OC
+    from .backends import TorchBackend
+
+    if isinstance(r.backend, TorchBackend) and not getattr(r.backend.lm, "_steering", 0):
+        OC.save(r.backend.lm, "profile-replies", protocol, grader, items, samples, seed,
+                [{**dataclasses.asdict(x), "groups": sorted(x.groups)} for x in reps])
+
+
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     if n == 0:
         return (0.0, 0.0)
@@ -258,10 +285,13 @@ def profile(source, items: list[dict], protocol: Protocol, *, grader: Optional[s
     r = Runner(source, protocol, grader)
     jobs = [{"item": it, "seed": seed_for(i, s, seed)} for i, it in enumerate(items)
             for s in range(samples if protocol.sampled else 1)]
+    if replies is None:
+        replies = _cached_main_pass(r, items, protocol, grader, samples, seed)
     if replies is not None and len(replies) == len(jobs):
         got: list[tuple[dict, Reply]] = [(j["item"], rep) for j, rep in zip(jobs, replies)]
     else:
         got = [(j["item"], rep) for j, rep in zip(jobs, r.run_many(jobs, progress=progress))]
+        _save_main_pass(r, items, protocol, grader, samples, seed, [rep for _, rep in got])
     n = len(got)
     counts = Counter(rep.label for _, rep in got)
     prof = Profile(name, model, protocol.describe(), grader, n, data=data, backend=r.backend.describe(),
@@ -311,7 +341,7 @@ def profile(source, items: list[dict], protocol: Protocol, *, grader: Optional[s
                                   "verdict": verdict.get("verdict")})
                 row["deep"] = row.get("deep", []) + [{"id": it["id"], "summary": res.summary}]
     prof.replies = [{"id": rep.id, "label": rep.label, "correct": rep.correct, "tokens": rep.n_tokens,
-                     "groups": sorted(rep.groups), "seed": rep.seed} for _, rep in got]
+                     "groups": sorted(rep.groups), "seed": rep.seed, "tail": rep.text[-160:]} for _, rep in got]
     prof.generations, prof.tokens, prof.seconds = r.generations, r.tokens, round(time.time() - t0, 1)
     return prof
 

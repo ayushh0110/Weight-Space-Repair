@@ -132,6 +132,37 @@ def attribute(lm: LM, texts: Sequence[tuple[torch.Tensor, int, float]], layers: 
     return out
 
 
+def attribute_heads(lm: LM, texts: Sequence[tuple[torch.Tensor, int, float]],
+                    first_only: bool = False) -> torch.Tensor:
+    """Causal head scores, [n_layers, n_heads] (0 for layers without attention heads): activation x gradient of
+    each head's slice of the attention output projection's input, with the same texts and metric as
+    `attribute`. A head scores high when its output makes the failing continuation more likely than the
+    working one."""
+    layers = [i for i in range(lm.n_layers) if lm.o_proj(i) is not None]
+    heads = max((lm.o_proj(i).weight.shape[1] // lm.head_dim(i) for i in layers), default=0)
+    out = torch.zeros(lm.n_layers, heads)
+    for ids, P, wgt in texts:
+        acts: dict[int, torch.Tensor] = {}
+        regs = [(lm.model.get_input_embeddings(), "post", lambda m, a, o: o.detach().requires_grad_(True))]
+        for i in layers:
+            regs.append((lm.o_proj(i), "pre", lambda m, a, i=i: acts.__setitem__(i, a[0])))
+        x = ids.to(lm.device)
+        with torch.enable_grad(), lm._hooks(regs):
+            k = x.shape[1] - P + 1
+            extra = {"logits_to_keep": k} if lm._keeps_logits else {}
+            lg = lm.model(input_ids=x, attention_mask=torch.ones_like(x), **extra).logits[0][-k:].float()
+            lp = lg[:1 if first_only else -1].log_softmax(-1)
+            tgt = x[0, P:P + 1] if first_only else x[0, P:]
+            metric = lp.gather(1, tgt[:, None]).mean() * wgt
+            grads = torch.autograd.grad(metric, [acts[i] for i in layers], allow_unused=True)
+        for i, g in zip(layers, grads):
+            if g is not None:
+                hd = lm.head_dim(i)
+                s = (acts[i].detach().float() * g.float())[0, P - 1:].sum(0).cpu()
+                out[i, : s.shape[0] // hd] += s.reshape(-1, hd).sum(-1)
+    return out
+
+
 def causal_neurons(lm: LM, pairs: Sequence[Any], top: int = 64, first_only: bool = True) -> dict[str, Any]:
     """The neurons that most raise the repeat's likelihood over the working continuation, from
     matched pairs (pairs.Pair), with the layers they sit in. first_only: score the step where the

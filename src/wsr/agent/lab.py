@@ -15,8 +15,13 @@ start processes, so the agent gets a small language instead:
   Calls the agent makes go through `_call`, which only calls whitelisted functions.
 - in-place tensor methods are not available, and every weight handed out is a copy: the model
   cannot be changed from here. Edits are built only by `build_edit`, from the arrays computed here.
-- every loop step and call checks a wall-clock deadline and a step budget; binary operations check
-  the broadcast size before computing; results above the element cap are refused.
+- every loop step and call checks a wall-clock deadline and a step budget; binary operations and the calls
+  whose result size can be told from their arguments (zeros, outer, cat, diag, a full SVD ...) are checked
+  before computing; results above the element cap are refused; the workspace as a whole has a cap too, and a
+  call that would pass it keeps none of its assignments; integers are capped in size.
+
+One limit this cannot give: a single torch call that is slow by itself (the SVD of a large matrix) runs to its
+end, because the deadline is only checked between operations.
 """
 from __future__ import annotations
 
@@ -29,6 +34,8 @@ from typing import Any, Callable, Optional
 import torch
 
 MAX_ELEMENTS = 64_000_000          # 256 MB of float32 per value
+MAX_WORKSPACE = 8 * MAX_ELEMENTS   # every variable together: 2 GB of float32
+MAX_INT_BITS = 100_000             # integers (10**10000 squared a few times would take minutes and gigabytes)
 MAX_STEPS = 2_000_000              # loop / comprehension iterations per call
 MAX_OUTPUT = 8_000                 # characters returned per call
 
@@ -96,6 +103,78 @@ def _numel(x: Any) -> int:
     return 1
 
 
+def _total(values: Any) -> int:
+    """Elements held by these values, each tensor's memory counted once."""
+    seen: set[int] = set()
+    n = 0
+    stack = [values]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, torch.Tensor):
+            key = v.untyped_storage().data_ptr() if v.numel() else id(v)
+            if key not in seen:
+                seen.add(key)
+                n += v.numel()
+        elif isinstance(v, dict):
+            stack.extend(v.values())
+        elif isinstance(v, (list, tuple, set)):
+            stack.extend(v)
+    return n
+
+
+def _estimate(name: str, fn: Any, args: tuple, kw: dict) -> int:
+    """Elements a call would produce, where its arguments say so before it runs (else 0). The check on the
+    result still runs afterwards; this one stops an allocation of many gigabytes from being attempted.
+    `name`: the name the workspace offers the function under (torch's own __name__ can differ: linalg_svd)."""
+    owner = getattr(fn, "__self__", None)
+    if isinstance(owner, torch.Tensor):
+        args = (owner, *args)
+    ts = [a for a in args if isinstance(a, torch.Tensor)]
+    try:
+        if name in ("zeros", "ones", "rand", "randn", "full", "randint"):
+            size = kw.get("size")
+            if size is None:
+                size = next((a for a in args if isinstance(a, (tuple, list, torch.Size))), None)
+            if size is None:
+                size = [] if name == "randint" else [a for a in args if isinstance(a, int) and not isinstance(a, bool)]
+            return math.prod(int(x) for x in size) if size else 0
+        if name == "eye":
+            return int(args[0]) * int(args[1] if len(args) > 1 else kw.get("m") or args[0])
+        if name == "randperm":
+            return int(args[0])
+        if name == "arange":
+            a = [x for x in args if isinstance(x, (int, float))]
+            lo, hi, step = (0, a[0], 1) if len(a) == 1 else (a[0], a[1], a[2] if len(a) > 2 else 1)
+            return max(0, int((hi - lo) / step))
+        if name == "linspace":
+            return int(args[2] if len(args) > 2 else kw.get("steps", 0))
+        if name in ("outer", "kron") and len(ts) == 2:
+            return ts[0].numel() * ts[1].numel()
+        if name == "pdist" and ts:
+            return ts[0].shape[0] * (ts[0].shape[0] - 1) // 2
+        if name in ("cov", "corrcoef") and ts:
+            return ts[0].shape[0] ** 2 if ts[0].dim() == 2 else 1
+        if name == "diag" and ts and ts[0].dim() == 1:
+            return ts[0].numel() ** 2
+        if name == "diag_embed" and ts:
+            return ts[0].numel() * ts[0].shape[-1]
+        if name == "one_hot" and ts:
+            k = args[1] if len(args) > 1 else kw.get("num_classes", -1)
+            return ts[0].numel() * int(k) if int(k) > 0 else 0
+        if name in ("cat", "stack", "hstack", "vstack") and args and isinstance(args[0], (list, tuple)):
+            return sum(x.numel() for x in args[0] if isinstance(x, torch.Tensor))
+        if name == "svd" and ts and (kw.get("full_matrices") or (len(args) > 1 and args[1] is True)):
+            return ts[0].shape[-2] ** 2 + ts[0].shape[-1] ** 2
+        if name in ("matmul", "mm", "bmm") and len(ts) == 2 and ts[0].dim() >= 2 and ts[1].dim() >= 2:
+            return ts[0].shape[-2] * ts[1].shape[-1] * max(1, math.prod(torch.broadcast_shapes(ts[0].shape[:-2],
+                                                                                              ts[1].shape[:-2])))
+        if len(ts) >= 2:
+            return math.prod(torch.broadcast_shapes(*[t.shape for t in ts]))
+    except (TypeError, ValueError, IndexError, RuntimeError):
+        return 0                                          # not the usual arguments: the call itself will say so
+    return 0
+
+
 class _Rewrite(ast.NodeTransformer):
     """Route attribute access, calls, binary operations and loop iterables through runtime guards."""
 
@@ -150,6 +229,9 @@ class Lab:
             self._callable_ok |= {id(v) for v in vars(ns).values() if callable(v)}
         self._callable_ok |= {id(v) for v in _SAFE_BUILTINS.values() if callable(v)}
         self._callable_ok |= {id(v) for v in helpers.values() if callable(v)}
+        self._svd = getattr(tns["linalg"], "svd", None)
+        self._names = {id(v): k for ns in (tns, vars(tns["linalg"]), vars(tns["F"])) for k, v in ns.items()
+                       if callable(v)}
         self._deadline = 0.0
         self._steps = 0
         self._printed: list[str] = []
@@ -189,6 +271,13 @@ class Lab:
         if fn is print:
             self._printed.append(" ".join(_show(a) for a in args))
             return None
+        if fn is self._svd and "full_matrices" not in kw and len(args) < 2:
+            kw["full_matrices"] = False                  # the reduced SVD: the full one of a vocabulary matrix is 90 GB
+        name = self._names.get(id(fn)) or getattr(fn, "__name__", "")
+        n = _estimate(name, fn, args, kw)
+        if n > MAX_ELEMENTS:
+            raise self._deny("limit:size", f"{name or 'this call'} would produce {n:,} elements, over the cap "
+                                           f"{MAX_ELEMENTS:,}")
         return self._check(fn(*args, **kw))
 
     def _bound_ok(self, fn: Any) -> bool:
@@ -216,9 +305,15 @@ class Lab:
             raise LabError("sequence too long")
         if op == "Mult" and isinstance(b, (list, str, tuple)) and isinstance(a, int) and len(b) * a > 1_000_000:
             raise LabError("sequence too long")
-        if op == "Pow" and isinstance(a, int) and isinstance(b, int) and abs(b) > 10_000:
-            raise LabError("exponent too large")
-        return self._check(_BIN[op](a, b))
+        if isinstance(a, int) and isinstance(b, int):
+            bits = (a.bit_length() + b.bit_length() if op == "Mult" else
+                    a.bit_length() * max(1, abs(b)) if op == "Pow" else 0)
+            if bits > MAX_INT_BITS or (op == "Pow" and abs(b) > 10_000):
+                raise self._deny("limit:int", "integer too large")
+        f = _BIN.get(op)
+        if f is None:
+            raise self._deny(f"syntax:{op}", f"the operator {op} is not available here")
+        return self._check(f(a, b))
 
     def _it(self, xs: Any) -> Any:
         if isinstance(xs, int):
@@ -303,6 +398,12 @@ class Lab:
             err = f"{type(e).__name__}: {e}"
         # Keep what was assigned before an error too, like a notebook cell.
         self.vars = {k: v for k, v in g.items() if not k.startswith("_") and (k not in fixed or v is not fixed[k])}
+        total = _total(self.vars)
+        if total > MAX_WORKSPACE:
+            self.vars = before                           # this call's assignments are dropped; what was there stays
+            raise self._deny("limit:workspace", f"the workspace would hold {total:,} elements (cap {MAX_WORKSPACE:,}): "
+                             "nothing from this call was kept. Overwrite variables you no longer need (x = 0), "
+                             "or keep smaller pieces")
         if err:
             raise LabError(err)
         changed = {k: _show(v, short=True) for k, v in self.vars.items() if k not in before or before[k] is not v}
@@ -325,6 +426,11 @@ class Lab:
     def put(self, name: str, value: Any) -> None:
         if name.startswith("_") or name in self.fixed:
             raise LabError(f"cannot store into {name!r}")
+        total = _total({**self.vars, name: value})
+        if total > MAX_WORKSPACE:
+            raise self._deny("limit:workspace", f"storing {name!r} would bring the workspace to {total:,} elements "
+                             f"(cap {MAX_WORKSPACE:,}): capture fewer positions, depths or texts, or overwrite "
+                             "variables you no longer need (x = 0)")
         self.vars[name] = value
 
     def summary(self) -> dict[str, str]:
@@ -351,7 +457,16 @@ def _show(v: Any, short: bool = False) -> str:
     if isinstance(v, (list, tuple)):
         if short:
             return f"{type(v).__name__}({len(v)})"
-        s = repr(type(v)([_show(x, True) if isinstance(x, (torch.Tensor, dict)) else x for x in v[:200]]))
-        return s[:4000]
-    s = repr(v)
+        big = lambda x: isinstance(x, int) and not isinstance(x, bool) and x.bit_length() > 4000  # noqa: E731
+        items = [_show(x, True) if isinstance(x, (torch.Tensor, dict)) or big(x) else x for x in v[:200]]
+        try:
+            return repr(type(v)(items))[:4000]
+        except (TypeError, ValueError):               # a torch.Size holding a shortened item, an unprintable one
+            return repr(items)[:4000]
+    if isinstance(v, int) and not isinstance(v, bool) and v.bit_length() > 4000:
+        return f"int ({v.bit_length():,} bits)"           # too long to print (Python refuses past 4,300 digits)
+    try:
+        s = repr(v)
+    except ValueError as e:                               # a value that cannot be shown must not break the reply
+        s = f"<{type(v).__name__}: {e}>"
     return s[:4000]

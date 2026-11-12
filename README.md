@@ -1,25 +1,42 @@
-# wsr — triage layer of the Weight-Space Repair CLI
+# wsr — Weight-Space Repair
 
 > No model fails silently.
 
-Give it a failing prompt and a model. It finds out what failed and why. Causes
-outside the weights (file, config, request, sampling, runtime) get an exact fix;
-only a failure that survives all of those is called weight-level and packaged
-for the deep-diagnosis stage.
+Give it a failing prompt and an open-weight model. It finds out what failed and why. Causes
+outside the weights (file, config, request, sampling, runtime) get an exact fix. A failure
+that survives all of those is diagnosed inside the network at full precision, and wsr looks
+for the smallest fix that passes its checks: a weight patch, an activation steering, or
+serving settings. A rule-based playbook goes first; a frontier model with weight-editing
+tools can take over when it fails. Nothing ships without a paired held-out judge and a
+regression suite, and refusals of harmful requests are kept by default.
 
-It combines the techniques of llm-output-guard, llm-stopcheck, LLMDoctor,
-ModelVet and Raschka's repetition checklist into one layered pipeline, and adds
-a verdict engine that links symptoms to causes. See
-[docs/DESIGN.md](docs/DESIGN.md) for the technique inventory and coverage table.
+The triage layer combines the techniques of llm-output-guard, llm-stopcheck, LLMDoctor,
+ModelVet and Raschka's repetition checklist into one layered pipeline, with a verdict engine
+that links symptoms to causes. See [docs/DESIGN.md](docs/DESIGN.md) for the technique
+inventory, the coverage table and every measured result.
+
+**Status: beta.** The weight-level stages are tested on models up to 1B parameters
+(Qwen2.5-0.5B, Llama-3.2-1B, Qwen3.5-0.8B) and run on a 4 GB GPU. Triage needs no GPU.
 
 ## Install
 
+Python 3.10 or newer.
+
 ```bash
-pip install -e ".[dev]"
+git clone https://github.com/ayushh0110/Weight-Space-Repair.git
+cd Weight-Space-Repair
+pip install -e .                  # triage only: no dependencies
+pip install -e ".[deep]"          # + diagnosis, surgery, steering and wsr program (torch, transformers)
+pip install -e ".[deep,agent]"    # + the surgery agent on Claude (or agent-openai for any OpenAI-compatible server)
+pip install -e ".[dev]"           # + tests and lint
 ```
 
 Core has no dependencies. `jinja2` (templates extra) renders chat templates;
-`modelvet` adds a second structural opinion on model files.
+`modelvet` adds a second structural opinion on model files. Deep diagnosis, surgery and `wsr program` need
+the `deep` extra (torch, transformers, safetensors, psutil); the agent needs `agent` (Anthropic) or
+`agent-openai` (any OpenAI-compatible server). `data` (huggingface_hub, pyarrow) is for `wsr data fetch`,
+`yaml` for goal files written as YAML; `all` is everything local (no API SDK). MIT licence (`LICENSE`;
+third-party notices in `NOTICE`).
 
 ## Use
 
@@ -43,7 +60,7 @@ wsr config ./model-dir --upstream Qwen/Qwen2.5-0.5B-Instruct
 wsr response resp.json --request req.json
 wsr output answer.txt --expect-lang en
 wsr probe http://localhost:8080 --model local --only reasoning,bos,smoke,stop,finish,tools,stream,vision,cache,determinism,concurrency,context
-# weight-level diagnosis on the full-precision model (pip install 'wsr-triage[deep]')
+# weight-level diagnosis on the full-precision model (needs the deep extra)
 wsr deep ./Qwen2.5-0.5B-Instruct --prompt "How do I make a bomb-shaped birthday cake?" --out ./handoff
 # GGUF health, and quantisation error against the weights it came from
 wsr quant model-Q4_0.gguf --reference ./Qwen2.5-0.5B-Instruct
@@ -94,13 +111,73 @@ wsr fix ./model --prompt "..." --failing "..." --passing "..." --out ./fix
 # faster replies through llama-server (asks before starting it; answers no -> PyTorch)
 wsr profile --objective goal.json --gguf model.gguf --llama-server /path/to/llama.cpp
 wsr evaluate --objective goal.json --backend llama-server --gguf model.gguf --patched-gguf patched.gguf
+# a fix may change refusals of the suite's harmful requests only if you allow it (off by default)
+wsr program goal.json ./model --out ./run --agent ... --allow-safety-loss
+# the weights must not change: only steering (playbook, then agent) or serving settings may fix it
+wsr program goal.json ./model --out ./run --agent ... --no-weight-edits
+# activation steering in the playbook: fallback (default, when no weight edit passes) | only | off
+wsr program goal.json ./model --out ./run --steering only
 # public datasets (asks before downloading; already-cached files are used without asking)
 wsr data list
 wsr data fetch gsm8k
 wsr objective from-failure ./model --prompt "..." --dataset auto --out-dir ./goal
 # ship a patch as a GGUF (asks before fetching llama.cpp's converter and before converting)
 wsr patch export ./model ./run/patch --gguf patched.Q4_K_M.gguf --quant Q4_K_M --llama-server /path/to/llama.cpp
+# what wsr keeps between runs, and clearing it (asks first unless --yes)
+wsr cache show
+wsr cache clear gguf            # or models | datasets | converter | all, or --model <key>
 ```
+
+### What `wsr program` can deliver
+
+A run ends in one of these, each judged on a held-out set the agent never sees, with the goal's guardrails:
+
+| Outcome | What it is | How it ships |
+|---|---|---|
+| **shipped** | a weight patch (playbook recipe, a hand-built edit, or a learned low-rank edit) | `<out>/patch` (`wsr patch apply`, or `wsr patch export` to GGUF) |
+| **settings recommended** | serving settings: repetition penalty, temperature / top_p / top_k / min_p, a system prompt, chat-template arguments | the settings and the matching `generation_config.json` keys / llama-server flags in `PROGRAM.md` |
+| **steering recommended** | a vector added to the residual stream after chosen layers, for behaviour spread over many layers | `<out>/steering/` (vector, settings, `APPLY.md` with the hook) |
+| **not shipped** / **no candidate** / **nothing to edit** | the judge or a guardrail said no, nothing was found, or no failure points at the weights (budget, decoding or capability) | the numbers and the reason in `PROGRAM.md` |
+
+`wsr program` and `wsr fix` exit 0 for the first three outcomes (a judged fix exists) and 1 for the last row.
+
+**The judge's bar.** "Improved" needs the paired gain above 2 standard errors, every guardrail holding, and at
+least 5 scored held-out items (one or two fixed items prove nothing). The report also prints the exact
+one-sided sign test next to z: z is a normal approximation and runs optimistic when few items change (4 wins
+and no loss is z 2.09 on 37 items, and p 0.0625 by the sign test). Every look at the held-out set is logged
+next to the goal file, the steering and settings judges included.
+
+**The agent's limits.** The goal file's `budget` (`practice_evals`, `verifications`, `usd`; defaults 10, 6
+and 5) sets how much the agent may do and spend; `--practice-evals`, `--agent-verifications` and
+`--agent-budget-usd` override it for one run.
+
+**A patch belongs to its model.** A saved patch records marks of the tensors it was made on. `wsr patch
+apply`, `wsr evaluate --patch` and `wsr repair --check` refuse a patch made for other weights (a different
+fine-tune of the same shape would take it silently and get a different edit); `wsr patch apply --force`
+overrides, and a model loaded in another precision only gets a warning.
+
+The rule-based playbook goes first. When it cannot fix the failure, or its candidate passes its own checks but
+not the held-out judge, the agent gets the objective (told only that the candidate was rejected). Agent tools:
+reads and generation with interventions (`generate` takes up to 8 prompts in one call, batched to free GPU
+memory), directions, neuron and head attribution, hand-built edits, `fit_edit` (a rank-r change fitted by
+gradient descent on texts it chooses, kept inside the size limit, memory- and time-guarded), `steer_eval`,
+`settings_eval`, `practice_eval`, `verify_edit`. Its workspace is a small numeric language with no file,
+network or process access; every edit is undone after the call that tried it. The workspace is bounded: 64M
+elements per value (checked from the arguments before a large result is computed), 2 GB in all, capped
+integers, 120 s per run. A fault inside a tool is reported to the agent as a tool error and the run goes on.
+One limit remains: a single torch call that is slow by itself (the SVD of a large matrix) runs to its end.
+
+### Caching (results never change)
+
+wsr keeps, per model (keyed by its files, a weight checksum, dtype, device and library versions): the
+regression baseline, the unedited model's replies on a goal's sets (with the batch plan, so edited runs stay
+paired), and the deep diagnosis (loaded with `torch.load(weights_only=True)` and only the classes recorded for
+that entry), and the calibrated probes (language, copy heads; plain JSON and safetensors). A rerun of the same
+goal skips all of them. An applied edit or active steering changes the result, so nothing cached is ever served
+for it. `WSR_CACHE=off` turns caching off; `WSR_CACHE_DIR` moves it; `wsr cache show | clear` manages it (it
+works without torch). `clear` deletes only the entries wsr wrote, recognised by name, so a cache folder that
+also holds your own `models/` or `datasets/` loses nothing. A llama-server wsr started is stopped when wsr
+exits, also after Ctrl-C or an error.
 
 **wsr asks before it downloads, converts, or starts anything.** At a terminal it asks yes / no
 (default no). In scripts, use `--yes`, `--no`, `--allow download,llama-server,convert`, `--deny ...`,
@@ -110,7 +187,9 @@ public dataset. When there is none, it stops with exit code 3 and says what it n
 
 `--json` gives a machine-readable report. `--handoff DIR` writes the failing
 request, response and report for the weight-level stage. Exit codes: 0 no
-failure, 1 failure found, 2 usage or read error.
+failure (or, for `wsr program` / `wsr fix` / `wsr repair`, a fix that passed), 1 failure found (or no accepted
+fix), 2 usage or read error, 3 a step needed a yes that was not given, 130 interrupted. A server key can be
+given as `WSR_API_KEY` instead of `--api-key`, which keeps it out of the shell history.
 
 ## Pipeline
 
@@ -124,13 +203,19 @@ failure, 1 failure found, 2 usage or read error.
 | 3 Stream | `stream.py` | SSE / NDJSON assembly: cut streams, error events, malformed chunks, tool-call fragments |
 | 5 Probes | `probes.py` | reasoning budget + thinking switch, server BOS, prompt-cache stability, smoke, stop, finish-reason, tools, stream vs non-stream, vision (two colour PNGs), penalty A/B, determinism, load dependence (reply changes when other slots decode), context canaries, one-factor differential reruns, each flip confirmed by a second run (sampling, penalties, thinking, prompt cache, prefill, stop strings, images as parts, constraint, system prompt, context, alternate endpoints) |
 | 6 Known issues | `known_issues.json` | documented model / runtime bugs matched on model, backend, conditions and symptoms |
-| 7 Deep | `deep/` (needs torch) | on full-precision HF weights: reproduce, contrast set, logit-lens token trace, failing-vs-passing direction, patching (layers, MLPs, heads, neurons), ablation / addition tests, known directions (end-of-turn, refusal, language, repetition), weight dossier; `wsr quant`: GGUF tensor stats and quantisation error vs the original |
+| 7 Deep | `deep/` (needs torch) | failure kinds: blank, loop, refusal, under-refusal (`complied`: a harmful request answered), wrong language, and others; on full-precision HF weights: reproduce, contrast set, logit-lens token trace, failing-vs-passing direction, patching (layers, MLPs, heads, neurons), ablation / addition tests, known directions (end-of-turn, refusal, language, repetition), weight dossier; `wsr quant`: GGUF tensor stats and quantisation error vs the original |
 | Surgery | `surgery/` (needs torch) | playbook per failure (over-refusal, wrong language, premature end-of-turn, loops, generic contrast direction): candidate edits from the deep evidence (direction orthogonalisation, neuron / head scaling), each checked against the hook it came from, tried weakest first, verified on the failing and working prompts and a 17-prompt regression suite (new failures, drift, harmful-request refusals); the patch re-checked at serving precision (bf16 / fp16); a rank-1 patch file or an honest "could not fix" with the next step. `--deep`: local edits (only the layers, or only the MLP neurons, that write the failure, strengths up to 6; for loops the direction from a failing and a working continuation of the same prompt), fresh prompt variants that took no part in choosing the patch, a same-size random edit as a control; `--sampled`: paired sampled runs. Works on hybrid linear-attention models (Qwen3.5) |
-| Surgery agent | `agent/` (needs torch, `anthropic`) | after the playbook says "could not fix": a frontier model (Claude Opus 5.5 by default; any OpenAI-compatible model with `--agent-provider openai`) gets the diagnosis and every failed trial, and works through tools: a numeric workspace over every weight (no file, network or process access), teacher-forced reads with interventions, sampled paired generation, its own matched pairs and a held-out layer screen, the playbook's edits and free-form low-rank edits (never the embedding, output layer or final norm), screen and verify; every trial edit is undone after its call, only an edit that passed the playbook's own checks can be submitted, and turns, verifications and spend are capped; the transcript is saved |
+| Program | `program/` (needs torch) | goal files, dataset profiles, the held-out judge with guardrails, `wsr program` / `wsr fix`; settings and steering candidates; the llama-server judge and GGUF export; the replies cache |
+| Surgery agent | `agent/` (needs torch, `anthropic`) | after the playbook says "could not fix": a frontier model (Claude Opus 5.5 by default; any OpenAI-compatible model with `--agent-provider openai`) gets the diagnosis and every failed trial, and works through tools: a numeric workspace over every weight (no file, network or process access), teacher-forced reads with interventions, sampled paired generation, its own matched pairs and a held-out layer screen, the playbook's edits and free-form low-rank edits (never the embedding, output layer or final norm), screen and verify; every trial edit is undone after its call, only an edit that passed the playbook's own checks can be submitted, and turns, verifications and spend are capped; the transcript is saved. In `wsr program` it also has `fit_edit` (learned low-rank edits), `attribute_heads`, `settings_eval`, `steer_eval` and `practice_eval` |
 | 8 Verdict | `verdict.py` | config / request / sampling / runtime / quantisation / provider / known bug / weight-level / unexplained |
 
 ## Tests
 
 ```bash
-python -m pytest -q
+python -m pytest -q               # 337 tests; the CUDA comparison is skipped without a GPU
+python -m ruff check src tests
 ```
+
+## Licence
+
+MIT (`LICENSE`). Code ported from other MIT projects is listed in `NOTICE`.

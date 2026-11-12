@@ -71,10 +71,24 @@ class Patch:
     deltas: list[Delta] = field(default_factory=list)
     untie: bool = False                        # untie lm_head from the embeddings before applying
     checks: dict[str, Any] = field(default_factory=dict)    # what verified it (mode, results); saved
+    base: dict[str, list] = field(default_factory=dict)     # the weights it was made on (base_marks); saved
 
     @property
     def n_params_touched(self) -> int:
         return sum(d.U.shape[0] * (d.V.shape[0] if d.V.shape[0] > 1 else 1) for d in self.deltas)
+
+    @property
+    def n_free_params(self) -> int:
+        """Numbers the edit is free to choose: rank x (rows + input columns it touches) per tensor, at most the
+        entries themselves. A rank-1 projection of one direction out of every layer's writes is a few hundred
+        thousand, though it touches every entry of those matrices; this, not the touched entries, is what can
+        fit (or overfit) the examples."""
+        n = 0
+        for d in self.deltas:
+            cols = int((d.V.abs().sum(1) > 0).sum()) if d.V.shape[0] > 1 else 1
+            rows = int((d.U.abs().sum(1) > 0).sum())
+            n += min(int(d.U.shape[1]) * (rows + cols), rows * cols)
+        return n
 
     @property
     def n_weights_changed(self) -> int:
@@ -91,9 +105,13 @@ class Patch:
         return sum(d.U.numel() + d.V.numel() for d in self.deltas)
 
     # -- persistence -----------------------------------------------------------------------------
-    def save(self, out: Path) -> None:
+    def save(self, out: Path, lm: Optional["LM"] = None) -> None:
+        """`lm`: the unedited model the patch was made on; its marks are written with the patch (base_marks),
+        so applying the patch to other weights can be noticed."""
         from safetensors.torch import save_file
 
+        if lm is not None and not self.base:
+            self.base = base_marks(lm, self)
         out.mkdir(parents=True, exist_ok=True)
         tensors = {}
         for k, d in enumerate(self.deltas):
@@ -107,7 +125,7 @@ class Patch:
         save_file(tensors, str(out / "patch.safetensors"))
         meta = {"label": self.label, "kind": self.kind, "untie": self.untie,
                 "params": [d.name for d in self.deltas], "spec": _jsonable(self.spec),
-                "checks": _jsonable(self.checks)}
+                "checks": _jsonable(self.checks), "base": self.base}
         (out / "patch.json").write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
 
     @classmethod
@@ -121,7 +139,8 @@ class Patch:
         for k in list(spec):
             if f"spec.{k}" in t:
                 spec[k] = t[f"spec.{k}"]
-        return cls(meta["label"], meta["kind"], spec, deltas, meta.get("untie", False), meta.get("checks", {}))
+        return cls(meta["label"], meta["kind"], spec, deltas, meta.get("untie", False), meta.get("checks", {}),
+                   meta.get("base") or {})
 
 
 def _jsonable(x: Any) -> Any:
@@ -175,7 +194,67 @@ def untie(lm: LM) -> None:
 
 
 def _param(lm: LM, name: str) -> nn.Parameter:
-    return dict(lm.model.named_parameters(remove_duplicate=False))[name]
+    p = dict(lm.model.named_parameters(remove_duplicate=False)).get(name)
+    if p is None:
+        raise ValueError(f"the patch changes {name}, which this model does not have: it was made for another model")
+    return p
+
+
+@torch.no_grad()
+def base_marks(lm: LM, patch: "Patch") -> dict[str, list]:
+    """For every tensor the patch changes: [sum of squares, sum of absolute values] of the tensor as it is now.
+    Call it on the unedited model. A patch is a difference from these exact weights: a gate or set_columns
+    stores new minus old, so on other weights it writes something else."""
+    out: dict[str, list] = {}
+    for name in dict.fromkeys(d.name for d in patch.deltas):
+        flat = _param(lm, name).detach().reshape(-1)
+        s2 = sa = 0.0
+        for i in range(0, flat.numel(), 1 << 22):
+            c = flat[i:i + (1 << 22)].double()
+            s2 += float((c * c).sum())
+            sa += float(c.abs().sum())
+        out[name] = [s2, sa]
+    return out
+
+
+SAME, CLOSE = 1e-9, 1e-3      # relative difference of the marks: summation order only / another 16-bit rounding
+
+
+def base_check(lm: LM, patch: "Patch") -> tuple[str, str]:
+    """Is this the model the patch was made on? ("same" | "close" | "different" | "unknown", why).
+    "close": the marks differ a little, as when the model is loaded in another precision; "unknown": the patch
+    carries no marks (made by an older wsr)."""
+    if not patch.base:
+        return "unknown", "the patch does not record the weights it was made on"
+    named = dict(lm.model.named_parameters(remove_duplicate=False))
+    missing = [n for n in patch.base if n not in named]
+    if missing:
+        return "different", f"this model has no tensor {missing[0]}"
+    now = base_marks(lm, Patch("", "", deltas=[Delta(n, torch.zeros(1, 1), torch.zeros(1, 1)) for n in patch.base]))
+    worst, where = 0.0, ""
+    for n, was in patch.base.items():
+        for a, b in zip(was, now[n]):
+            r = abs(a - b) / max(abs(a), abs(b), 1e-30)
+            if r > worst:
+                worst, where = r, n
+    if worst <= SAME:
+        return "same", ""
+    if worst <= CLOSE:
+        return "close", (f"the weights differ slightly from the ones the patch was made on (relative {worst:.1e} in "
+                         f"{where}): another precision, or a close variant of the model")
+    return "different", (f"{where} differs from the tensor the patch was made on (relative {worst:.1e}): these are "
+                         "other weights")
+
+
+def fits(lm: LM, patch: "Patch") -> None:
+    """Raise ValueError unless every delta names a parameter of this model with the right shape. Run before
+    anything is changed, so a patch for another model is refused whole instead of applied in part."""
+    for d in patch.deltas:
+        p = _param(lm, d.name)
+        want = (d.U.shape[0], d.V.shape[0]) if p.dim() == 2 else (d.U.shape[0],)
+        if tuple(p.shape) != want or (p.dim() == 1 and d.V.shape[0] != 1) or p.dim() > 2:
+            raise ValueError(f"the patch's change to {d.name} has shape {want}, the model's tensor is "
+                             f"{tuple(p.shape)}: it was made for another model")
 
 
 # -- builders --------------------------------------------------------------------------------------
@@ -209,6 +288,36 @@ def _scale_columns(lm: LM, mod: nn.Linear, cols: list[int], s: float) -> Delta:
     for k, c in enumerate(cols):
         V[c, k] = 1.0
     return Delta(_names(lm)[id(mod.weight)], (s - 1.0) * W[:, cols], V)
+
+
+OVERWRITE_KINDS = ("gate", "agent_set_columns", "agent_set_rows")
+
+
+def _footprint(d: "Delta") -> tuple[set, set]:
+    rows = set(torch.nonzero(d.U.abs().sum(1) > 0).flatten().tolist())
+    cols = set(torch.nonzero(d.V.abs().sum(1) > 0).flatten().tolist()) if d.V.shape[0] > 1 else {0}
+    return rows, cols
+
+
+def overwrite_clash(parts: Sequence["Patch"]) -> str:
+    """Why these patches cannot be added up, or ''. An overwrite (a gate taking over a neuron, set_columns,
+    set_rows) is stored as new - old; a second edit of the same entries computed from the same old weights
+    makes the sum neither of them. Additive edits (projections, scales, free deltas) compose."""
+    for i, a in enumerate(parts):
+        for b in parts[i + 1:]:
+            if a.kind not in OVERWRITE_KINDS and b.kind not in OVERWRITE_KINDS:
+                continue
+            for da in a.deltas:
+                ra, ca = _footprint(da)
+                for db in b.deltas:
+                    if da.name != db.name:
+                        continue
+                    rb, cb = _footprint(db)
+                    if ra & rb and ca & cb:
+                        return (f"cannot combine {a.label!r} and {b.label!r}: both change the same entries of {da.name} "
+                                "and at least one overwrites them, so their sum is neither edit (two gates at one "
+                                "layer take the same quiet neuron: give one a \"neuron\")")
+    return ""
 
 
 def scale_neurons(lm: LM, neurons: Sequence[tuple[int, int]], s: float = 0.0, *, label: str = "",
@@ -392,6 +501,7 @@ def _bump(lm: LM) -> None:
 @torch.no_grad()
 def apply(lm: LM, patch: Patch, sign: float = 1.0) -> None:
     """Add (sign=+1) or subtract (-1) the patch in place. Prefer `applied()` for trials: it restores exactly."""
+    fits(lm, patch)
     if patch.untie:
         untie(lm)
     for d in patch.deltas:
@@ -406,6 +516,7 @@ def apply(lm: LM, patch: Patch, sign: float = 1.0) -> None:
 @contextlib.contextmanager
 def applied(lm: LM, patch: Patch) -> Iterator[None]:
     """The patch applied for the duration; the touched parameters are restored bit for bit after."""
+    fits(lm, patch)
     if patch.untie:
         untie(lm)
     saved = {d.name: _param(lm, d.name).detach().to("cpu", copy=True) for d in patch.deltas}

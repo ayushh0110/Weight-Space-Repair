@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -65,8 +66,21 @@ def diagnose(lm: LM, messages: list[dict], **kw: Any) -> DeepResult:
     Clean forward passes are reused within one run (lm.memo()): the same prompt's clean pass
     feeds several steps and recomputing it gives the same numbers.
     """
+    from . import diagcache as DC
+
+    dep = DC.depends(messages, kw)
+    if dep is not None:
+        res = DC.load(lm, dep)
+        if res is not None:
+            if kw.get("out_dir"):
+                write_handoff(res, Path(kw["out_dir"]))
+            return res
+    t0 = time.perf_counter()
     with lm.memo():
-        return _diagnose(lm, messages, **kw)
+        res = _diagnose(lm, messages, **kw)
+    if dep is not None:
+        DC.save(lm, dep, res, time.perf_counter() - t0)
+    return res
 
 
 def _diagnose(lm: LM, messages: list[dict], *, kind: str = "auto", failing: tuple[str, ...] = (),
@@ -101,7 +115,8 @@ def _diagnose(lm: LM, messages: list[dict], *, kind: str = "auto", failing: tupl
             # Which quantised tensor causes it: rebuild the served model from the GGUF and bisect.
             from . import qbisect as QB
             qm = QB.build(lm, gguf)
-            qclf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs)
+            qclf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs,
+                              expect_refuse=kind == "complied")
             qb = QB.bisect(qm, qclf, messages)
             res.qbisect = qb
             o = qb.get("outcome")
@@ -122,7 +137,8 @@ def _diagnose(lm: LM, messages: list[dict], *, kind: str = "auto", failing: tupl
             # The reply was cut at max_new while still healthy. A failure that starts later (a loop
             # often needs 50-100 tokens) would be missed, so look once further before saying
             # "not weight-level".
-            late = Classifier(lm, expect_lang=expect_lang, max_new=longer, template_kwargs=template_kwargs).run(
+            late = Classifier(lm, expect_lang=expect_lang, max_new=longer, template_kwargs=template_kwargs,
+                              expect_refuse=kind == "complied").run(
                 "original_longer", messages)
         if late is not None and late.groups:
             res.summary = (f"does not fail within {max_new} new tokens on full precision, but fails later "
@@ -289,7 +305,8 @@ def _diagnose(lm: LM, messages: list[dict], *, kind: str = "auto", failing: tupl
                                neurons=loc.neurons[:5]))
     if d is not None:
         lm.stage("causal")
-        clf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs)
+        clf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs,
+                         expect_refuse=c.kind == "complied")
         cz = A.causal_tests(lm, c, d, clf)
         res.causal = cz
         rep.findings.append(_f("DEEP_CAUSAL", Severity.INFO,
@@ -460,7 +477,7 @@ def _pct(v: float) -> str:
 
 def _playbook(kind: str) -> str:
     return {"blank": "premature end-of-turn", "loop": "repetition and token collapse", "refusal": "over-refusal",
-            "language": "wrong language"}.get(kind, "free-form exploration")
+            "complied": "under-refusal", "language": "wrong language"}.get(kind, "free-form exploration")
 
 
 def _summarise(lm: LM, res: DeepResult) -> tuple[str, str]:

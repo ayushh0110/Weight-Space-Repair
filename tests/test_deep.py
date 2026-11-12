@@ -272,10 +272,9 @@ def test_zero_heads_removes_exactly_those_heads(lm):
     assert torch.allclose(allh, manual, atol=1e-5)
 
 
-def test_induction_scores_and_attention(lm, tmp_path, monkeypatch):
+def test_induction_scores_and_attention(lm):
     from wsr.deep import copyheads as CH
 
-    monkeypatch.setattr(CH, "CACHE", tmp_path)
     sc = CH.induction_scores(lm, seq_len=8, n_seqs=2)
     assert sc.shape == (lm.n_layers, lm.n_heads) and float(sc.min()) >= 0 and float(sc.max()) <= 1
     a = lm.attention(lm.encode("tell me about the cat"))

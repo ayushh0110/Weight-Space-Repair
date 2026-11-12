@@ -6,7 +6,7 @@ writes that copy's token forward. Two measurements, neither needing passing prom
 
 * calibrated once per model: each head's induction score on a random token
   sequence repeated twice (attention from each token of the second copy to the
-  token after its earlier occurrence), cached under ~/.cache/wsr/copyheads/;
+  token after its earlier occurrence), cached with the model's other results (wsr/cache.py);
 * at the loop's decision point: each head's attention mass on earlier positions
   holding the token it is about to repeat, times its direct effect on the
   failure metric (the logit difference falls by this much when the head's
@@ -19,26 +19,23 @@ not loop still come out fine.
 """
 from __future__ import annotations
 
-import os
 import random
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
 
 from .lm import LM
 
-CACHE = Path(os.environ.get("WSR_CACHE", Path.home() / ".cache" / "wsr")) / "copyheads"
-
 
 def induction_scores(lm: LM, seq_len: int = 40, n_seqs: int = 4, seed: int = 0, cache: bool = True) -> torch.Tensor:
     """[n_layers, n_heads] mean attention to the induction target on repeated random tokens."""
-    from .langprobe import _key
+    from .. import cache as C
 
-    path = CACHE / f"{lm.name}-{_key(lm)}-L{seq_len}.pt"
-    if cache and path.exists():
-        return torch.load(path)
+    dep = {"seq_len": seq_len, "n_seqs": n_seqs, "seed": seed}
+    hit = C.load(lm, "induction-scores", dep) if cache else None
+    if hit is not None:
+        return hit[1]["scores"]
     g = torch.Generator().manual_seed(seed)
     V = lm.unembed.weight.shape[0]
     lo, hi = min(1000, V // 4), min(V - 1, 30000)
@@ -56,8 +53,7 @@ def induction_scores(lm: LM, seq_len: int = 40, n_seqs: int = 4, seed: int = 0, 
         total = s if total is None else total + s
     sc = total / n_seqs
     if cache:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(sc, path)
+        C.save(lm, "induction-scores", dep, {}, {"scores": sc})
     return sc
 
 

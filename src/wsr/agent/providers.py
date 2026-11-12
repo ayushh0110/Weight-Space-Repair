@@ -23,7 +23,10 @@ from typing import Any, Optional, Protocol
 
 # Claude Opus 5.5 list price, USD per million tokens (input, output), for the spend cap.
 PRICES = {"claude-opus-5-5": (4.0, 20.0), "claude-sonnet-5-5": (2.0, 10.0), "claude-haiku-5-5": (0.10, 0.50),
-          "claude-fable-5-1": (10.0, 50.0)}
+          "claude-fable-5-1": (10.0, 50.0), "claude-fable-5": (10.0, 50.0), "claude-mythos-5-1": (10.0, 50.0),
+          "claude-mythos-5": (10.0, 50.0)}
+# A model this table does not know is counted at the dearest price in it, so the spend cap stops early, not late.
+UNKNOWN_PRICE = max(PRICES.values())
 # Cache reads as a share of the input price (writes cost 1.25x for the 5-minute TTL).
 CACHE_READ = {"claude-opus-5-5": 0.05, "claude-fable-5-1": 0.025, "claude-mythos-5-1": 0.025}
 
@@ -117,7 +120,7 @@ class AnthropicProvider:
         read = int(getattr(u, "cache_read_input_tokens", 0) or 0)
         self.cached_tokens += read
         tin = (u.input_tokens or 0) + created * 1.25 + read * CACHE_READ.get(self.model, 0.1)
-        pin, pout = PRICES.get(self.model, (4.0, 20.0))
+        pin, pout = PRICES.get(self.model, UNKNOWN_PRICE)
         # Tokens for the run's token cap: the whole prompt (uncached, written and read), not only the uncached part.
         return Turn(text, calls, r.content, r.stop_reason or "", int(u.input_tokens or 0) + created + read,
                     int(u.output_tokens or 0), (tin * pin + (u.output_tokens or 0) * pout) / 1e6)
@@ -137,7 +140,8 @@ class OpenAIProvider:
 
     def __init__(self, model: str, *, base_url: Optional[str] = None, key_env: str = "OPENAI_API_KEY",
                  effort: Optional[str] = None, max_tokens: int = 16000, price_in: Optional[float] = None,
-                 price_out: Optional[float] = None, timeout: float = 600.0, extra_body: Optional[dict] = None,
+                 price_out: Optional[float] = None, price_cached: Optional[float] = None, timeout: float = 600.0,
+                 extra_body: Optional[dict] = None,
                  client: Any = None):
         if not model:
             raise ValueError("the OpenAI-compatible provider needs --agent-model (the model id on that server)")
@@ -159,6 +163,8 @@ class OpenAIProvider:
         self.base_url = base_url
         self.extra_body = dict(extra_body or {})
         self.prices = (price_in, price_out) if price_in is not None and price_out is not None else None
+        # cached input tokens bill at the full input price unless the user gives the cache-read price
+        self.price_cached = price_cached if self.prices and price_cached is not None else None
         self.name = f"openai-compatible:{model}" + (f"@{base_url}" if base_url else "")
         self.caching = openai_cache_control(model, base_url)
         self.cached_tokens = 0
@@ -190,7 +196,9 @@ class OpenAIProvider:
             blocks = c if isinstance(c, list) else [{"type": "text", "text": str(c)}]
             text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
             calls = [{"id": b["id"], "type": "function",
-                      "function": {"name": b["name"], "arguments": json.dumps(b.get("input") or {})}}
+                      "function": {"name": b["name"], "arguments": json.dumps(b.get("input") or {})},
+                      # server data the call came with, returned unchanged (Gemini 3's thought signatures)
+                      **({"extra_content": b["extra_content"]} if b.get("extra_content") else {})}
                      for b in blocks if b.get("type") == "tool_use"]
             msg: dict[str, Any] = {"role": "assistant", "content": text or None}
             if calls:
@@ -236,7 +244,13 @@ class OpenAIProvider:
             except ValueError:
                 args = {"__invalid_json__": (tc.function.arguments or "")[:2000]}
             calls.append(ToolCall(tc.id, tc.function.name, args))
-            content.append({"type": "tool_use", "id": tc.id, "name": tc.function.name, "input": args})
+            block = {"type": "tool_use", "id": tc.id, "name": tc.function.name, "input": args}
+            # Gemini 3 on its OpenAI endpoint attaches a thought signature here and rejects the next turn
+            # unless it comes back with the call.
+            extra = getattr(tc, "extra_content", None) or (getattr(tc, "model_extra", None) or {}).get("extra_content")
+            if extra:
+                block["extra_content"] = extra
+            content.append(block)
         stop = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens",
                 "content_filter": "refusal"}.get(ch.finish_reason or "", ch.finish_reason or "")
         if getattr(msg, "refusal", None):
@@ -244,9 +258,18 @@ class OpenAIProvider:
         u = getattr(r, "usage", None)
         tin = int(getattr(u, "prompt_tokens", 0) or 0)
         tout = int(getattr(u, "completion_tokens", 0) or 0)
+        # Some servers (Gemini's OpenAI endpoint) leave thinking tokens out of completion_tokens but bill them as
+        # output; they show up only in total_tokens.
+        total = int(getattr(u, "total_tokens", 0) or 0)
+        if total > tin + tout:
+            tout = total - tin
         det = getattr(u, "prompt_tokens_details", None)
-        self.cached_tokens += int(getattr(det, "cached_tokens", 0) or 0)   # automatic caching, where the server reports it
-        cost = (tin * self.prices[0] + tout * self.prices[1]) / 1e6 if self.prices else 0.0
+        cached = min(tin, int(getattr(det, "cached_tokens", 0) or 0))   # automatic caching, where the server reports it
+        self.cached_tokens += cached
+        cost = 0.0
+        if self.prices:
+            pc = self.prices[0] if self.price_cached is None else self.price_cached
+            cost = ((tin - cached) * self.prices[0] + cached * pc + tout * self.prices[1]) / 1e6
         return Turn(msg.content or "", calls, content, stop, tin, tout, cost)
 
 

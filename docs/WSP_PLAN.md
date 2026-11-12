@@ -32,7 +32,50 @@ Progress:
   Q8_0 and Q4_K_M on the served file (blank replies 53 % → 0 % on both). Exporting also found and
   fixed a tied-weight save bug.
 - Phase 2 stays deferred: the refused-operations log had only imports, now allowed as no-ops.
-- Still a plan: a live `wsr program` run with a frontier agent on a hard objective.
+- Phase 1 acceptance, positive control: `wsr profile` reproduces "most answers hit the cap" on Qwen3.5-0.8B
+  (95 % at 4,096 tokens). The paper's p50c edit, rebuilt exactly (its checksums match), halves the looping
+  share on 40 held-out MATH-500 problems (25 % -> 12.5 %), but at z 1.5 the judge says "no clear change"; a
+  larger sample is needed for a verdict.
+- `wsr program` on Llama-1B's MATH loops: diagnosed, 15 playbook edits tried, none fixes it; nothing shipped.
+- First frontier-agent run (Gemini 3.8 Flash on AI Studio's OpenAI endpoint, effort medium): `wsr program` on
+  Llama-1B's MATH loops (7/40 practice replies loop to the cap). Playbook could not fix it; the agent took 64 turns,
+  built 4 edits (one a no-op baseline, three rejected by the weight cap or the gate guard), screened 2: 0/8
+  decision flips (margins 3.3-7.7 logits). Stopped at the $1.50 cap (counted); no candidate, nothing shipped.
+  About 92% of input was cache hits. Fixed on the way: Gemini 3's thought signatures are returned with tool
+  calls; thinking tokens hidden from `completion_tokens` are billed as output; `--agent-price IN OUT CACHED`.
+  Seen: the agent spent a 40-item practice_eval on a no-op edit to get a baseline that practice_eval
+  already reports (`before`).
+- After that run: the profile's main pass is practice_eval's baseline when it ran on the same PyTorch model in
+  the same process (same protocol, seeds, order, and its batch plans pinned), and the brief states it; the size
+  cap counts an edit's free parameters (rank x (rows + columns) per tensor), not the entries it touches, so a
+  rank-1 projection out of every layer is no longer refused; the gate guard stays at 2% (assessed: stricter
+  than verification on exactly the damage a gate does, so a real safety check); the brief lists every build
+  check; an edit that changes no weight says so. Audit fixes: combine refuses overwrite edits (gates,
+  set_columns / set_rows) on the same entries, whose stored new - old deltas do not add up (two gates at one
+  layer took the same quiet neuron); scale and strength are bounded like alpha; screen / verify no longer spend
+  budget on an unknown edit id.
+- Claude Opus 5.5 through Kiro CLI's headless mode (a test-only driver outside wsr: each turn resumes one
+  `kiro-cli chat --no-interactive --trust-tools=` conversation and answers with JSON tool calls that wsr runs).
+  Known-fix control (the planted test model, playbook off): found the planted neuron, ran a random-neuron
+  control, verified, chose it; shipped, held-out 40% -> 100% (z 2.45), 15 turns, 11 min. MATH loops on
+  Llama-1B (playbook off, 24 turns): a sparse edit at MLP 10/11/14 cut practice loops 17.5% -> 10% but rewrote
+  3/7 working prompts; a strength sweep found no selective setting, gates did not separate, zeroing the top
+  attributed neurons made it worse; it gave up and asked for decoding-side repetition control. No candidate.
+- Two harness bugs it surfaced, fixed: verify demanded "the original fixed" even when the original's own
+  unedited reference run did not fail (then no edit could pass); now that is reported as not measurable and the
+  measurable failing prompts decide. `generate` took "suite:<name>" as literal text; it now runs that prompt.
+- Settings fixes and longer loop checks (DESIGN.md section 13): the agent measures serving settings with
+  `settings_eval` and can choose them; the judge compares current vs new settings on held-out (same weights,
+  suite generated under both as the guardrail) and the report recommends them with how to apply; no patch.
+  For loops, the reference runs again at twice the cap when it hides the failure. Measured on the MATH run:
+  3/8 -> 7/8 failing prompts reproduced (512 -> 1024 tokens); a repetition penalty (1.05, 1.1) halved loops but
+  did not raise accuracy (the escaped replies end unfinished), so nothing was recommended.
+- Full toolkit and speed (DESIGN.md section 14): `fit_edit` (a learned low-rank edit, trained on texts the agent
+  chooses, kept inside the size cap while training, memory- and time-guarded), `attribute_heads`, settings with a
+  system prompt and template arguments; captures skip the unused vocabulary projection (-20% per capture,
+  bit-identical); the unedited model's replies are kept across runs with their batch plans. Measured: the longer
+  loop check adds ~6 min per check on the MATH goal; an exact-repeat early stop would save only 5% there and was
+  not built.
 
 ## The idea in one picture
 
@@ -352,3 +395,30 @@ Needs the `gguf` package and llama.cpp's converter, downloaded with the user's O
 | Capability requests resume with `--resume`, draft first | yes, made general | Phase 1.6: full state, a model fingerprint check, and pending proposals built and verified first once the unlock is granted |
 | Decide the restart design now | yes, decided | The paper did restart (4 conversations in p50c) with the notebook and current edit while the kernel kept its variables. wsr keeps all state; only the conversation is new; the best checkpoint is the reference; the alternatives stay available; `--restart-from fresh` is optional |
 | Hold full Python until 5-10 real runs | agreed | Phase 2 is deferred and gated on a refused-operations log from phase 0, which also says exactly which operations to allow |
+- Failure-type runs (Opus 5.5 via Kiro, GTX 1650): planted blank (Qwen 0.5B) SHIPPED, exact neuron, held-out
+  30% -> 85%; planted corrupted neurons: exact neurons found from weight norms, not shipped (detectors miss most of
+  the damage; drift guard against a broken model); over-refusal (Llama-1B, XSTest): not shipped, held-out guardrail
+  caught harmful refusals 66.7% -> 53.3%; under-refusal (Qwen, XSTest): new `complied` kind, playbook rejected on
+  held-out, agent (fit_edit) 86.7% -> 100% but safe prompts refused more (56.7% -> 36.7%), not shipped; MATH loops
+  (Llama-1B): settings and fits tried, gave up (capability); GSM8K, German (both models): nothing to edit, correctly;
+  IFEval: no instruction checker in wsr; the planted Penguin loop does not fire in normal use.
+- Review round (DESIGN.md section 15). Open suggestions, not built: (1) keep the deep diagnosis across runs
+  (same model, prompts and settings give the same result; saves ~30 min on a rerun); (2) `generate` with several
+  prompts in one call (a step costs the same for 1 or 8 sequences); (3) on GPUs where float16 is slower than
+  float32, compute in float32 on float16 weights (about 3x on teacher-forced stages there; changes numerics
+  slightly, so it needs a decision); (4) `wsr cache` to show and clear ~/.cache/wsr; (5) declare the dynamic
+  attributes on Contrast (`_ref`, `_ref_clf`, ...) as fields; (6) split `run_program` and `_diagnose` into stages;
+  (7) a README pass for program / fix / settings / fit_edit; (8) an instruction checker for format goals;
+  (9) a known-good reference checkpoint for repairing models damaged everywhere.
+- Over-refusal shipped (Llama-1B, Opus 5.5 via Kiro, refusal guardrails off by the user's choice): the first goal's
+  held-out had 2 failing items of 30, so no fix could reach z 2 (the judge now says so, `evaluate.power`). Rebuilt
+  goal (13/250 XSTest safe prompts refused; 7 in a 37-item held-out): playbook candidate z 1.43, rejected, handed to
+  the agent; it probed steering on 8 prompts in one batched call (it unlocked harmful requests too), then combined
+  three gated neurons (layers 9-11): held-out 81.1% -> 91.9% (z 2.09, 4 better, 0 worse), drift 0.0006, agreement
+  99.7%, no refusal lost. 24 turns, 2 verifications, 46 min.
+- Activation steering in the playbook (DESIGN.md section 17): clamp (conditional) and add, from the diagnosed
+  direction and, for refusal kinds, the known refusal direction; judged on held-out like a patch. Planted blank:
+  30% -> 85% by steering alone; over-refusal: 81.1% -> 97.3% (z 2.64) by clamping the refusal direction over layers
+  6-8, better than the weight fix; under-refusal: rejected on held-out; corrupted neurons: correctly not passed.
+  The refusal detector missed "I'm sorry, but ... is not appropriate or ethical": fixed, detector version in the
+  cache key.

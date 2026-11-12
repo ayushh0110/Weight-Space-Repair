@@ -876,6 +876,8 @@ exposed:
 |---|---|---|
 | 1 | After `list_examples` the model thought for 7,800 tokens, the request timed out, and the traceback ended wsr: no report | a provider error now ends the agent run cleanly (state saved, report written); `--agent-timeout`, `--agent-turn-tokens`, `--agent-extra` (here `{"chat_template_kwargs": {"enable_thinking": false}}`); a turn that runs out of output before a tool call gets one nudge |
 | 2 | 11 turns. It found layer 10 #0 (`inspect_neuron`: promotes `<\|eot_id\|>`, activation 18.8 failing vs 0.0 working) but then tried an orthogonalise over the size cap and a gate with the spec nested one level too deep ("unknown edit kind None"), and gave up | explicit errors: why an edit is over the cap (orthogonalise also edits the embedding unless `embed: false`), the valid kinds with examples, nested specs accepted, a direction id given as `read_source` explained; evidence hints (a neuron that fires only on failing prompts, or a layer whose share sits in 1-3 neurons, names the candidate edit) |
+| 3 (Gemini 3.8 Flash, MATH loops, 64 turns) | spent a 40-item practice_eval on a no-op edit for a baseline; orthogonalise refused by the entry-count cap again (598M entries, about 0.4M free parameters); three gates refused at 4.5-4.8% false firing; no edit flipped a failing decision (margins 3-8 logits) | the profile's pass is the practice baseline (stated in the brief, reused at that n); the cap counts free parameters; the 2% gate guard kept (stricter than verification on a gate's damage); the brief lists every build check; combine refuses overlapping overwrites; scale / strength bounded |
+| 4 (Claude Opus 5.5 via Kiro CLI, MATH loops, 24 turns) | a sparse edit halved practice loops but broke 3/7 working prompts; no selective strength; gave up with a decoding-side request. Its verify said "the original still fails" while generate showed it fixed | verify no longer demands an original whose unedited reference run does not fail (reported as not measurable); generate resolves `suite:<name>` |
 | 3 | 9 turns. It followed the hint to `scale_neurons` on 10 #0 but wrote `neurons: [[10, 0], 0.5]` and got "'float' object is not iterable"; an extra `id` argument and pairs without `bad` gave raw TypeError / KeyError | every tool checks its input: missing fields named with the schema, unknown arguments dropped and listed, the `[layer, neuron]` shape explained with an example |
 | 4 | **fixed in 7 turns, no error**: list_examples, make_direction, inspect_neuron, build_edit scale_neurons [[10, 0]] x0, screen_edit (10/10 flips), verify_edit (passed), submit_patch. 10/10 failing fixed, 3/3 working kept, no new regression failures, harmful requests still refused 2/2; 45,944 tokens | - |
 
@@ -922,7 +924,7 @@ tools, the budgets and the judge are the same whatever model drives them.
 | `--agent-provider` | Models | Key | Notes |
 |---|---|---|---|
 | `anthropic` (default) | Claude; default `claude-opus-5-5` | `ANTHROPIC_API_KEY` (or an `ant auth login` profile) | adaptive thinking, effort `high`, prompt caching, server-side refusal fallbacks (a safety-classifier decline is retried on the recommended model instead of ending the run); list prices built in, so `--agent-budget-usd` holds |
-| `openai` | OpenAI's models, or with `--agent-base-url` any OpenAI-compatible server: OpenRouter (Gemini, DeepSeek, Mistral, Qwen, Llama ...), Together, Groq, Fireworks, DeepSeek, Mistral, Gemini's OpenAI endpoint, a local vLLM / Ollama / llama-server | `OPENAI_API_KEY`, or the variable named by `--agent-key-env`; a local server needs none | `--agent-model` is required; `--agent-effort` is sent as `reasoning_effort` only when given; prices via `--agent-price IN OUT` (USD / M tokens), otherwise the spend cap cannot be computed and `--agent-max-tokens` (default 6M) is the limit |
+| `openai` | OpenAI's models, or with `--agent-base-url` any OpenAI-compatible server: OpenRouter (Gemini, DeepSeek, Mistral, Qwen, Llama ...), Together, Groq, Fireworks, DeepSeek, Mistral, Gemini's OpenAI endpoint, a local vLLM / Ollama / llama-server | `OPENAI_API_KEY`, or the variable named by `--agent-key-env`; a local server needs none | `--agent-model` is required; `--agent-effort` is sent as `reasoning_effort` only when given; prices via `--agent-price IN OUT [CACHED]` (USD / M tokens; cached input at the input price unless CACHED is given; thinking tokens a server leaves out of `completion_tokens` but counts in `total_tokens` are billed as output, as Gemini's endpoint does; tool calls' `extra_content`, Gemini 3's thought signatures, is sent back unchanged), otherwise the spend cap cannot be computed and `--agent-max-tokens` (default 6M) is the limit |
 
 Keys are read only from environment variables, never from the command line (shell history) and
 never stored. Tool arguments that are not valid JSON go back to the model as an error. Every
@@ -1422,3 +1424,374 @@ memory.
   deletes its partial file.
 - Export could have reused a model loaded in fp16 to write a bf16 checkpoint, which loses small
   weights. Now the in-memory model is reused only in fp32.
+
+## 12. Protecting the user's machine
+
+**What happened.** During a MATH run the system drive fell from about 16 GB free to 195 MB. Windows'
+system-managed page file had grown from 11 to 25 GB. The measurement behind it, on this 16 GB
+machine:
+
+| State | Committed / limit |
+|---|---|
+| idle, other software only | 21.1 / 26.5 GB |
+| plus a CUDA context | 22.3 GB |
+| plus Llama-3.2-1B fp16 loaded on the GPU | 28.3 / 31.7 GB (the limit grew: the page file expanded) |
+
+On Windows, GPU memory is backed by system commit (WDDM), so a model on the GPU still costs commit.
+A second copy in llama-server, the converter, and the Qwen download running in parallel pushed
+commit far past the limit. The page file grew to cover it until the disk was full. Stopping wsr
+returned everything (12.7 GB free, page file 11.3 GB).
+
+**What wsr does about it (`resources.py`, `backends.plan_offload`, the server watchdog):**
+- **Headroom.** `resources.headroom()` is the memory a step can still commit before the page file
+  would eat into the last 3 GB of the system drive: spare commit plus free disk above the floor on
+  Windows, free RAM plus swap elsewhere. Optional heavy steps check it first. Starting llama-server
+  needs model + KV cache + 1 GB; converting needs 1.2× the checkpoint. A step that does not fit is
+  skipped with the reason, and the run continues on PyTorch.
+- **Where llama-server runs.** PyTorch first hands back the GPU memory it caches but does not use.
+  The server goes on the GPU only if its model and KV cache fit in the free VRAM with a margin;
+  otherwise on the CPU if RAM allows; otherwise not at all. An oversubscribed GPU is exactly what
+  turns into system commit.
+- **Watchdog.** A wsr-started server is stopped if the system drive falls below 2 GB free.
+  Requests then say why, and the profile and the judge fall back to PyTorch mid-run, freeing the
+  GPU first.
+- **Logs survive a stop.** Output is line-buffered, so a stopped run keeps its log.
+
+**A goal-file pitfall, now checked.** A system prompt typed in JSON as "...in \boxed{}" with one
+backslash turns `\b` into a backspace. The earlier MATH profile ran with exactly that prompt.
+`wsr objective check` now reports control characters in any prompt, with the doubled-backslash
+fix.
+
+**The paper's edit, reproduced exactly.** For the positive control (WSP_PLAN phase 1):
+- Qwen3.5-0.8B was downloaded (revision 2fc0636). Its two edited tensors match the base checksums
+  in the paper's manifest, byte for byte.
+- The released p50c diff was rebuilt as a wsr patch and applied with the direct file patch. Both
+  edited tensors then match the paper's edited checksums exactly, and the other 486 tensors are
+  unchanged.
+
+**The positive control (WSP_PLAN phase 1 acceptance).**
+- **Setup:** Qwen3.5-0.8B against the same model with the paper's p50c edit (exact, see above). Both
+  were exported to Q8_0 and judged with `wsr evaluate --backend llama-server`, one server at a time.
+- **Protocol:** the paper's own: thinking on, temperature 0.6, top-p 0.95, top-k 20, presence
+  penalty 1.5. Grader `detector:loop`, 40 held-out MATH-500 problems, same seeds for both, a
+  4,096-token cap (the paper used 32k).
+
+| | Original | With p50c |
+|---|---|---|
+| cut at the cap, looping tail | **25 %** | **12.5 %** |
+| cut at the cap, still working | 70 % | 82.5 % |
+| correct | 5 % | 5 % |
+| loop-free | 75 % | 87.5 % (+12.5 ± 8.2 SE, z 1.53; 8 better, 3 worse, 29 same) |
+
+- **Part 1 reproduced:** `wsr profile` shows "most answers hit the cap" (95 %).
+- **The edit halves the looping share,** the effect the paper describes. At n = 40 the gain is 1.5
+  standard errors, and the judge requires more than 2, so its verdict is "no clear change". It does
+  not overclaim; about 70 problems would be needed at this effect size.
+- **Accuracy is cap-limited** at 4,096 tokens, so it says nothing either way here.
+
+**The MATH loop objective on Llama-3.2-1B (`wsr program`, no agent).**
+- **Profile:** 40 practice problems, greedy, a 512-token cap.
+
+  | Group | Count | Cause from the test that ran |
+  |---|---|---|
+  | correct | 20 % | |
+  | cut at the cap, looping | 4 | weight-level candidate (loops again under sampling) |
+  | short loops | 2 | decoding (sampling always escapes) |
+  | cut at the cap, still working | 7 | budget |
+  | wrong answers | 19 | capability |
+
+- **First run:** stopped with "no candidate", because the diagnosis looked at only 256 tokens and saw
+  healthy replies. Loops are now diagnosed at the length they were seen at, and retried once at the
+  longer length when the diagnosis reports the failure starts past its limit.
+- **Second run:** the 512-token diagnosis saw the loops (10/10 fresh variants fail), but it found
+  no causal mechanism, only a correlated direction (layers 11-12). The playbook tried 15 edits
+  (sparse and local direction edits at alpha 1-6, a gated neuron at 0.5-4); the best fixed 1 of
+  11. Nothing shipped. That is the correct outcome, and consistent with the paper, where the fix
+  took an agent and many forward passes.
+- **A goal file is now checked for control characters:** a JSON `\b` written for `\boxed` had
+  turned into a backspace in an earlier run.
+
+**More from these runs:**
+- `wsr evaluate` with two GGUFs now runs every original run first, stops that server, then starts
+  the patched one, so only one model is in memory at a time. The first attempt held both and the
+  disk watchdog stopped it. If the patched half fails, the original half's numbers are kept,
+  marked incomplete.
+- The KV-cache estimate now comes from the GGUF's metadata: about 17 KB/token on Qwen3.5 (one
+  attention layer in four) and 40 KB on Llama-1B, margins included, instead of a flat 128 KB.
+  Each slot now holds the prompt plus the reply, not twice the reply. A server that does not fit
+  ends with a clear error, or falls back.
+- The profile's llama-server is stopped once the profile is done, not held through the
+  diagnosis.
+
+## 13. Settings fixes, and loop checks past the token limit
+
+### Serving settings as a candidate (`settings_eval`, `program.judge_settings`)
+
+Some failures come from decoding, not from the weights: a greedy loop that a repetition penalty or sampling
+escapes. The diagnosis already probes this on the original prompt (loop battery, "decoding"); the agent can now
+measure it on the objective.
+
+- **`settings_eval`** (agent tool in `wsr program`): the original weights on the first n practice items with
+  serving settings on top of the goal's protocol (`repetition_penalty` 1-1.5, `temperature` 0-2, `top_p`,
+  `top_k`, `min_p`), against the same baseline as `practice_eval`, paired, with failure-group rates. It shares
+  the practice-eval budget. `presence_penalty` and DRY have no PyTorch equivalent and are refused with that
+  reason. `generate` takes `repetition_penalty` for a quick probe.
+- **`final_choice`** takes a `settings_id` as well as an `edit_id`. If the agent ends without a final choice
+  but a settings candidate gained at least one standard error on practice, the program judges the best one.
+- **The judge** runs the held-out set with the current settings and with the new ones, same weights, items and
+  seeds, and gives the same paired verdict as for a patch. Guardrails: every data guardrail under both, and the
+  regression-suite prompts generated under both (a reply that was fine must not fail, every refusal kept).
+- **The report** ("Recommended settings" in `PROGRAM.md`) gives the measured numbers and how to apply them:
+  the `generation_config.json` keys and the llama-server flags. Nothing is patched; the outcome is
+  "settings recommended" only when the held-out verdict is "improved".
+
+### Loop checks past the token limit (`playbook._longer_reference`)
+
+A failing example counts in the target check only if its unedited reference run (the same list, the same batch
+chunks as the edited runs) fails too. Long greedy replies diverge a little between batch layouts, and a loop
+that starts near the end of the reply can start after the cap in the reference run. On Llama-1B's MATH loops
+only 3 of 8 failing prompts looped again at 512 tokens, and the original was not one of them, so verify reported
+"the original still fails" for every edit.
+
+- For loops, when fewer than 2/3 of the failing examples fail again in the reference run, the reference is run
+  once more at twice the limit (at most 4096 tokens). If more fail there, every target judgment (edits, the
+  random control, the rounded weights) runs at that length; the fresh variants get the same treatment.
+- The extra cost is paid only when the cap hides the failure: one more reference run, and longer target runs.
+- The held-out judge still uses the goal's protocol, so the decision that ships something is unchanged.
+- The original is required only when its own reference run fails; otherwise it is reported as not measurable
+  and the measurable failing prompts decide (with the 2/3 rule, the suite, rounding and fresh variants).
+- `checks.reference_runs` records the agreement at the cap and at the longer length.
+
+### Measured (Llama-3.2-1B, MATH-500 loops, Opus 5.5 via Kiro, playbook off)
+
+- **Longer reference:** at the 512-token cap, 3 of 8 failing prompts looped again in their reference run; at
+  1024 tokens, 7 of 8. The checks ran at 1024. Before this, the target check could not measure the original.
+- **Settings:** the agent tested its own hypothesis (a repetition penalty) with `settings_eval` on all 40
+  practice items. 1.1: looping at the cap 17.5% -> 7.5%, but unfinished replies 10% -> 25% and accuracy
+  15% -> 12.5%. 1.05: loops 17.5% -> 7.5%, unfinished 10% -> 20%, accuracy 15% -> 15%. Neither gained one
+  standard error, so neither was judged or recommended: the penalty turns loops into unfinished replies that
+  still do not answer within the cap. 11 turns, gave up with that evidence (the first run without these tools:
+  24 turns, and the decoding question was left as a request).
+
+## 14. Full agent toolkit, and speed without changing results
+
+### What the agent can do (all inside wsr's checks)
+
+The agent works on the user's machine, so it never gets a Python kernel: its `compute` is a small numeric language
+(no imports, files, network or processes; whitelisted torch math; read-only copies of weights; time, step and
+size caps). Every edit goes through `build_edit` or `fit_edit`, is applied only for the duration of a call, and
+counts only if `verify_edit` (target, regression suite, rounding, fresh variants) and, in a program, the
+held-out judge accept it. New in this round:
+
+- **`fit_edit` (`surgery/fit.py`)**: learn an edit from texts. A rank-r change U V^T on 1-4 weight matrices
+  (U starts at zero, so step 0 is the original), trained by gradient descent to make target continuations more
+  likely (the agent may write them, e.g. a correct full answer to a practice prompt) or failure continuations
+  less likely (unlikelihood), while a KL term over the original's top-32 tokens keeps the "keep" texts (the
+  regression and working replies by default) where they were. Only U and V get gradients; the model's weights
+  are untouched (a forward hook while training; their requires_grad flags are switched off and restored). The
+  change is held under the size cap (|delta| <= |W|) during training, so a fit cannot end outside the build
+  check. Guards: <= 8 fits, rank <= 32, <= 300 steps, 300 s each, a free-GPU-memory check before starting, and an
+  out-of-memory error ends the fit cleanly. The result is an ordinary low-rank edit with an edit_id.
+- **`attribute_heads`**: activation x gradient on each attention head's output, like `attribute_neurons`.
+- **settings** (`settings_eval`) also take a system prompt and chat-template arguments, not only sampling.
+
+### Measured: what the longer loop check costs, and an early stop that was not built
+
+- On Llama-1B's 15 MATH target prompts (GTX 1650): the reference run takes 205 s at 512 new tokens and 583 s at
+  1024, so the longer check adds about 6 minutes once, and the same to each target judgment at 1024. It is paid
+  only when the cap hides the loop (3/8 -> 7/8 failing prompts reproduced).
+- Stopping a greedy reply once it repeats an exact token cycle would be safe (no reply stopped by the rule later
+  ended or broke the cycle) but saves only 5% of tokens there: these loops repeat with small changes (step
+  numbers), not exactly. A looser rule could stop replies that would recover and change labels, so it was not
+  built.
+- 14 of 15 replies at 512 tokens were exact prefixes of the 1024-token replies (greedy generation is stable).
+
+### Speedups that leave every result unchanged
+
+- **Captures skip the vocabulary projection**: `seq_capture` and `attention` asked the model for logits at every
+  position and discarded them; they now ask for one row. Captured activations are bit-identical (checked on four
+  736-token texts); 5.54 -> 4.45 s per capture on Llama-1B (-20%), which the diagnosis stages built on captures
+  use heavily.
+- **Original replies kept across runs** (`program/origcache.py`): the unedited PyTorch model's replies on a fixed
+  set (the profile's main pass, evaluate's and the judge's baselines, data guardrails, the practice baseline, the
+  settings judge's current-settings side) are stored with the batch plan they ran in, keyed by the model (files,
+  a weight checksum, dtype, device, versions), protocol, grader, items and seeds. A later run on the same goal
+  skips them (the profile alone was 18 minutes on the MATH goal), and the stored plan keeps the edited run in the
+  same chunks, so the comparison stays exactly paired. An applied edit changes the weight version and so the key:
+  a stored original is never served for an edited model (tested).
+
+### Found by the failure-type runs, and fixed
+
+- **A settings system prompt never reached the model.** The goal's system prompt is written into each item's
+  messages when the items are loaded, so `settings_eval` / the settings judge changed only the protocol. The agent
+  caught it (two opposite system prompts gave byte-identical replies). `items_for` now rewrites the items' system
+  message for the practice eval, the held-out judge and its suite guardrail.
+- **Under-refusal could not be diagnosed.** The profile labels a harmful request that the model answers COMPLIED,
+  but the deep diagnosis had no such kind: in "auto" it saw a healthy reply and stopped ("does not reproduce").
+  New kind `complied`: the classifier is told a refusal is expected (`expect_refuse`), so a refusal is the
+  wanted reply and an answer gets the `complied` group; the contrast, the target checks, the reference runs and
+  the playbook use it like any other kind.
+
+### Known limits these runs showed
+
+- **Format instructions** (IFEval): wsr has no checker for the instructions themselves ("no commas", "300+
+  words"), so those failures are not seen; only refusals and truncation were.
+- **Whole-model corruption**: the regression guard measures drift against the current model. When the current
+  model is damaged everywhere, a true repair is drift by construction and cannot pass verify; fixing that needs a
+  known-good reference (a checkpoint) to compare with.
+- **A playbook candidate the judge rejects now goes to the agent.** Before, a rule-based candidate that passed
+  its own checks but not the held-out judge ended the run (under-refusal: the judge's safe-prompts guardrail
+  failed). With an agent configured, the agent now gets the objective, told only that the playbook's candidate
+  was rejected (no held-out numbers), and its choice is judged the same way. The rejected candidate is kept in
+  `candidate_playbook/` and its judgment is in PROGRAM.md.
+
+## 15. Review round: where the time goes, and what was tidied
+
+### Measured on a GTX 1650 (4 GB), Llama-3.2-1B and Qwen2.5-0.5B
+
+- **Half precision is slow on this GPU family.** A 4096^2 matmul runs at 1.52 TFLOPS in float32 and 0.34 in float16
+  (4.5x slower); Qwen 0.5B forwards 512 tokens in 0.22 s in float32 and 1.15 s in float16. Llama-1B only fits in
+  float16 here (float32 needs 4.9 GB), so every teacher-forced stage runs at about 164 tokens/s.
+- **A generation step has a floor that does not depend on the batch**: 128 ms per step for Llama-1B in float16
+  at batch 1, 132 ms at batch 8 (55 / 58 ms for Qwen in float32). Batching is therefore nearly free in time; the
+  batch is limited by free memory (about 0.5 GB after the model and the reserve: 9 sequences of 712 tokens).
+- Consequence: on this machine the remaining time is hardware, not waste. Options that would change it are listed
+  in WSP_PLAN (compute in float32 on float16 weights for GPUs with slow half precision; the diagnosis kept across
+  runs; several prompts per `generate` call).
+
+### Tidied
+
+- The goal's suite guardrail limits (`max_drift`, `min_agreement`) now also set the verification budget in
+  `wsr program`; before, verification used the defaults and only the judge used the goal's.
+- `allow_safety_loss` on the goal's `wsr_regression` guardrail, and `--allow-safety-loss` on `wsr program` /
+  `wsr fix` (it existed only on `wsr repair`): off by default, because a fix for something else should not change
+  refusals unnoticed; the user can allow it. The settings judge's suite check follows it too.
+- The agent's `generate` may run as long as `verify_edit` judges (it was capped at 512 while loop checks could run
+  at 1024).
+- One `_agent_opts` helper replaces three copies of the agent flags in the CLI; a `locals()` check in evaluate is
+  gone; the PyTorch backend no longer describes itself as "one sequence at a time"; `psutil` is declared.
+
+## 16. Diagnosis cache, batched generate, steering, and a judge that says when a set is too small
+
+- **Deep diagnosis kept across runs** (`deep/diagcache.py`): keyed by the model and every diagnosis input; runs
+  that read a GGUF or a second model are not stored. Written with `torch.save`, read with
+  `torch.load(weights_only=True)` allowing only the classes recorded for that entry (wsr's own and a few standard
+  types; a tampered list is refused, tested). The report says when it came from the cache (`context.from_cache`).
+  Measured: planted-blank `wsr program` 81.3 s -> 37.9 s on a rerun, same patch and held-out result.
+- **`generate(prompts=[...])`**: up to 8 prompts in one `generate_batch` call (the VRAM-aware planner; out of
+  memory halves the batch). Llama-1B, 8 prompts: 70.2 s -> 11.4 s at 64 tokens, 244 s -> 42.5 s at 256;
+  identical replies 8/8.
+- **Steering** (`steer_eval`, `judge_steering`): alpha x vector added after chosen layers at every position, on
+  the original weights; judged on held-out with the regression suite compared under the steering exactly as for
+  a patch; exported as `steering/` (vector, spec, a hook tested to give the same logits as `LM.steer`). The
+  replies cache refuses to run while steering hooks are active.
+- **`Contrast.reference`** (a declared `Reference`: replies, classifier, agreement, agreement at the cap)
+  replaces four attributes the playbook attached at run time; `checks.reference_runs` records its length and
+  agreement.
+- **`wsr cache show | clear`**: sizes per group and per model; clear asks first (or `--yes`), refuses without a
+  terminal, only deletes inside the cache, keeps remembered consent answers.
+- **The judge says when a set cannot show an improvement** (`evaluate.power`): from the original's scores, the z a
+  perfect fix would reach. The first over-refusal goal had 2 failing items of 30 held-out: even fixing both gives
+  z 1.4 < 2, so "no clear change" was certain whatever the fix. The verdict now carries that note, and the run
+  summary says to add items that fail.
+
+## 17. Activation steering in the playbook, and a conditional (clamp) mode
+
+The playbook now tries steering when no weight edit passes (`--steering fallback`, the default; `only` tries
+steering and no weight edit; `off`). Candidates come from the diagnosis: the failing-minus-working direction at
+its best depth, after that layer or over the three layers up to it.
+
+- **clamp** first: after each listed layer, the residual's component along the direction is lowered to the
+  working examples' level wherever it is above it, at every position; everything else is untouched. Levels: the
+  largest working component at the decision position, then half a gap lower.
+- **add** next: a constant shift against the direction, 0.5 / 1 / 1.5 / 2 x the failing-minus-working gap.
+- Each step goes through the decision-token screen and the same `_verify` checks as a weight edit (target,
+  regression suite under the steering, fresh variants, sampled runs); the rounding check does not apply (no
+  weights change). A random direction of the same size and layers is the reported control.
+- A pass returns status `steered` (`Repair.steering`); `wsr repair` writes `steering/` (vector, spec, APPLY.md),
+  `wsr program` judges it on held-out like the agent's steering and hands it to the agent if rejected. The agent's
+  `steer_eval` takes `mode: add | clamp` too, and its brief lists the playbook's steering trials.
+- Why clamp: on the planted toy bug (one neuron that fires only on "please"), a constant shift broke all 4
+  working prompts at every strength and fixed none; the clamp fixed 2/3 failing prompts, kept 4/4 working ones,
+  at the planted layer, and a random direction fixed 0/3.
+
+### Measured on real models (playbook only, `--steering only`, then with the agent)
+
+| Case | What the playbook steered with | Practice checks | Held-out | Outcome |
+| --- | --- | --- | --- | --- |
+| Planted blank (Qwen2.5-0.5B) | clamp the diagnosed direction after layer 16 (the planted layer) | 9/11 fixed, drift 0.008, agreement 97% | 30% -> 85%, z 4.82, 11 better, 0 worse | steering recommended (the same held-out result as the weight fix) |
+| Over-refusal (Llama-3.2-1B) | clamp the known refusal direction over layers 6-8 | 8/10 fixed, drift 0.025, agreement 98% | 81.1% -> 97.3%, z 2.64, 6 better, 0 worse | steering recommended (better than the gated-neuron patch, 91.9%); 2 of the suite's harmful requests no longer refused, allowed by the goal |
+| Under-refusal (Qwen2.5-0.5B) | add against the diagnosed direction over layers 8-10 | 7/10 fixed, drift 0.090 | 86.7% -> 83.3% | rejected on held-out |
+| Corrupted neurons (Qwen2.5-0.5B) | clamp the diagnosed direction | stops the garbage, but other languages fail and drift 0.19-0.37 | - | correctly not passed |
+
+- The diagnosed direction is the right vector when a failure fires on specific inputs (planted blank); for refusal,
+  the known refusal direction (harmful minus harmless) is, which is why it is now a candidate for refusal kinds.
+- The under-refusal agent run found a detector bug: "I'm sorry, but discussing ... is not appropriate or
+  ethical" was not recognised as a refusal, so real refusals were counted as answering. Fixed (and
+  `DETECTOR_VERSION`, part of every cache key, so labels cached with the old detector are recomputed).
+- Rebuilt under-refusal goal (24 of XSTest's 200 harmful prompts answered by Qwen after the detector fix; 12 in a
+  32-item held-out set, 40 safe prompts as a guardrail): playbook clamp 62.5% -> 75% (z 1.68), safe-prompt
+  guardrail failed, rejected; the agent with every tool shipped a learned edit on layers 15-16, 62.5% -> 87.5%
+  (z 3.21), safe prompts answered 50% -> 55%; the agent with weight edits switched off (a test-only driver) chose
+  steering (add d2 after layers 15-16): practice 62.5% -> 93.8% (z 3.3), held-out 62.5% -> 71.9% (z 1.0), rejected.
+  Steering generalises when one direction carries the failure (planted blank, over-refusal); raising refusals by a
+  shift fitted the practice set and moved safe prompts too.
+- With every tool, the agent never picked steer_eval in four live runs: it probed steering with interventions and
+  chose weight edits, which ship as a patch. The steer_eval -> judge -> export path is covered by the scripted test
+  and the steering-only live run.
+
+### Steering at the most causal layer first, and `--no-weight-edits`
+
+- The diagnosis already patches every layer's attention and MLP output with a working run's and records how much
+  of the failure each removes (`Localisation.attn`, `.mlp`). Steering candidates now start there
+  (`playbook.causal_layers`): the most causal layer alone, the second alone, then both, with the
+  failing-minus-working direction at that depth (and, for refusal kinds, the known refusal direction at the same
+  layers); the wider windows come after. One layer moves the least of what must stay, so with the safety rule on
+  (refusals kept) it is the steering most likely to pass. No extra forward pass; the ranking is logged.
+- `--no-weight-edits` (`wsr program`, `wsr fix`): the weights must not change. The playbook only steers, the
+  agent's `build_edit` / `fit_edit` are refused with the reason, its brief says so, and PROGRAM.md records it. A fix
+  ships as a steering or serving settings. This also makes steering testable on its own.
+
+### Measured: steering only (`--no-weight-edits`), safety rule on
+
+| Case | Playbook steering (most causal layers first) | Agent (steering and settings only) | Outcome |
+| --- | --- | --- | --- |
+| Planted blank (Qwen) | causal ranking: layer 14 (0.78), layer 16 (0.75); clamp after layer 16 (the planted layer) passed; held-out 30% -> 85% (z 4.82) | not needed | steering recommended |
+| Over-refusal (Llama-1B) | layers 8 (0.61) and 11 (0.53); every strength that fixed it also dropped harmful refusals or drifted (up to 1.2 nats/token); the refusal-free direction did not flip enough below 2x gap | run 1: the over-refusal direction minus its harmful-refusal component, add after layer 8: held-out 81.1% -> 91.9% (z 2.09), no refusal lost, drift 0.09, rejected only for a new loop on the Chinese suite prompt; run 2: gave up | not shipped: with refusals kept, steering alone could not separate this over-refusal from real refusals (the gated-neuron weight edit did) |
+| Under-refusal (Qwen) | clamp after layer 20 (most causal): drift 0.000, agreement 100%, but no held-out change | add toward refusal after layer 18: held-out 62.5% -> 93.8% (z 3.75), but safe prompts answered 50% -> 20% | not shipped: a refusal shift refuses broadly |
+| Corrupted neurons (Qwen) | none passed | clamp the corrupted layer 12's dominant write direction to 0: no held-out change | not shipped |
+
+- Causal-layer selection works: it costs nothing and put the steering at the planted layer, and on over-refusal at
+  the layers the diagnosis measured; when the steering still drifts, the reason is the mechanism, not the layer.
+- Steering fixes failures carried by one direction (planted blank; over-refusal when refusals may change). With the
+  safety rule on, a failure that shares its mechanism with what must stay needs a conditional weight edit (a gate)
+  or a fitted edit; steering-only runs say so instead of shipping collateral damage.
+
+## 18. Pre-release audit: what was wrong and what changed
+
+A read of the whole tool before shipping, with every suspected fault reproduced first (toy model, then the
+planted-blank Qwen run end to end). Each fix has a regression test.
+
+| Area | What was wrong | Now |
+|---|---|---|
+| Agent loop | a tool result over 20,000 characters was cut mid-JSON and the loop's own `json.loads` raised (a `read` of 64 texts did it); any error class the dispatcher did not list (an `AttributeError` in `logit_lens` on a suite example) left the run with a traceback | results are always valid JSON (a cut one says so); a fault inside a tool is a tool error for the agent; `logit_lens` reads suite examples and checks its depth |
+| Agent workspace | the size cap looked at results, so `torch.zeros(3e9)` first tried to allocate 12 GB; an integer power tower ran for minutes; nothing capped the workspace as a whole (every `read` adds a variable); a large integer broke the display of every later result | sizes are told from the arguments first (zeros, outer, kron, diag, cat, cov, a full SVD, broadcasting calls); SVD is the reduced one unless asked; integers capped at 100,000 bits; 2 GB for all variables, and a call that would pass it keeps none of its assignments |
+| Judge | with 1 or 2 scored items the standard error is 0 and any gain was "improved"; the steering and settings judges read the held-out set without logging the look | no verdict under 5 scored items; both judges log their looks; the exact one-sided sign test is printed next to z (reported, the bar stays z > 2) |
+| Probe caches | the language probe and the induction scores took `WSR_CACHE` (the on/off switch) as a folder name, loaded with pickle, ignored `WSR_CACHE=off`, and were keyed by the config plus 16 unembedding values, which an edited model shares | stored through `cache.py` like every other result: keyed by the weight checksum, JSON plus safetensors, switched off with the rest |
+| `wsr cache` | imported torch (the core install has none); `clear models` removed the whole `models/` folder under `WSR_CACHE_DIR` | no torch needed; only entries named the way wsr names them are deleted |
+| Goal file | `budget` was parsed and never used (the real cap was the flag's default) | honoured: flag, then goal file, then default; unknown keys are an error; `passes` is read as `practice_evals` |
+| CLI | usage errors left with exit code 1 ("failure found"); a recommended steering or settings made `wsr program` exit 1; Ctrl-C printed a traceback; JSON errors did not name the file; `--agent-allow` typos surfaced after the diagnosis; the failing conversation was read by five copies of the same code | exit 2 with the `wsr:` prefix; exit 0 for the three fix outcomes; exit 130; file named; checked before the model loads; one helper |
+| Patches | a patch for another model was a `KeyError`, or half applied before a shape error; a different fine-tune of the same shape took the patch silently | refused whole; a saved patch records marks of its base tensors and apply / evaluate / check compare them (`--force` to override) |
+| Servers and downloads | a llama-server wsr started could outlive wsr after Ctrl-C; the converter download had no timeout; a dataset interrupted mid-write was reused | stopped at exit; timeout and the tar `data` filter; written whole or not at all |
+| Smaller | duplicate steering candidates (the most causal layer is often the diagnosis's depth) each cost a full verification; a clamp steering was reported as "Add"; an invalid regex grader was a traceback; an unknown Claude model was priced as Opus | tried once; reported as a clamp; a clear error; priced at the dearest known rate so the spend cap stops early |
+
+Known and not changed:
+
+- The Anthropic provider (the default for `--agent`) is written from the API reference and tested with a
+  stand-in client; the live runs so far used Gemini (OpenAI-compatible endpoint) and Kiro.
+- A single slow torch call in the workspace cannot be interrupted (the deadline is checked between operations).
+- The judge's bar is z > 2 on the paired difference; on few changed items that is more generous than the
+  sign test, which is why both are printed.
+- The agent's state is rewritten after every turn (up to 1 GB of workspace tensors).
+- The file-level GGUF export (`patch_files`) does not compare the patch's base marks; `wsr patch apply` does.
+

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -137,9 +137,12 @@ def _token_loop_onset(gen: list[int], max_period: int = 40, min_repeats: int = 3
 
 class Classifier:
     def __init__(self, lm: LM, *, expect_lang: Optional[str] = None, max_new: int = 48,
-                 template_kwargs: Optional[dict] = None):
+                 template_kwargs: Optional[dict] = None, expect_refuse: bool = False):
+        """expect_refuse: the prompts are requests the model must refuse (the "complied" kind, under-refusal). A
+        refusal is then the wanted reply (no group), and a reply without one gets the "complied" group."""
         self.lm, self.expect_lang, self.max_new = lm, expect_lang, max_new
         self.template_kwargs = template_kwargs or {}
+        self.expect_refuse = expect_refuse
 
     def run(self, name: str, messages: list[dict], hooks=None) -> Example:
         ids = self.lm.encode(messages, **self.template_kwargs)
@@ -168,7 +171,13 @@ class Classifier:
         codes.discard("TRUNCATED")     # max_new is ours, not the user's cap
         if not gen or gen[0] in self.lm.eot_ids:
             codes.add("EMPTY")
-        return _groups_of(codes)
+        groups = _groups_of(codes)
+        if self.expect_refuse:
+            if "refusal" in groups:
+                groups.discard("refusal")
+            elif "blank" not in groups:
+                groups.add("complied")
+        return groups
 
 
 def list_items(lm: LM, gen: list[int]) -> list[tuple[int, str]]:
@@ -261,15 +270,41 @@ def decision_point(lm: LM, ex: Example, kind: str, loop_item: Optional[int] = No
 
 
 @dataclass
+class Reference:
+    """The unedited model's run of a failing + working list, in the same batch chunks as the edited runs that are
+    compared with it (surgery/playbook.reference): an example counts as failing only if it fails here too.
+
+    `agrees` says how many examples kept their label in this run. When the failure starts past the token limit,
+    the run is redone at a longer length (playbook._longer_reference): `agrees_at_cap` then holds the agreement at
+    the original limit and `clf.max_new` the length every judgment uses."""
+    replies: list[Example]
+    clf: Any                                       # the Classifier (and so the length) of this run
+    agrees: dict
+    agrees_at_cap: Optional[dict] = None
+
+    @property
+    def max_new(self) -> int:
+        return int(self.clf.max_new)
+
+    @property
+    def extended(self) -> bool:
+        return self.agrees_at_cap is not None
+
+    def describe(self) -> dict:
+        return {"max_new": self.max_new, "agrees": self.agrees, "agrees_at_cap": self.agrees_at_cap}
+
+
+@dataclass
 class Contrast:
     kind: str
     failing: list[Example]
     passing: list[Example]
     tried: list[Example]
+    reference: Optional[Reference] = None          # set when surgery prepares its checks
 
 
 def primary_kind(groups: set[str]) -> str:
-    for k in ("blank", "loop", "refusal", "language", "template_leak", "garbage", "structure"):
+    for k in ("blank", "loop", "refusal", "complied", "language", "template_leak", "garbage", "structure"):
         if k in groups:
             return k
     return "other"
@@ -278,7 +313,8 @@ def primary_kind(groups: set[str]) -> str:
 def build(lm: LM, messages: list[dict], *, kind: str = "auto", extra_failing: tuple[str, ...] = (),
           extra_passing: tuple[str, ...] = (), expect_lang: Optional[str] = None, max_new: int = 48,
           template_kwargs: Optional[dict] = None, max_variants: int = 12) -> Contrast:
-    clf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs)
+    clf = Classifier(lm, expect_lang=expect_lang, max_new=max_new, template_kwargs=template_kwargs,
+                     expect_refuse=kind == "complied")
     jobs = ([("original", messages)]
             + [(f"user_failing_{i}", _with_last_user(messages, t)) for i, t in enumerate(extra_failing)]
             + [(f"user_passing_{i}", _with_last_user(messages, t)) for i, t in enumerate(extra_passing)]

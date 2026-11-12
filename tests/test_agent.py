@@ -32,7 +32,7 @@ def setup(monkeypatch):
     res.contrast.failing = [e for e in res.contrast.failing if e.messages[-1]["content"].lower().count("please") == 1]
     # The playbook is made to fail (no candidates), so the agent is the one that has to find the edit.
     monkeypatch.setattr(P, "candidates", lambda *a, **k: [])
-    rep = P.repair(lm, res, max_new=12, log=None)
+    rep = P.repair(lm, res, max_new=12, log=None, steering="off")     # its steering fallback would fix it
     assert rep.status == "could_not_fix" and rep.ctx is not None
     return lm, res, rep
 
@@ -357,6 +357,43 @@ def test_openai_compatible_request_translation_and_parsing():
     assert r.turn("s", [{"role": "user", "content": "x"}], SCHEMAS).stop == "refusal"
 
 
+def test_openai_tool_call_extra_content_is_returned_unchanged():
+    """Gemini 3's OpenAI endpoint puts a thought signature on the (first) tool call and rejects the next turn
+    without it; whatever the server attached comes back on that call, and calls without it get nothing."""
+    from wsr.agent.providers import OpenAIProvider
+    rep = _reply(calls=[("list_examples", "{}"), ("read", "{}")])
+    sig = {"google": {"thought_signature": "abc=="}}
+    rep.choices[0].message.tool_calls[0].extra_content = sig
+    fake = _FakeChat([rep, _reply("ok", finish="stop")])
+    p = OpenAIProvider("gemini-x", client=fake, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+    t = p.turn("sys", [{"role": "user", "content": "go"}], SCHEMAS)
+    hist = [{"role": "user", "content": "go"}, {"role": "assistant", "content": t.content},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c0", "content": "1"},
+                                         {"type": "tool_result", "tool_use_id": "c1", "content": "2"}]}]
+    p.turn("sys", hist, SCHEMAS)
+    calls = fake.seen[1]["messages"][2]["tool_calls"]
+    assert calls[0]["extra_content"] == sig and "extra_content" not in calls[1]
+
+
+def test_openai_cost_counts_hidden_thinking_and_cached_price():
+    """Gemini's endpoint reports thinking only in total_tokens (billed as output); cached input bills at the
+    cache-read price when the user gives one, else at the full input price (never under-counted)."""
+    from types import SimpleNamespace as NS
+    from wsr.agent.providers import OpenAIProvider
+
+    def rep():
+        r = _reply("x", finish="stop", tin=1000, tout=10)
+        r.usage = NS(prompt_tokens=1000, completion_tokens=10, total_tokens=1400,
+                     prompt_tokens_details=NS(cached_tokens=800))
+        return r
+    full = OpenAIProvider("m", client=_FakeChat([rep()]), price_in=1.0, price_out=4.0)
+    t = full.turn("s", [{"role": "user", "content": "x"}], SCHEMAS)
+    assert t.output_tokens == 400 and abs(t.cost_usd - (1000 * 1.0 + 400 * 4.0) / 1e6) < 1e-12
+    disc = OpenAIProvider("m", client=_FakeChat([rep()]), price_in=1.0, price_out=4.0, price_cached=0.1)
+    t = disc.turn("s", [{"role": "user", "content": "x"}], SCHEMAS)
+    assert abs(t.cost_usd - (200 * 1.0 + 800 * 0.1 + 400 * 4.0) / 1e6) < 1e-12 and disc.cached_tokens == 800
+
+
 def test_the_agent_runs_the_same_through_an_openai_compatible_model(setup, tmp_path):
     """Provider-neutral: the same loop, tools and judge, driven through the OpenAI adapter."""
     from wsr.agent.providers import OpenAIProvider
@@ -386,17 +423,17 @@ def test_cli_agent_provider_fails_early_and_clearly(monkeypatch):
     from wsr.cli import _agent_provider
     a = argparse.Namespace(agent_provider="openai", agent_model=None, agent_base_url=None, agent_key_env=None,
                            agent_effort=None, agent_price=None)
-    with pytest.raises(SystemExit, match="--agent-model"):
+    with pytest.raises(ValueError, match="--agent-model"):
         _agent_provider(a)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     a.agent_model = "gpt-x"
-    with pytest.raises(SystemExit, match="OPENAI_API_KEY"):
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
         _agent_provider(a)
     a.agent_base_url = "http://127.0.0.1:8080/v1"                 # a local server needs no key
     assert _agent_provider(a).name == "openai-compatible:gpt-x@http://127.0.0.1:8080/v1"
     a2 = argparse.Namespace(agent_provider="anthropic", agent_model=None, agent_key_env=None, agent_effort="bogus",
                             agent_base_url=None, agent_price=None)
-    with pytest.raises(SystemExit, match="effort"):
+    with pytest.raises(ValueError, match="effort"):
         _agent_provider(a2)
 
 
@@ -509,9 +546,18 @@ def test_tool_errors_that_a_small_model_hit_are_forgiving_and_explicit(setup):
     bad = wb.build_edit({"gate": {"layer": 1, "read_source": "d1", "write_direction_id": "d1"}})
     assert "not a direction id" in bad["error"]
     assert "one of" in wb.build_edit({"what": 1})["error"]
-    small = Workbench(lm, res, rep.ctx, rep.sitemap, Budget(max_weights_changed=10))
+    small = Workbench(lm, res, rep.ctx, rep.sitemap, Budget(max_free_params=10))
     small.make_direction({"kind": "contrast"})
     assert "embed" in small.build_edit({"kind": "orthogonalise", "direction_id": "d1"})["error"]
+    # the size is the edit's free parameters: a rank-1 projection out of every layer touches every entry of
+    # those matrices but chooses only rank x (rows + columns) numbers
+    orth = wb.build_edit({"kind": "orthogonalise", "direction_id": "d1"})
+    assert orth["free_params"] < orth["weights_changed"]
+    p = wb._edit(orth["edit_id"])
+    assert 0 < orth["free_params"] <= sum(d.U.shape[1] * (d.U.shape[0] + (d.V.shape[0] if d.V.shape[0] > 1 else 1))
+                                          for d in p.deltas)          # untouched (all-zero) rows are not counted
+    noop = wb.build_edit({"kind": "scale_neurons", "neurons": [[0, 0]], "scale": 1})
+    assert "no weight" in noop.get("warning", "")
     hint = wb.inspect_neuron(PLANT_LAYER, PLANT_NEURON).get("hint", "")
     assert f"[[{PLANT_LAYER}, {PLANT_NEURON}]]" in hint and "verify_edit" in hint
 
@@ -591,3 +637,183 @@ def test_openai_breakpoint_is_sent_only_when_supported_and_dropped_if_rejected()
     q = OpenAIProvider("some/model", base_url="https://openrouter.ai/api/v1", client=client)
     q.turn("SYSTEM", [{"role": "user", "content": "hi"}], [])
     assert sent[-1]["messages"][0] == {"role": "system", "content": "SYSTEM"}
+
+
+def test_overwrite_edits_on_the_same_entries_are_not_combined(setup):
+    """A gate (or set_columns / set_rows) is stored as new - old: two of them on the same entries, or one with
+    another edit there, do not add up. Additive edits compose; overwrites on other entries compose."""
+    import torch
+    from wsr.surgery import edits as E
+
+    def patch(kind, row, col):
+        U = torch.zeros(4, 1)
+        U[row, 0] = 1.0
+        V = torch.zeros(3, 1)
+        V[col, 0] = 1.0
+        return E.Patch(f"{kind}@{row},{col}", kind, {}, [E.Delta("w", U, V)])
+    assert "cannot combine" in E.overwrite_clash([patch("gate", 1, 2), patch("gate", 1, 2)])
+    assert "cannot combine" in E.overwrite_clash([patch("gate", 1, 2), patch("projection", 1, 2)])
+    assert E.overwrite_clash([patch("gate", 1, 2), patch("gate", 3, 2)]) == ""      # other rows
+    assert E.overwrite_clash([patch("projection", 1, 2), patch("scale_neurons", 1, 2)]) == ""
+
+
+def test_scale_strength_bounds_and_budget_not_spent_on_a_bad_id(setup):
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    assert "beyond" in wb.build_edit({"kind": "scale_neurons", "neurons": [[PLANT_LAYER, PLANT_NEURON]],
+                                      "scale": 1000})["error"]
+    assert "beyond" in wb.build_edit({"kind": "gate", "layer": 1, "write_direction_id": "d1",
+                                      "strength": 50})["error"]
+    out, err = wb.call("screen_edit", {"edit_id": "e9"})
+    assert err and wb.used["screens"] == 0
+    out, err = wb.call("verify_edit", {"edit_id": "e9"})
+    assert err and wb.used["verifications"] == 0
+
+
+def test_generate_resolves_regression_suite_names(setup):
+    """'suite:<name>' (as read and list_examples name them) runs that suite prompt, not the literal text."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    r = rep.ctx.base.replies[0]
+    by_name = wb.generate(f"suite:{r.name}", max_new=8)
+    by_text = wb.generate(r.prompt, max_new=8)
+    assert by_name["original"]["reply"] == by_text["original"]["reply"]
+
+
+def test_fit_edit_learns_a_change_that_passes_the_build_checks(setup):
+    """fit_edit trains a low-rank change toward a target continuation, keeps the original weights untouched, and
+    goes through the same checks as any edit; frozen tensors and out-of-range settings are refused."""
+    import torch
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    before = {n: p.detach().clone() for n, p in lm.model.named_parameters()}
+    name = f"model.layers.{PLANT_LAYER}.mlp.down_proj.weight"
+    out = wb.fit_edit([name], [{"item": {"prompt": "original", "continuation": "the cat sat on the mat"},
+                                "weight": 1.0}], rank=2, steps=30, lr=0.05)
+    assert "edit_id" in out, out
+    assert out["loss_end"]["target"] < out["loss_start"]["target"]
+    assert out["free_params"] > 0 and wb.used["fits"] == 1
+    assert all(torch.equal(before[n], p) for n, p in lm.model.named_parameters())          # nothing written
+    assert all(p.requires_grad for p in lm.model.parameters()) or not any(
+        p.requires_grad for p in before.values())                                          # flags restored
+    emb = next(n for n, p in lm.model.named_parameters() if p is lm.model.get_input_embeddings().weight)
+    assert "frozen" in wb.fit_edit([emb], [{"item": "original", "weight": -1}])["error"]
+    assert "rank" in wb.fit_edit([name], [{"item": "original", "weight": -1}], rank=999)["error"]
+    assert "non-zero" in wb.fit_edit([name], [{"item": "original", "weight": 0}])["error"]
+    assert wb.used["fits"] == 1                                                             # refusals cost nothing
+    scr = wb.screen_edit(out["edit_id"])
+    assert "decision_flips" in scr
+
+
+def test_attribute_heads_ranks_heads(setup):
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    out = wb.attribute_heads(top=5)
+    assert len(out["heads"]) == 5 and all(len(h) == 3 for h in out["heads"]) and out["layers"]
+
+
+def test_fit_edit_out_of_memory_ends_cleanly(setup, monkeypatch):
+    """Running out of GPU memory mid-fit is a clear refusal: no exception escapes, the weights and their
+    requires_grad flags are as before, and the budget is still charged only once."""
+    import torch
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    before = {n: p.detach().clone() for n, p in lm.model.named_parameters()}
+    flags = [p.requires_grad for p in lm.model.parameters()]
+    calls = {"n": 0}
+    real = lm.model.forward
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        if calls["n"] > 3:                                # after the keep references and the first losses
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return real(*a, **k)
+    monkeypatch.setattr(lm.model, "forward", boom)
+    name = f"model.layers.{PLANT_LAYER}.mlp.down_proj.weight"
+    out = wb.fit_edit([name], [{"item": {"prompt": "original", "continuation": "the cat sat"}, "weight": 1.0}],
+                      rank=2, steps=5)
+    assert "out of GPU memory" in out["error"]
+    assert all(torch.equal(before[n], p) for n, p in lm.model.named_parameters())
+    assert [p.requires_grad for p in lm.model.parameters()] == flags
+    assert wb.used["fits"] == 1
+
+
+def test_generate_many_prompts_in_one_batched_call(setup):
+    """prompts=[...] gives the same replies as one call per prompt (greedy), for the original and the edit, and
+    costs the same generations budget."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    e = wb.build_edit({"kind": "scale_neurons", "neurons": [[PLANT_LAYER, PLANT_NEURON]], "scale": 0})["edit_id"]
+    names = ["original", "tell me about the dog", "what is the sun"]
+    many = wb.generate(prompts=names, edit_id=e, compare=True, max_new=8)
+    assert len(many["results"]) == 3 and wb.used["generations"] == 6
+    for name, r in zip(names, many["results"]):
+        one = wb.generate(name, edit_id=e, compare=True, max_new=8)
+        assert r["original"]["reply"] == one["original"]["reply"] and r["edited"]["reply"] == one["edited"]["reply"]
+    assert "error" in wb.generate(prompts=[])
+    assert "error" in wb.generate()
+
+
+# -- audit fixes -----------------------------------------------------------------------------------------
+
+def test_a_long_tool_result_is_still_valid_json_and_a_tool_fault_does_not_end_the_run(setup, tmp_path, monkeypatch):
+    """A read of 64 texts was cut mid-JSON at 20,000 characters and the loop's json.loads raised; a fault inside
+    a tool (AttributeError) escaped the dispatcher. Either ended a paid agent run with a traceback."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    items = [{"prompt": f"what is the sun number {i}", "continuation": " the sun is a star" * 6} for i in range(64)]
+    s, err = wb.call("read", {"items": items})
+    assert not err and json.loads(s)["stored_as"] and len(s) <= 20_000
+    monkeypatch.setattr(wb, "tools", {**TOOLS, "note": lambda self, text: {"blob": "x" * 50_000}}, raising=False)
+    s, err = wb.call("note", {"text": "t"})
+    cut = json.loads(s)                                               # cut, and still JSON
+    assert "truncated" in cut and len(s) < 30_000
+    s, err = wb.call("logit_lens", {"example": "suite:sun", "depth": 1})   # a suite reply has ids, not prompt_ids
+    assert not err and json.loads(s)["top"]
+    assert "depth must be" in json.loads(wb.call("logit_lens", {"example": "original", "depth": 99})[0])["error"]
+
+    def broken(self, text):
+        raise AttributeError("'NoneType' object has no attribute 'to'")
+    monkeypatch.setattr(wb, "tools", {**TOOLS, "note": broken}, raising=False)
+    s, err = wb.call("note", {"text": "t"})
+    assert err and "failed inside wsr" in json.loads(s)["error"]
+    before = _weights(lm)
+    script = [[("read", {"items": items})], [("give_up", {"reason": "done", "next_step": "none"})]]
+    out = run(lm, res, rep, ScriptedProvider(script), out=tmp_path, log=None)
+    assert out.status == "could_not_fix" and "done" in out.summary
+    assert all(torch.equal(p, before[n]) for n, p in lm.model.named_parameters())
+
+
+def test_workspace_refuses_huge_results_before_computing_them(setup, monkeypatch):
+    """The size cap was checked on the result, after the allocation: torch.zeros(3e9) tried to take 12 GB first,
+    and an integer power tower ran for minutes. Both are refused from their arguments now."""
+    import time
+
+    from wsr.agent import lab as L
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    t0 = time.perf_counter()
+    for code, why in (("x = torch.zeros(3000000000)", "would produce"),
+                      ("x = torch.randn(60000, 60000)", "would produce"),
+                      ("a = torch.ones(100000)\nx = torch.outer(a, a)", "would produce"),
+                      ("a = torch.ones(100000)\nx = torch.diag(a)", "would produce"),
+                      ("a = torch.ones(100000)\nx = a.outer(a)", "would produce"),
+                      ("a = torch.ones(9000, 9000)\nx = torch.cat([a, a])", "would produce"),
+                      ("a = 10**10000\nb = a**10000", "integer too large"),
+                      ("a = 2**90000\nb = a * a", "integer too large"),
+                      ("1 << 4", "not available")):
+        out = wb.compute(code)
+        assert why in out.get("error", ""), (code, out)
+    assert time.perf_counter() - t0 < 20                              # refused, not computed
+    # the reduced SVD by default: the full one of a tall matrix allocates rows x rows
+    out = wb.compute("U, S, Vh = torch.linalg.svd(torch.randn(50, 4))\nU.shape")
+    assert "50, 4" in out["output"], out
+    assert "would produce" in wb.compute("x = torch.linalg.svd(torch.ones(9000, 2), full_matrices=True)")["error"]
+    # the workspace as a whole is capped: a call that would pass it keeps nothing, earlier variables stay
+    monkeypatch.setattr(L, "MAX_WORKSPACE", 1000)
+    assert "error" not in wb.compute("small = torch.ones(600)")
+    out = wb.compute("big = torch.ones(600)")
+    assert "workspace would hold" in out["error"] and "big" not in wb.lab.vars and "small" in wb.lab.vars
+    with pytest.raises(L.LabError, match="workspace"):
+        wb.lab.put("r9", [torch.ones(900)])
+    assert wb.lab.denied.get("limit:workspace", 0) >= 2

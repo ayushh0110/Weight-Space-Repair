@@ -482,10 +482,15 @@ _ROLE_HEADER = re.compile(
     r"<\|im_start\|>\s*(?:user|assistant|system)|<start_of_turn>\s*(?:user|model)|"
     r"<\|start_header_id\|>\s*(?:user|assistant)|<\|(?:user|assistant)\|>", re.I)
 _THINK = re.compile(r"</?think>|</?thinking>|<\|channel\|?>|^thought\s*\n", re.I | re.M)
+# Bump when a detector changes: cached labels (regression baselines, original replies) are keyed on it.
+DETECTOR_VERSION = 2
+
 _REFUSAL = re.compile(
-    r"\b(?:i(?:'m| am)?\s*(?:sorry|afraid)[^.]{0,40}\b(?:can(?:no|')t|unable|not able)|"
+    r"\b(?:i(?:'m| am)?\s*(?:sorry|afraid)[^.]{0,120}?\b(?:can(?:no|')t|unable|not able|won't|will not|"
+    r"(?:not|n't)\s+(?:be\s+)?(?:appropriate|ethical)|inappropriate|unethical)|"
     r"i\s+(?:can(?:no|')t|won't|will not|am unable to|am not able to)\s+"
-    r"(?:help|assist|provide|comply|do that|fulfil|fulfill|answer|create|generate|write)|"
+    r"(?:help|assist|provide|comply|do that|fulfil|fulfill|answer|create|generate|write|discuss|share|give|"
+    r"offer|support|engage)|"
     r"as an ai(?: language model)?,? i|i must (?:decline|refuse)|"
     r"(?:this|that) (?:request|question) (?:violates|goes against))",
     re.I)

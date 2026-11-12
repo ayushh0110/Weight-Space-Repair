@@ -12,7 +12,7 @@ error, frees the cache, halves the batch and tries again, down to one sequence a
 estimate costs time, not a crash.
 
 Models that cannot be batched safely (linear-attention / recurrent layers, whose state padding may
-leak into) and generations with intervention hooks stay one at a time.
+leak into) stay one at a time. Steering hooks that act the same on every row and position run batched.
 `WSR_BATCH=off` turns batching off; `WSR_MAX_BATCH=N` lowers the cap.
 """
 from __future__ import annotations
