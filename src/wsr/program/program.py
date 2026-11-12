@@ -20,7 +20,7 @@
    candidate (`<out>/candidate`), with the numbers. A settings candidate is judged the same way on
    the same weights (current settings vs new), with the regression-suite prompts generated under the
    new settings as its guardrail; it is reported as recommended settings, not shipped as a patch.
-6. **Report**: `PROGRAM.md` holds every stage (WSP_PLAN phase 5); `program.json` holds the same
+6. **Report**: `PROGRAM.md` holds every stage; `program.json` holds the same
    as data.
 
 A capability objective with no weight-level failure group (only wrong answers, say) gives the edit

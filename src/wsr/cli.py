@@ -718,7 +718,74 @@ def build_parser() -> argparse.ArgumentParser:
                                            "without it a patch is scored on PyTorch")
     _common(ev)
     ev.set_defaults(fn=cmd_evaluate)
+    _fill_help(ap)
     return ap
+
+
+# Help for options that several commands share and that are added without their own text. An option's own help
+# always wins; every option must end up with one (tests/test_docs.py).
+HELP = {
+    "action": "apply, revert, or export (a GGUF)",
+    "agent_turns": "stop the agent after this many turns",
+    "ctx": "context size for the memory-fit estimate",
+    "data": "JSONL file to shuffle and split",
+    "device": "auto (CUDA when available), cpu, cuda, cuda:1 ...",
+    "dtype": "auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16",
+    "endpoint": "the server's base URL, e.g. http://localhost:8080",
+    "eval_limit": "held-out items the judge scores (default: all)",
+    "expect_json": "the reply must be JSON",
+    "expect_lang": "language the reply must be in (ISO code)",
+    "fast": "the playbook's fast checks instead of deep ones (the held-out judge still decides)",
+    "file": "the file to read (- for stdin)",
+    "finish_reason": "the finish reason the server reported",
+    "gguf": "the GGUF file",
+    "grader": "exact | contains | regex:<pattern> | math | detector:<group>",
+    "hash": "sha256 the weights and compare with the Hub (slow)",
+    "heldout": "held-out JSONL file (only the judge reads it)",
+    "heldout_share": "share of the items that goes to the held-out set",
+    "judge": "where the held-out judge runs: auto (llama-server when there and allowed), torch, llama-server",
+    "judge_quant": "GGUF type the llama-server judge serves",
+    "kind": "the failure kind (auto: detected from the reply)",
+    "limit": "first N rows only",
+    "max_new": "tokens generated per reply",
+    "max_tokens": "the request's max_tokens (to tell a cut reply from a finished one)",
+    "model": "the model directory the goal is for",
+    "model_dir": "Hugging Face model directory (full precision)",
+    "name": "a name for it",
+    "no_guardrails": "score the main set only",
+    "no_memory": "skip the memory-fit estimate",
+    "no_playbook": "skip the rule-based recipes",
+    "no_probes": "skip the live probes",
+    "no_thinking": "render the chat template with enable_thinking=false",
+    "objective": "the goal file (JSON or YAML)",
+    "path": "model directory, or a .safetensors / .gguf file",
+    "practice": "practice JSONL file (the agent may use it)",
+    "practice_evals": "practice_eval calls the agent may make (default: the goal file's budget, else 10)",
+    "preset": "detector thresholds: chat, strictJson, longForm or lenient",
+    "profile_limit": "practice items to profile",
+    "prompt": "the failing user prompt",
+    "prompt_file": "file with the failing user prompt",
+    "repeat_penalty": "the repeat penalty the failing request used",
+    "samples": "dataset rows to run",
+    "scan_values": "scan safetensors for NaN / Inf (needs numpy)",
+    "seed": "random seed",
+    "split": "which set to score",
+    "system": "system prompt to send with --prompt",
+    "temperature": "the temperature the failing request used",
+    "timeout": "seconds per request",
+    "top": "how many to list",
+    "top_p": "the top_p the failing request used",
+    "upstream": "Hugging Face repo[@revision] to compare files and template against",
+}
+
+
+def _fill_help(p: argparse.ArgumentParser) -> None:
+    for a in p._actions:
+        if isinstance(a, argparse._SubParsersAction):
+            for sub in a.choices.values():
+                _fill_help(sub)
+        elif not isinstance(a, argparse._HelpAction) and not a.help and a.dest in HELP:
+            a.help = HELP[a.dest]
 
 
 def cmd_objective_init(args: argparse.Namespace) -> int:

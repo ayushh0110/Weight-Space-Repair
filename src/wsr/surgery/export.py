@@ -1,4 +1,4 @@
-"""`wsr patch export --gguf`: ship a verified patch into the file people serve (WSP_PLAN phase 4).
+"""`wsr patch export --gguf`: ship a verified patch into the file people serve.
 
 1. The patch is applied to the full-precision model and saved in its checkpoint precision, as
    `wsr patch apply` does.

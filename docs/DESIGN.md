@@ -1,10 +1,17 @@
-# Triage layer — technique inventory and hybrid design
+# wsr design notes and measured results
 
-Scope comes from the product report (v1 / Milestone 2): a basic triage CLI for
-small open-weight models (Qwen, Gemma, Llama under ~4B), safetensors first, GGUF
-read-only, focused on blank responses, loops, wrong language and over-refusal.
-Deep weight-level diagnosis (section 4) and surgery (section 5, `wsr repair`) are
-built on top of it; triage produces the verdict and the hand-off package.
+How each part of wsr was built, why, and what it measured, in the order it was built. For what the tool
+does and how to use it, read [GUIDE.md](GUIDE.md); for what is not tested or not built,
+[LIMITATIONS.md](LIMITATIONS.md).
+
+How to read this: sections 1-3 design the triage layer from the tools it draws on; 4 is deep diagnosis;
+5 surgery; 6 the surgery agent; 7 scope; 8-9 goal files, profiles, the judge, `wsr program` and GGUF
+export; 10-17 later rounds (speed, protecting the machine, settings fixes, the full agent toolkit,
+caching, steering); 18 the pre-release audit. Later sections supersede earlier ones where they differ, and
+results are reported as measured at the time, including the runs that failed.
+
+Scope at the start (v1): a triage CLI for small open-weight models (Qwen, Gemma, Llama under ~4B),
+safetensors first, GGUF read-only, focused on blank responses, loops, wrong language and over-refusal.
 
 ## 1. What the existing tools actually do
 
@@ -810,7 +817,7 @@ Full tool list:
   and the patch records `checks.agent` (provider, turns, cost, rationale, notes).
 
 What it still cannot do, on purpose: run arbitrary Python (a real kernel would need an isolated
-container; `TODO.md` has that as an opt-in), train or use gradients, edit the
+container; listed as open work in LIMITATIONS.md), train or use gradients, edit the
 embedding / unembedding / final norm, change the checks, or reach files and the network.
 
 **When the repair needs something wsr does not allow (`request_capability`).** The agent can
@@ -836,7 +843,7 @@ category, why, evidence, the opt-in, the proposal) goes into `REPAIR.md` under "
 needed but could not do", into `repair.json` (`checks.agent.capability_requests`) and into the CLI
 output, and the next step names the flags to rerun with.
 
-**State, `--resume` and drafts that come back (WSP_PLAN phase 1.6).** After every turn the run
+**State, `--resume` and drafts that come back.** After every turn the run
 writes `<out>/agent_state/` (`agent/state.py`):
 - the workspace variables (tensors in safetensors, everything else as JSON; no pickle, so a
   state file can be read without running code from it);
@@ -864,9 +871,9 @@ agent asked for an unlock, REPAIR.md and the CLI print the exact command: the sa
 for testing an agent or when the recipes are known not to fit; the checks are the same. Every
 operation the safe workspace refuses is counted by kind (`attr:Tensor.numpy`, `call:getattr`,
 `syntax:FunctionDef`, `name:open`, `limit:time`). The counts appear in `checks.agent.denied` and
-REPAIR.md, and over real runs they decide what the workspace should allow (WSP_PLAN phase 2).
+REPAIR.md, and over real runs they decide what the workspace should allow.
 
-**First live runs: a free local agent (WSP_PLAN phase 0).** The agent model was Gemma 4 E2B Q4_0
+**First live runs: a free local agent.** The agent model was Gemma 4 E2B Q4_0
 on the CPU through llama-server (`--jinja`, OpenAI-compatible, no key, $0), and the model under
 repair was the planted-blank Llama-3.2-1B on the GPU. Each run used `--agent-only`, so the playbook
 was skipped and the agent had to find the fix itself. Four runs, each fixing what the previous one
@@ -989,17 +996,17 @@ loop. Declined correctly: a language the model does not know, and a decoding loo
 
 | Gap | Why it matters | What closes it |
 |---|---|---|
-| Objective-driven runs | The paper's task was open-ended ("make it better at math") | goal files, profiles and the judge are built (section 8); `wsr program` (WSP_PLAN phase 3) puts the agent on them |
+| Objective-driven runs | The paper's task was open-ended ("make it better at math") | goal files, profiles and the judge are built (section 8); `wsr program` (section 9) puts the agent on them |
 | Benchmark-scale evaluation | The paper confirmed on 1,152 problems with 32k-token sampled generations | the paired judge exists, but on transformers only, one sequence at a time; it needs the llama-server / vLLM backends for long sampled runs |
 | A live agent result on a hard case | The agent is the part that makes this programming rather than recipes | an easy case is done; the hard cases need a paid or higher-limit key, or a self-hosted agent model |
-| Full Python for the agent | The workspace is a safe subset | the opt-in container kernel (`TODO.md`, item 9) |
+| Full Python for the agent | The workspace is a safe subset | the opt-in container kernel (open work, LIMITATIONS.md) |
 | Scale and formats | Tested up to 1.5B on a 4 GB GPU; GGUF survival untested | a larger GPU; experiment 6 |
 
 So the accurate description is: **triage, diagnosis and verified weight-space repair of observed
 failures, with a weight-space-programming agent in the style of Takehi et al.** "Full weight-space
 programming" fits once the objective mode, the benchmark harness and one live agent result exist.
 
-## 8. Objectives, dataset profiles and the judge (`src/wsr/program/`, WSP_PLAN phases 1 and 1.5)
+## 8. Objectives, dataset profiles and the judge (`src/wsr/program/`)
 
 Sections 4-6 start from one reproduced failure and check a patch on prompt sets. This section adds
 what an open-ended goal needs: a task with a metric, data split so the agent is never scored on
@@ -1087,7 +1094,7 @@ the paper's failure (reasoning that loops until the cap) at 1B scale, but the nu
 16 problems, and 3 of 16 loop. The slow part is generation. A benchmark-sized profile needs the
 llama-server backend, which is still to build.
 
-## 9. Asking first, two backends, `wsr program` and GGUF export (WSP_PLAN phases 3-5)
+## 9. Asking first, two backends, `wsr program` and GGUF export
 
 **Asking first (`src/wsr/consent.py`).** Every step the user did not plainly ask for asks first:
 
@@ -1462,14 +1469,14 @@ backslash turns `\b` into a backspace. The earlier MATH profile ran with exactly
 `wsr objective check` now reports control characters in any prompt, with the doubled-backslash
 fix.
 
-**The paper's edit, reproduced exactly.** For the positive control (WSP_PLAN phase 1):
+**The paper's edit, reproduced exactly.** For the positive control:
 - Qwen3.5-0.8B was downloaded (revision 2fc0636). Its two edited tensors match the base checksums
   in the paper's manifest, byte for byte.
 - The released p50c diff was rebuilt as a wsr patch and applied with the direct file patch. Both
   edited tensors then match the paper's edited checksums exactly, and the other 486 tensors are
   unchanged.
 
-**The positive control (WSP_PLAN phase 1 acceptance).**
+**The positive control.**
 - **Setup:** Qwen3.5-0.8B against the same model with the paper's p50c edit (exact, see above). Both
   were exported to Q8_0 and judged with `wsr evaluate --backend llama-server`, one server at a time.
 - **Protocol:** the paper's own: thinking on, temperature 0.6, top-p 0.95, top-k 20, presence
@@ -1655,8 +1662,8 @@ held-out judge accept it. New in this round:
 - **A generation step has a floor that does not depend on the batch**: 128 ms per step for Llama-1B in float16
   at batch 1, 132 ms at batch 8 (55 / 58 ms for Qwen in float32). Batching is therefore nearly free in time; the
   batch is limited by free memory (about 0.5 GB after the model and the reserve: 9 sequences of 712 tokens).
-- Consequence: on this machine the remaining time is hardware, not waste. Options that would change it are listed
-  in WSP_PLAN (compute in float32 on float16 weights for GPUs with slow half precision; the diagnosis kept across
+- Consequence: on this machine the remaining time is hardware, not waste. Options that would change it were listed
+  in the development plan (compute in float32 on float16 weights for GPUs with slow half precision; the diagnosis kept across
   runs; several prompts per `generate` call).
 
 ### Tidied

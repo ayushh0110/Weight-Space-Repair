@@ -12,8 +12,24 @@ regression suite, and refusals of harmful requests are kept by default.
 
 The triage layer combines the techniques of llm-output-guard, llm-stopcheck, LLMDoctor,
 ModelVet and Raschka's repetition checklist into one layered pipeline, with a verdict engine
-that links symptoms to causes. See [docs/DESIGN.md](docs/DESIGN.md) for the technique
-inventory, the coverage table and every measured result.
+that links symptoms to causes.
+
+**Documentation:** [docs/GUIDE.md](docs/GUIDE.md) covers every command, check, output file and option;
+[docs/LIMITATIONS.md](docs/LIMITATIONS.md) what is not tested or not built; [docs/DESIGN.md](docs/DESIGN.md)
+how each part was built and every measured result.
+
+## What it does
+
+| | |
+|---|---|
+| **Triage** | seven layers (file, config, request and response, output, live probes with one-factor reruns, known issues) and a verdict that names one cause and its fix; no GPU, no dependencies |
+| **Deep diagnosis** | on the full-precision model: token trace, failure direction, patching of layers, heads and neurons, known directions (refusal, end-of-turn, language, repetition), calibrated language and loop probes, causal tests against random controls |
+| **Quantisation** | GGUF tensor health and error against the original weights; bisection to the tensors that cause a failure |
+| **Repair** | a playbook of verified edits (direction removal, local projection, neuron and head scaling, gated neurons), then activation steering (add or clamp); checked on the failing and working prompts, a regression suite that keeps refusals, serving precision, fresh variants and a random control |
+| **Surgery agent** | a frontier model (Claude, or any OpenAI-compatible model) with weight-editing tools in a workspace that cannot touch files, the network or processes; only an edit that passes the same checks is accepted |
+| **Weight-space programming** | goal files with practice and held-out data, dataset profiles, a paired held-out judge with guardrails; `wsr program` and `wsr fix` ship a patch, a steering or serving settings, only when the judge accepts it |
+| **Shipping** | apply, revert, or export a patch to GGUF through llama.cpp; a patch refuses weights it was not made for |
+| **Around it** | llama-server or batched PyTorch backends, results cached per model, questions before any download or server start |
 
 **Status: beta.** The weight-level stages are tested on models up to 1B parameters
 (Qwen2.5-0.5B, Llama-3.2-1B, Qwen3.5-0.8B) and run on a 4 GB GPU. Triage needs no GPU.
@@ -91,7 +107,7 @@ wsr repair ./model --prompt "..." --deep --agent --agent-provider openai --agent
     --agent-key-env OPENROUTER_API_KEY --agent-model <provider/model> --agent-price 1.0 4.0
 wsr patch apply ./model ./repair/patch --out ./model-repaired
 
-# beyond one prompt (docs/WSP_PLAN.md phase 1): a goal file, a dataset profile, a paired judge
+# beyond one prompt: a goal file, a dataset profile, a paired judge
 wsr objective init goal.json --name my-goal --grader math          # or exact | contains | regex:<p> | detector:<group>
 wsr objective split all.jsonl --practice data/practice.jsonl --heldout heldout/heldout.jsonl
 wsr objective check goal.json                                      # files, gradable rows, practice/held-out overlap
