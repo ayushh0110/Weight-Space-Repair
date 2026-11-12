@@ -33,8 +33,13 @@ MIN_SIDE = 3          # failing and passing runs needed on each side for a trust
 
 def _f(code: str, sev: Severity, msg: str, *, cause: Cause = Cause.NONE, fix: Optional[str] = None,
        **ev: Any) -> Finding:
-    return Finding(code, Layer.DEEP, sev, msg, cause=cause, fix=fix, source=SRC,
-                   evidence={k: v for k, v in ev.items() if v is not None})
+    from ..evidence import for_finding
+
+    evidence = {k: v for k, v in ev.items() if v is not None}
+    dims = for_finding(code, evidence)
+    if dims is not None:
+        evidence["evidence"] = dims          # what this finding rests on (wsr/evidence.py)
+    return Finding(code, Layer.DEEP, sev, msg, cause=cause, fix=fix, source=SRC, evidence=evidence)
 
 
 @dataclass

@@ -11,6 +11,8 @@ A grader returns True (correct), False (wrong) or None (cannot be graded: no ans
                        (`math_verify` is accepted as a name for this grader);
 * `detector:<group>` - no wsr failure detector of that group fired on the reply (`detector:any`: none fired).
                        Needs no answer: it grades the behaviour, not the content.
+* `item`             - each item names its own grader in its `grader` field (the canary mixes math, contains
+                       and regex items).
 """
 from __future__ import annotations
 
@@ -20,7 +22,8 @@ from typing import Any, Callable, Optional
 
 from ..verdict import GROUPS
 
-KNOWN = ("exact", "contains", "regex", "math", "math_verify", "detector")
+KNOWN = ("exact", "contains", "regex", "math", "math_verify", "detector", "item")
+GRADER_VERSION = 1          # bumped whenever a grader's decision on the same reply can change (manifests record it)
 NOT_BUILT = ("ifeval", "judge")
 
 
@@ -150,6 +153,9 @@ def grade(name: Optional[str], reply: str, item: dict[str, Any], groups: set[str
     if not name:
         return None
     head, _, arg = name.partition(":")
+    if head == "item":
+        inner = item.get("grader")
+        return None if not inner or str(inner).startswith("item") else grade(str(inner), reply, item, groups)
     if head == "detector":
         gs = groups or set()
         if item.get("expect") == "refuse":           # a request that must be refused (XSTest's unsafe half)

@@ -466,6 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "16-bit type, else bfloat16; none: skip)")
     rp.add_argument("--check", metavar="PATCH_DIR",
                     help="do not search: check this patch (e.g. one a fast repair found) with the mode's checks")
+    _identity_flags(rp)
     _agent_opts(rp)
     rp.add_argument("--agent-only", action="store_true",
                     help="skip the rule-based playbook and hand the case to the agent at once (still judged by the "
@@ -477,14 +478,17 @@ def build_parser() -> argparse.ArgumentParser:
     _common(rp)
     rp.set_defaults(fn=cmd_repair)
 
-    pa = sub.add_parser("patch", help="apply or revert a surgery patch, or export the patched model as a GGUF")
-    pa.add_argument("action", choices=["apply", "revert", "export"])
-    pa.add_argument("model_dir")
-    pa.add_argument("patch_dir", nargs="?", help="the patch directory written by wsr repair / program (<out>/patch); "
-                                                 "export without it writes the unpatched model (the comparison file)")
+    pa = sub.add_parser("patch", help="apply, revert, export, show or check a fix (a patch, steering or settings "
+                                      "directory with its MANIFEST.json)")
+    pa.add_argument("action", choices=["apply", "revert", "export", "show", "check"])
+    pa.add_argument("model_dir", help="apply / revert / export: the model directory; show / check: the fix's directory "
+                                      "(<out>/patch, <out>/steering or <out>/settings)")
+    pa.add_argument("patch_dir", nargs="?", help="apply / revert / export: the patch directory written by wsr repair / "
+                                                 "program (<out>/patch); export without it writes the unpatched model "
+                                                 "(the comparison file); check: optionally the model directory to "
+                                                 "check the fix against")
     pa.add_argument("--out", help="apply / revert: where to write the patched model")
-    pa.add_argument("--force", action="store_true",
-                    help="apply: also when the patch records other weights than this model's")
+    _identity_flags(pa)
     pa.add_argument("--gguf", help="export: the GGUF file to write")
     pa.add_argument("--quant", default="Q8_0", help="export: F16, BF16, Q8_0 (converter) or any llama-quantize type "
                                                     "such as Q4_K_M (default Q8_0)")
@@ -495,6 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "llama-quantize is looked for next to it)")
     from .consent import add_args as _ca
     _ca(pa)
+    pa.add_argument("--json", action="store_true", help="show / check: print JSON")
     pa.set_defaults(fn=cmd_patch)
 
     q = sub.add_parser("quant", help="GGUF tensor statistics and quantisation error vs the original weights")
@@ -560,6 +565,9 @@ def build_parser() -> argparse.ArgumentParser:
     off.add_argument("--grader", help="default: the failure's detector (detector:<group>)")
     off.add_argument("--samples", type=int, default=200, help="dataset rows to run (default 200)")
     off.add_argument("--heldout-share", type=float, default=0.5)
+    off.add_argument("--confirm-share", type=float, default=0.25,
+                     help="share of the failing items kept as a confirmation set (used once, for one frozen "
+                          "candidate); none when too few items fail: 0 for none")
     off.add_argument("--max-new", type=int, default=256)
     off.add_argument("--no-thinking", action="store_true")
     off.add_argument("--expect-lang")
@@ -639,6 +647,9 @@ def build_parser() -> argparse.ArgumentParser:
     fx.add_argument("--no-thinking", action="store_true")
     fx.add_argument("--samples", type=int, default=200)
     fx.add_argument("--heldout-share", type=float, default=0.5)
+    fx.add_argument("--confirm-share", type=float, default=0.25,
+                    help="share of the failing items kept as a confirmation set (used once, for one frozen "
+                         "candidate); none when too few items fail: 0 for none")
     fx.add_argument("--seed", type=int, default=0)
     fx.add_argument("--out", required=True, help="goal/ (the objective) and run/ (PROGRAM.md, patch) go here")
     fx.add_argument("--profile-limit", type=int, default=40)
@@ -716,6 +727,7 @@ def build_parser() -> argparse.ArgumentParser:
     _backend_opts(ev)
     ev.add_argument("--patched-gguf", help="llama-server backend: the patched model's GGUF (wsr patch export --gguf); "
                                            "without it a patch is scored on PyTorch")
+    _identity_flags(ev)
     _common(ev)
     ev.set_defaults(fn=cmd_evaluate)
     _fill_help(ap)
@@ -911,6 +923,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
                         messages=messages, failing=tuple(args.failing), passing=tuple(args.passing),
                         dataset=Path(args.dataset) if args.dataset and not auto else None, auto=auto,
                         samples=args.samples, heldout_share=args.heldout_share, seed=args.seed,
+                        confirm_share=args.confirm_share,
                         expect_lang=args.expect_lang, consent=consent)
     if not args.json:
         print(F.render(ff))
@@ -1053,6 +1066,7 @@ def cmd_objective_from_failure(args: argparse.Namespace) -> int:
                          dataset=Path(args.dataset) if args.dataset and not auto else None, auto=auto, profile=prof,
                          group=args.group, grader=args.grader, samples=args.samples,
                          heldout_share=args.heldout_share, seed=args.seed, deep=args.deep, name=args.name,
+                         confirm_share=args.confirm_share,
                          expect_lang=args.expect_lang, consent=consent)
     print(json.dumps(res, indent=1, ensure_ascii=False) if args.json else F.render(res))
     return 0 if not res.get("stopped") else 1
@@ -1140,9 +1154,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             return B.choose("llama-server", consent=consent, protocol=obj.protocol, gguf=args.patched_gguf,
                             server_bin=args.llama_server, parallel=args.parallel).backend
     if patch is not None and isinstance(src, B.TorchBackend):
-        _check_base(src.lm, patch)
+        _check_identity(src.lm, patch, args)
     try:
         res = E.evaluate(src, obj, patch=patch, patched_source=psrc,
+                         fmt=("gguf:" + Path(args.patched_gguf).stem.rsplit(".", 1)[-1]) if args.patched_gguf else None,
                          patch_name=(f"{args.patch} ({patch.label})" if patch else
                                      f"{Path(args.patched_gguf).name} (patched GGUF)" if psrc is not None else ""),
                          partial_ok=True, split=args.split, limit=args.limit, samples=args.samples, seed=args.seed,
@@ -1151,6 +1166,18 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         src.close()                                   # the patched server, if any, is closed inside evaluate
     res["backend_notes"] = notes
     res["decisions"] = consent.decisions
+    if args.patch and args.patched_gguf and (Path(args.patch) / "MANIFEST.json").exists() and res.get("paired"):
+        # The fix's record learns how it did as this served file (format from the GGUF's name, e.g. x.Q4_K_M.gguf).
+        from . import manifest as MF
+        stem = Path(args.patched_gguf).stem
+        fmt = "gguf:" + (stem.rsplit(".", 1)[1] if "." in stem else stem)
+        by = res.get("guardrails_by_format") or {}
+        rails = {g["name"]: g for f, rs in by.items() if f != "pytorch" for g in rs.values()}
+        ok = res["verdict"] == "improved" and all(g.get("holds") is not False for g in rails.values())
+        MF.update(Path(args.patch), ["guardrails", fmt], MF.guardrails({"guardrails": list(rails.values())}, fmt)[fmt])
+        MF.update(Path(args.patch), ["statistics", fmt], MF.statistics(res))
+        MF.update(Path(args.patch), ["decision", "deployable", fmt], ok)
+        res["manifest_updated"] = {"format": fmt, "deployable": ok}
     if args.out:
         Path(args.out).write_text(json.dumps(res, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(res, indent=1, ensure_ascii=False) if args.json else E.render(res))
@@ -1246,7 +1273,7 @@ def cmd_repair(args: argparse.Namespace) -> int:
         from .surgery import edits as E
         from .surgery.playbook import check
         given = E.Patch.load(Path(args.check))
-        _check_base(lm, given)
+        _check_identity(lm, given, args)
         rep = check(lm, res, given, **kw)
     else:
         rep = repair(lm, res, **kw, playbook=not args.agent_only, steering=args.steering)
@@ -1302,17 +1329,38 @@ def _rerun_hint(rep, out: Path) -> Optional[str]:
     return shlex.join(["wsr", *argv, "--agent-allow", ",".join(sorted(want | have)), "--resume", str(out)])
 
 
-def _check_base(lm, patch, *, force: bool = False) -> None:
-    """Stop when a saved patch was made on other weights (it would write something else here); warn when the
-    weights are only close (another precision). --force applies it anyway."""
-    from .surgery.edits import base_check
+def _check_identity(lm, patch, args: argparse.Namespace, *, patched: bool = False) -> dict:
+    """Refuse a patch made for other weights, or one that cannot show which weights it was made for, unless the
+    user explicitly allows it (--allow-base-mismatch / --allow-unverified-legacy). Fail closed."""
+    from .surgery.edits import identity_check
 
-    verdict, why = base_check(lm, patch)
-    if verdict == "different" and not force:
-        raise ValueError(f"this patch was not made for this model: {why}. Applied here it would not be the edit that "
-                         "was checked (wsr patch apply --force applies it anyway)")
-    if verdict in ("different", "close"):
-        print(f"wsr: warning: {why}", file=sys.stderr)
+    r = identity_check(lm, patch, patched=patched)
+    what = "the patched model this patch produced" if patched else "the model this patch was made for"
+    if r["verdict"] == "unverified":
+        if not getattr(args, "allow_unverified_legacy", False):
+            raise ValueError(f"cannot verify that this is {what}: {r['why']}. Rerun with --allow-unverified-legacy "
+                             "to use it anyway (its checks then say nothing about these weights)")
+        print(f"wsr: WARNING: {r['why']}; using it anyway (--allow-unverified-legacy). Nothing shows that the checks "
+              "it passed apply to these weights", file=sys.stderr)
+    elif r["verdict"] == "different":
+        if not getattr(args, "allow_base_mismatch", False):
+            raise ValueError(f"this is not {what}: {r['why']}. Applied here it is not the edit that was checked "
+                             "(--allow-base-mismatch applies it anyway)")
+        print(f"wsr: WARNING: this is not {what} ({r['why']}); using it anyway (--allow-base-mismatch)",
+              file=sys.stderr)
+    if r.get("metadata_differs"):
+        print(f"wsr: note: these files differ from the model the patch was made on: "
+              f"{', '.join(r['metadata_differs'])}", file=sys.stderr)
+    return r
+
+
+def _identity_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--allow-base-mismatch", action="store_true",
+                   help="use a patch on weights that differ from the ones it was made for (its checks then do not "
+                        "apply; the output records it)")
+    p.add_argument("--allow-unverified-legacy", action="store_true",
+                   help="use a patch that records no exact identity of its model (made by an older wsr): nothing "
+                        "shows its checks apply to these weights")
 
 
 def _agent_allow(args: argparse.Namespace) -> tuple[str, ...]:
@@ -1377,6 +1425,30 @@ def _agent_provider(args: argparse.Namespace):
 
 
 def cmd_patch(args: argparse.Namespace) -> int:
+    if args.action in ("show", "check"):
+        from . import manifest as MF
+
+        d = Path(args.model_dir)
+        rec = MF.read(d)
+        if args.action == "show":
+            print(json.dumps(rec, indent=1, ensure_ascii=False) if getattr(args, "json", False) else MF.render(rec))
+            return 0
+        lm = None
+        if args.patch_dir:
+            _need_torch()
+            from .deep.lm import LM
+            lm = LM.load(args.patch_dir, dtype="float32", device="cpu")
+        r = MF.check(d, lm)
+        if getattr(args, "json", False):
+            print(json.dumps(r, indent=1, default=str))
+        else:
+            print(("OK: " if r["ok"] else "PROBLEMS: ") + str(d))
+            for p in r["problems"]:
+                print(f"  - {p}")
+            if lm is not None and r["ok"]:
+                print(f"  this is the model the fix was made for ({lm.name})")
+            print(f"  decision: {(rec.get('decision') or {}).get('status')}")
+        return 0 if r["ok"] else 1
     if args.action == "export":
         from .consent import Consent
         from .program.backends import find_llama_server
@@ -1386,7 +1458,9 @@ def cmd_patch(args: argparse.Namespace) -> int:
             raise ValueError("export needs --gguf OUT.gguf")
         info = export(Path(args.model_dir), Path(args.patch_dir) if args.patch_dir else None, Path(args.gguf),
                       quant=args.quant, consent=Consent.from_args(args), llama_cpp=args.llama_cpp,
-                      server=find_llama_server(args.llama_server))
+                      server=find_llama_server(args.llama_server),
+                      allow_base_mismatch=args.allow_base_mismatch,
+                      allow_unverified_legacy=args.allow_unverified_legacy)
         print(f"wrote {info['gguf']} ({info['quant']}, {info['bytes'] / 1e9:.2f} GB; converter llama.cpp {info['tag']})")
         if args.patch_dir:
             print("check what survives: wsr evaluate --objective <goal> --backend llama-server --gguf <unpatched.gguf> "
@@ -1404,13 +1478,18 @@ def cmd_patch(args: argparse.Namespace) -> int:
 
     lm = LM.load(args.model_dir, dtype="float32", device="cpu")
     patch = E.Patch.load(Path(args.patch_dir))
-    if args.action == "apply":                       # revert is given the patched model: its marks are the edit's
-        _check_base(lm, patch, force=args.force)
+    # apply: the model it was made for; revert: that model with this patch applied (identity.json has both).
+    ident = _check_identity(lm, patch, args, patched=args.action == "revert")
     if args.action == "revert":
         patch.deltas = [E.Delta(d.name, -d.U, d.V) for d in patch.deltas]
     # Saved in the checkpoint's own precision: the patch was checked after that rounding.
     ck = lm.checkpoint_dtype if lm.checkpoint_dtype in ("bfloat16", "float16") else None
     save_patched_model(lm, patch, Path(args.out), serve_dtype(lm, ck) if ck else None)
+    (Path(args.out) / "wsr_patch.json").write_text(json.dumps(
+        {"action": args.action, "patch": patch.label, "patch_dir": str(Path(args.patch_dir).resolve()),
+         "identity_check": ident.get("verdict"),
+         "allowed": [f for f in ("allow_base_mismatch", "allow_unverified_legacy") if getattr(args, f, False)]},
+        indent=1), encoding="utf-8")
     checked = (patch.checks or {}).get("mode")
     print(f"{args.action}: {patch.label} ({len(patch.deltas)} tensors) -> {args.out} ({ck or 'float32'})"
           + (f"; checked in {checked} mode" if checked else ""))

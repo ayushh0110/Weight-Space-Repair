@@ -142,6 +142,10 @@ from wsr.program import profile as P  # noqa: E402
 from wsr.surgery import edits as E  # noqa: E402
 
 PLEASE = ["tell me about the cat please", "write a story please", "what is the sun please"]
+# More prompts the planted neuron blanks: a held-out set needs at least 5 failing items before any fix can pass the
+# exact sign test (0.5^5 < 0.05), and 6 when a run judges two candidates (each at 0.025).
+PLEASE_MORE = ["how is the park please", "write a poem please", "tell me about the dog please",
+               "where is the big red mat please", "why is the moon small please"]
 OTHER = ["write a poem about the moon", "list numbers", "what is a tree", "how is the park"]
 
 
@@ -204,7 +208,8 @@ def _goal(tmp_path, heldout, *, rails=()):
 
 
 def test_evaluate_the_fix_is_improved_paired_and_logged(lm, tmp_path):
-    obj = _goal(tmp_path, PLEASE + OTHER[:2], rails=[{"data": "g.jsonl", "grader": "detector:any", "max_drop": 0.5}])
+    obj = _goal(tmp_path, PLEASE + PLEASE_MORE[:3] + OTHER[:2],
+                rails=[{"data": "g.jsonl", "grader": "detector:any", "max_drop": 0.5}])
     fix = E.scale_neurons(lm, [(PLANT_LAYER, PLANT_NEURON)], 0.0)
     res = EV.evaluate(lm, obj, patch=fix, patch_name="fix")
     p = res["paired"]
@@ -222,7 +227,7 @@ def test_evaluate_a_harmless_nothing_is_no_clear_change_and_a_guardrail_can_fail
     obj = _goal(tmp_path, PLEASE + OTHER[:2], rails=[{"data": "g.jsonl", "grader": "detector:any", "max_drop": -0.01}])
     noop = E.scale_neurons(lm, [(0, 1)], 1.0)                      # scale 1: changes nothing
     res = EV.evaluate(lm, obj, patch=noop, log=False)
-    assert res["paired"]["diff"] == 0 and res["verdict"] == "no clear change"
+    assert res["paired"]["diff"] == 0 and res["verdict"] == "inconclusive" and "no item changed" in res["verdict_reason"]
     assert not res["guardrails"][0]["holds"]                        # a negative max_drop cannot hold
     assert "heldout_looks" not in res
 
@@ -286,8 +291,9 @@ TOY_SUITE = [("story", "write a story about the dog", "en", "general"), ("sun", 
 def _program_goal(tmp_path):
     prac = ["tell me about the cat please", "write a story please", "what is the moon please",
             "list numbers please", "write a poem about the moon", "what is a tree", "how is the park"]
-    held = ["tell me about the dog please", "what is the sun please", "write a poem please", "list numbers",
-            "what is the sun"]
+    held = ["tell me about the dog please", "what is the sun please", "write a poem please", "how is the park please",
+            "where is the big red mat please", "why is the moon small please", "who ran in the park please",
+            "list numbers", "what is the sun"]
     _write_jsonl(tmp_path / "practice.jsonl", [{"id": f"p{i}", "prompt": c} for i, c in enumerate(prac)])
     (tmp_path / "held").mkdir()
     _write_jsonl(tmp_path / "held" / "h.jsonl", [{"id": f"h{i}", "prompt": c} for i, c in enumerate(held)])
@@ -433,7 +439,7 @@ def test_program_agent_settings_choice_is_judged_on_heldout(lm, tmp_path, monkey
     ag = rec["stages"]["agent"]
     assert ag["stopped"] == "final choice (settings)" and ag["settings_evals"]["s1"]["n"] == 7
     js = rec["stages"]["settings"]
-    assert js["settings"] == {"repetition_penalty": 1.2} and js["n"] == 5 and js["verdict"]
+    assert js["settings"] == {"repetition_penalty": 1.2} and js["n"] == 9 and js["verdict"]
     assert js["guardrails"][0]["prompts"] == len(TOY_SUITE)
     assert rec["outcome"] in ("settings recommended", "no candidate") and "patch" not in rec
     assert not (tmp_path / "run" / "patch").exists()
@@ -501,7 +507,7 @@ def test_a_rejected_playbook_candidate_hands_over_to_the_agent(lm, tmp_path, mon
         ev = real(*a, **k)
         calls.append(k.get("patch_name"))
         if len(calls) == 1:
-            ev = {**ev, "verdict": "no clear change"}
+            ev = {**ev, "verdict": "inconclusive"}
         return ev
     monkeypatch.setattr(EV, "evaluate", first_says_no)
     obj = _program_goal(tmp_path)
@@ -512,7 +518,7 @@ def test_a_rejected_playbook_candidate_hands_over_to_the_agent(lm, tmp_path, mon
     ]
     rec = run_program(lm, obj, out=tmp_path / "run", provider=ScriptedProvider(script), playbook=True, mode="fast",
                       agent_budget=Budget(), agent_limits=AgentLimits(max_turns=10), log=None)
-    assert len(calls) == 2 and rec["stages"]["judge_playbook"]["verdict"] == "no clear change"
+    assert len(calls) == 2 and rec["stages"]["judge_playbook"]["verdict"] == "inconclusive"
     assert rec["stages"]["agent"]["stopped"] == "final choice" and rec["outcome"] == "shipped"
     assert (tmp_path / "run" / "candidate_playbook" / "patch.json").exists()
     tr = json.loads((tmp_path / "run" / "agent_transcript.json").read_text(encoding="utf-8"))
@@ -647,8 +653,9 @@ def test_cache_command_shows_and_clears_only_what_is_named(tmp_path, monkeypatch
     m1, m2 = "m1-" + "a" * 20, "m2-" + "b" * 20              # as cache.model_key names them
     gg = "x-" + "c" * 12 + ".Q8_0.gguf"
     mine = ("models/my-own-model/weights.bin", "datasets/mine.jsonl", "gguf/mine.gguf")   # not wsr's: must survive
+    ident = "identity/m-" + "d" * 20 + ".json"
     for rel in (f"models/{m1}/regression-baseline-1.json", f"models/{m2}/profile-replies-2.json",
-                f"gguf/{gg}", "datasets/xstest.jsonl", *mine):
+                f"gguf/{gg}", "datasets/xstest.jsonl", ident, "langprobe/old.pt", "confirmations.json", *mine):
         f = tmp_path / "c" / rel
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text("x" * 100)
@@ -665,18 +672,24 @@ def test_cache_command_shows_and_clears_only_what_is_named(tmp_path, monkeypatch
     # only what wsr wrote is deleted: a cache folder shared with the user's own models and data loses nothing
     assert all((tmp_path / "c" / rel).exists() for rel in mine)
     assert (tmp_path / "c" / "consent.json").exists()                # remembered answers are not cache
+    assert not (tmp_path / "c" / ident).exists() and not (tmp_path / "c" / "langprobe").exists()
+    assert (tmp_path / "c" / "confirmations.json").exists()          # the record of used confirmation sets is kept
     with pytest.raises(ValueError):
         C.remove([tmp_path / "elsewhere.txt"])
 
 
 def test_judge_says_when_a_set_is_too_small_to_show_an_improvement():
-    """2 failing items of 30: even a perfect fix reaches z ~1.4 < 2, so 'no clear change' must say the set is
-    the limit (the over-refusal run: 93.3% -> 96.7% could never ship)."""
+    """2 failing items of 30: even a perfect fix has sign-test p 0.25, so the set is the limit (the first over-refusal
+    goal: 93.3% -> 96.7% could never ship). 5 failing items are the least that can pass at 0.05, 6 at 0.025."""
     pw = EV.power([0.0, 0.0] + [1.0] * 28)
-    assert pw["failing"] == 2 and not pw["can_show_improvement"] and pw["best_z"] < 2 and "add items" in pw["note"]
-    assert EV.power([0.0] * 10 + [1.0] * 20)["can_show_improvement"]
+    assert pw["failing"] == 2 and not pw["can_show_improvement"] and pw["best_p"] == 0.25 and "add items" in pw["note"]
+    assert EV.power([0.0] * 5 + [1.0] * 15)["can_show_improvement"]
+    assert not EV.power([0.0] * 5 + [1.0] * 15, m=2)["can_show_improvement"]       # two candidates: 0.025 each
+    assert EV.power([0.0] * 6 + [1.0] * 15, m=2)["can_show_improvement"]
     assert EV.power([0.0] * 30)["can_show_improvement"]                  # all failing: a fix would be clear
     assert not EV.power([1.0] * 30)["can_show_improvement"]
+    small = EV.power([0.0] * 6 + [1.0] * 194)                            # 6 of 200: significant, but at most +3 points
+    assert not small["can_show_improvement"] and "minimum" in small["note"]
 
 
 def test_program_judges_the_playbooks_steering_on_heldout(lm, tmp_path, monkeypatch):
@@ -729,12 +742,15 @@ def test_a_verdict_needs_five_scored_items_and_reports_the_exact_sign_test():
     """One or two fixed items gave "improved" (their standard error is 0): too few items now give no verdict."""
     for n in (1, 2, 4):
         p = EV._paired([0.0] * n, [1.0] * n)
-        assert EV._verdict(p, True).startswith("too few items"), n
+        d = EV.decide(p, True)
+        assert d["verdict"] == "inconclusive" and d["reason"].startswith("too few items"), n
         assert not EV.power([0.0] * n)["can_show_improvement"] and "at least 5" in EV.power([0.0] * n)["note"]
     p = EV._paired([0.0] * 5, [1.0] * 5)
     assert EV._verdict(p, True) == "improved" and p["sign_p"] == round(1 / 32, 4)
     q = EV._paired([0.0] * 4 + [1.0] * 33, [1.0] * 37)        # the over-refusal run: 4 wins, no loss, z 2.09
-    assert q["wins"] == 4 and q["sign_p"] == 0.0625 and EV._verdict(q, True) == "improved"
+    d = EV.decide(q, True)
+    assert q["wins"] == 4 and q["sign_p"] == 0.0625 and q["z"] > 2
+    assert d["verdict"] == "inconclusive" and "not significant" in d["reason"]   # z > 2 alone no longer ships it
     assert EV._paired([1.0] * 6, [1.0] * 6)["sign_p"] is None  # nothing changed: no test to report
     assert EV.sign_p(3, 1) == round(5 / 16, 4)
 
@@ -823,3 +839,35 @@ def test_probe_caches_use_the_model_cache_not_a_folder_named_after_wsr_cache(lm,
     meta, tensors = probe.to_cache()
     back = LP.LangProbe.from_cache(json.loads(json.dumps(meta)), tensors)       # plain JSON + tensors, no pickle
     assert back.langs == probe.langs and torch.equal(back.means, probe.means) and back.counts == probe.counts
+
+
+# -- judge policy (exact test, minimum gain, correction, inconclusive) ----------------------------------------
+
+def test_the_exact_test_decides_and_inconclusive_is_not_worse():
+    win = EV._paired([0.0] * 8 + [1.0] * 12, [1.0] * 20)               # 8 wins: p 0.0039, gain 40 points
+    assert EV.decide(win, True)["verdict"] == "improved"
+    assert EV.decide(win, False)["verdict"] == "improved on the task, but a guardrail failed"
+    assert EV.decide(win, True, m=2)["p_adjusted"] == round(2 * 0.5 ** 8, 6)
+    tiny = EV._paired([0.0] * 30 + [1.0] * 970, [1.0] * 1000)          # significant, but only +3 points
+    t = EV.decide(tiny, True)
+    assert t["verdict"] == "inconclusive" and "below the minimum" in t["reason"]
+    assert EV.decide(tiny, True, min_gain=0.01)["verdict"] == "improved"
+    lose = EV._paired([1.0] * 8 + [0.0] * 12, [0.0] * 20)              # 8 losses, no win
+    assert EV.decide(lose, True)["verdict"] == "worse"
+    mixed = EV._paired([0.0, 0.0, 0.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 0.0, 0.0, 0.0])   # 3 better, 2 worse
+    m = EV.decide(mixed, True)
+    assert m["verdict"] == "inconclusive" and "not significant" in m["reason"]
+    five = EV._paired([0.0] * 5 + [1.0] * 10, [1.0] * 15)
+    assert EV.decide(five, True)["verdict"] == "improved"
+    assert EV.decide(five, True, m=2)["verdict"] == "inconclusive"     # p 0.031 x 2 candidates = 0.0625
+
+
+def test_goal_judge_section_sets_alpha_and_min_gain():
+    base = {"name": "g", "practice": "p.jsonl", "heldout": "h.jsonl"}
+    obj = O.from_dict({**base, "judge": {"min_gain": 0.1, "alpha": 0.01}})
+    assert EV.judge_settings(obj) == {"alpha": 0.01, "min_gain": 0.1}
+    assert EV.judge_settings(O.from_dict(base)) == {"alpha": EV.ALPHA, "min_gain": EV.MIN_GAIN}
+    with pytest.raises(ValueError, match="judge"):
+        O.from_dict({**base, "judge": {"z": 2}})
+    with pytest.raises(ValueError, match="judge"):
+        O.from_dict({**base, "judge": {"alpha": 0.5}})

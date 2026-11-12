@@ -33,6 +33,7 @@ class Judge:
     patched: Any = None
     notes: list[str] = field(default_factory=list)
     files: dict[str, str] = field(default_factory=dict)
+    server_version: Optional[str] = None
 
     def close(self) -> None:
         for s in (self.source, self.patched):
@@ -146,10 +147,13 @@ def choose(kind: str, *, lm, model_dir: Optional[Path], patch, out: Path, consen
             except Exception:
                 s1.stop()
                 raise
+            from ..surgery.export import server_tag
+
             return Judge("llama-server", ServerBackend(s1.url, parallel=parallel, label=f"{orig.name}", owned=s1),
                          ServerBackend(s2.url, parallel=parallel, label=f"{cand.name}", owned=s2),
-                         notes=[f"judged on {quant} GGUFs via llama-server; regression guardrail on PyTorch"],
-                         files={"original": str(orig), "candidate": str(cand)})
+                         notes=[f"judged on {quant} GGUFs via llama-server (both on the same build and settings); "
+                                "the suite's drift checks on PyTorch, its reply checks and the canary on the GGUFs"],
+                         files={"original": str(orig), "candidate": str(cand)}, server_version=server_tag(server))
         except NeedsConsent as e:
             why = f"llama-server judge not possible: {e}"
         except Exception as e:                          # noqa: BLE001 - the fast judge is optional: never sink the run

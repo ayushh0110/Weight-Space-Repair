@@ -14,13 +14,14 @@ generated from the CLI itself.
 5. [Repair: the smallest fix that passes the checks](#repair-the-smallest-fix-that-passes-the-checks)
 6. [The surgery agent](#the-surgery-agent)
 7. [Weight-space programming: goals, profiles and the held-out judge](#weight-space-programming-goals-profiles-and-the-held-out-judge)
-8. [Backends: PyTorch and llama-server](#backends-pytorch-and-llama-server)
-9. [Safety: what wsr will not do without you](#safety-what-wsr-will-not-do-without-you)
-10. [Caching](#caching)
-11. [Files wsr writes](#files-wsr-writes)
-12. [Environment variables](#environment-variables)
-13. [Exit codes](#exit-codes)
-14. [Command reference](#command-reference)
+8. [What a fix is made for: identity, manifest, evidence](#what-a-fix-is-made-for-identity-manifest-evidence)
+9. [Backends: PyTorch and llama-server](#backends-pytorch-and-llama-server)
+10. [Safety: what wsr will not do without you](#safety-what-wsr-will-not-do-without-you)
+11. [Caching](#caching)
+12. [Files wsr writes](#files-wsr-writes)
+13. [Environment variables](#environment-variables)
+14. [Exit codes](#exit-codes)
+15. [Command reference](#command-reference)
 
 ## Which command for which question
 
@@ -36,6 +37,7 @@ generated from the CLI itself.
 | Fix it from one prompt, end to end, judged on held-out data | `wsr fix` | `deep` extra |
 | Improve a measurable goal over a dataset | `wsr objective`, `wsr profile`, `wsr evaluate`, `wsr program` | `deep` extra, a goal file |
 | Ship a fix to the file people serve | `wsr patch apply`, `wsr patch export` | a patch from `repair` or `program` |
+| What is this fix, how was it judged, does it match my model? | `wsr patch show`, `wsr patch check` | a fix directory with its `MANIFEST.json` |
 | Public datasets, remembered answers, what wsr keeps | `wsr data`, `wsr consent`, `wsr cache` | nothing |
 
 Triage needs no GPU and no dependencies. Everything that touches weights needs the `deep` extra; deep
@@ -134,6 +136,10 @@ weakest first; a weight edit is first checked against the intervention it came f
 - **Regression suite**: 17 prompts (general tasks, six languages, three harmful requests) plus your `--keep`
   prompts: no new failures, drift at most 0.15 nats per token on the original replies (`--max-drift`), top-token
   agreement at least 85% (`--min-agreement`), and every harmful request refused before still refused.
+- **Semantic canary**: 32 deterministic items in six groups (arithmetic, units, sequences, comparisons, facts,
+  instruction formats), answers computed or hand-checked, graded per item, greedy at 48 tokens. Only items the
+  original model gets right count, and a fix may lose at most one of them. The suite catches broken text; the
+  canary catches a fix that still writes fluent text but gets simple answers wrong.
 - **Serving precision**: the patch again after rounding to bf16 or fp16 (`--serve-dtype`).
 
 `--deep` adds local edits (only the layers or MLP neurons that write the failure, strengths up to 6), a
@@ -151,9 +157,10 @@ settings and an `APPLY.md` with the transformers hook.
 the closest attempt and the practical next step), or `not_indicated` (the weights are not where to fix it).
 
 **Shipping a patch.** `wsr patch apply MODEL_DIR PATCH_DIR --out DIR` writes the patched model in the
-checkpoint's precision; `revert` undoes it; `export --gguf FILE --quant Q4_K_M` writes a GGUF through llama.cpp's
-converter (asks before fetching it). A patch records marks of the tensors it was made on, and `apply`,
-`evaluate --patch` and `repair --check` refuse a patch made for other weights (`--force` overrides).
+checkpoint's precision; `revert` undoes it (and checks that the edited tensors are back to their exact original
+hashes); `export --gguf FILE --quant Q4_K_M` writes a GGUF through llama.cpp's converter (asks before fetching
+it) and records the GGUF's SHA-256. A patch refuses any weights but the exact ones it was made on (see
+[identity](#what-a-fix-is-made-for-identity-manifest-evidence)).
 
 ## The surgery agent
 
@@ -203,8 +210,11 @@ For a goal measured over a dataset ("stop over-refusing safe prompts", "fewer bl
   "protocol": {"template_kwargs": {}, "sampling": {}, "max_new_tokens": 256, "system": null},
   "practice": "practice/items.jsonl",
   "heldout": "heldout/items.jsonl",
+  "confirmation": "confirmation/items.jsonl",
   "grader": "detector:refusal",
-  "guardrails": [{"suite": "wsr_regression"}, {"data": "general.jsonl", "grader": "detector:any", "max_drop": 0.02}],
+  "judge": {"alpha": 0.05, "min_gain": 0.05},
+  "guardrails": [{"suite": "wsr_regression"}, {"suite": "semantic_regression_canary", "max_lost": 1},
+                 {"data": "general.jsonl", "grader": "detector:any", "max_drop": 0.02}],
   "budget": {"practice_evals": 10, "verifications": 6, "usd": 5}
 }
 ```
@@ -217,16 +227,22 @@ For a goal measured over a dataset ("stop over-refusing safe prompts", "fewer bl
 - Graders: `exact`, `contains`, `regex:<pattern>`, `math`, `detector:<group>` or `detector:any` (no detector of
   that group fired). Groups: `blank`, `loop`, `garbage`, `template_leak`, `language`, `refusal`, `vision`,
   `endpoint`, `structure`.
-- Guardrails: `wsr_regression` (the 17-prompt suite; `max_drift`, `min_agreement`, `allow_safety_loss`) and data
-  sets that may drop by at most `max_drop`.
+- Three sets: `practice` (the tools and the agent may use it), `heldout` (also accepted as `validation`: judges
+  every candidate, every look logged) and `confirmation` (optional: evaluated once, on one frozen candidate).
+- `judge`: `alpha` (0 to 0.1, default 0.05) for the exact sign test and `min_gain` (a share of the metric,
+  default 0.05 = 5 points).
+- Guardrails: `wsr_regression` (the 17-prompt suite; `max_drift`, `min_agreement`, `allow_safety_loss`),
+  `semantic_regression_canary` (`max_lost`, default 1) and data sets that may drop by at most `max_drop`.
 - `budget`: the agent's limits; the `--practice-evals`, `--agent-verifications` and `--agent-budget-usd` flags
   override them.
 
 **Building a goal.** `wsr objective init` writes a template; `check` reports rows, gradable rows, overlap between
-practice and held-out, and stray control characters; `split` shuffles a file into the two sets.
-`wsr objective from-failure` goes from one failing prompt (or a profile group) to a goal: it confirms the
-failure, finds items that fail the same way (in a local dataset, a public one with `--dataset auto`, or
-rewrites of your prompt) and splits them, stratified.
+any two sets, stray control characters, and whether the confirmation set was already used; `split` shuffles a
+file into practice and held-out. `wsr objective from-failure` goes from one failing prompt (or a profile group)
+to a goal: it confirms the failure, finds items that fail the same way (in a local dataset, a public one with
+`--dataset auto`, or rewrites of your prompt) and splits them, stratified, three ways. `--confirm-share`
+(default 0.25) is the share of the failing items kept for confirmation; the split never shrinks validation below
+6 failing items, and gives no confirmation set when fewer than 5 failing items would be left for it.
 
 **Profile.** `wsr profile` runs triage over a dataset and groups the failures (`EMPTY`, `LOOP`,
 `TRUNCATED_LOOP`, `TRUNCATED_WORKING`, `GARBAGE`, `TEMPLATE_LEAK`, `REFUSAL`, `COMPLIED`, `LANGUAGE`,
@@ -246,12 +262,70 @@ the playbook fails or its candidate is rejected (the agent hears only that it wa
 | `settings recommended` | serving settings, with the `generation_config.json` keys and llama-server flags in `PROGRAM.md` |
 | `not shipped`, `no candidate`, `nothing to edit` | the numbers and the reason in `PROGRAM.md` |
 
-**The judge** (`wsr evaluate`, and inside `program`): the original and the candidate answer the same held-out
-items with the same seeds, and the per-item difference is tested. `improved` needs the gain above 2 standard
-errors, at least 5 scored items and every guardrail holding. Other verdicts: `improved on the task, but a
-guardrail failed`, `worse`, `no clear change`, `too few items to judge`. The report adds the exact one-sided sign
-test, and says when a set cannot show an improvement at all (too few failing items). Every look at the held-out
-set is appended to `<goal>.heldout_log.jsonl`, because a choice made after many looks overstates the gain.
+**The judge** (`wsr evaluate`, and inside `program`): the original and the candidate answer the same validation
+items with the same seeds, and the items that changed are counted. `improved` needs:
+
+- the exact one-sided sign test (wins against losses, ties ignored) below `alpha` divided by the number of
+  candidate slots the run has (1, or 2 when an agent may judge a candidate after the playbook; with stopping at
+  the first acceptance this equals Holm's correction);
+- a gain of at least `min_gain`;
+- at least 5 scored items and every guardrail holding.
+
+Other verdicts: `improved on the task, but a guardrail failed`, `worse` (significantly, the other way),
+`inconclusive` with the reason (too few items changed, a gain below the minimum, a set that cannot reach the
+bar), and `nothing to compare`. z is printed but decides nothing. Before judging, wsr computes the best result
+the set allows (with k items failing, the smallest p is 0.5^k), so a set that cannot prove a fix says so up
+front. Every look at the validation set is appended to `<goal>.heldout_log.jsonl`, because a choice made after
+many looks overstates the gain.
+
+**Confirmation.** When the goal has a `confirmation` set, the one candidate that passed validation is frozen
+(its hash is recorded) and evaluated on it once, with the same rules and guardrails. Only then does it ship; a
+candidate that passes validation but not confirmation is not shipped. The set is recorded as used by the hash of
+its content in `confirmations.json` under the cache base (and a `<file>.used.json` note next to it), so a later
+run, the same file renamed, or a second candidate cannot use it again. A set that could not reach the bar with
+its failing items is reported as "inconclusive: insufficient confirmation sample size" before any candidate runs,
+and is not used up.
+
+**Guardrails on the served file.** With the llama-server judge, the canary and the suite's reply checks (new
+failures, refusals lost) also run on the patched GGUF, compared with the unpatched GGUF of the same quantisation
+built by the same llama.cpp. Drift and top-token agreement need log-probabilities of the full-precision model, so
+they are marked "not supported" on the GGUF and run on PyTorch. The manifest records each check by format, and
+whether the fix is deployable in that format.
+
+## What a fix is made for: identity, manifest, evidence
+
+**Identity.** Every patch has an `identity.json`: the SHA-256 of every tensor of the model it was made on, in the
+precision of its files (float32, bfloat16 or float16), with the architecture, the hashes of the tokenizer and
+config files, and the Hub revision when known; and the hashes of the edited tensors after the edit. Hashes are
+computed from the safetensors files and cached (`identity` in `wsr cache`). `wsr patch apply`, `patch export`,
+`evaluate --patch` and `repair --check` compare the model in front of them and stop on any difference (fail
+closed): another fine-tune of the same shape, a different revision, a model loaded in another precision is
+compared in its file's precision. `--allow-base-mismatch` applies it anyway, with a warning; a patch from an older
+wsr without exact hashes needs `--allow-unverified-legacy`. `revert` checks that the result matches the original
+hashes again.
+
+**Manifest.** Every judged fix (`<out>/patch`, `<out>/steering` or `<out>/settings`) carries a `MANIFEST.json`:
+
+| Part | What it records |
+|---|---|
+| `model` | the identity above |
+| `artifact` | one SHA-256 over the fix's files |
+| `candidate` | a hash of the base model, the fix and its evaluation: the frozen candidate that confirmation judged |
+| `evaluation` | the goal and its version, the hash of each data set, the grader, detector and canary versions, the protocol, the judge settings and the number of candidate slots |
+| `statistics` | validation and confirmation: wins, losses, ties, the exact p, the gain |
+| `guardrails` | each guardrail by format (PyTorch, GGUF and its quantisation, llama-server build) |
+| `evidence` | below |
+| `decision` | the status, whether it shipped, why, and where it is deployable |
+
+`wsr patch show FIX` prints it (`--json` for JSON); `wsr patch check FIX [MODEL_DIR]` checks that the files still
+match their hashes and, with a model, that the model is the one the fix was made for. `wsr patch apply` also
+writes `wsr_patch.json` into the patched model, so the patched copy records where it came from.
+
+**Evidence.** Findings of the diagnosis and the checks of a repair are filed under five headings, so a report
+says what kind of evidence it has rather than one score: `observation` (the failure was seen), `intervention`
+(changing the found part changes the failure), `controls` (a random edit or direction of the same size does
+not), `generalization` (fresh variants and held-out items) and `replication` (another run, seed or set). A
+validation pass is generalisation, never replication; a confirmation set is.
 
 ## Backends: PyTorch and llama-server
 
@@ -283,9 +357,11 @@ Per model, keyed by its files, a checksum of the weights as loaded, the precisio
 and detector version: the regression baseline, the unedited model's replies on a goal's sets (with the batch
 plan, so edited runs stay paired), the deep diagnosis (loaded only with the classes recorded for it), and the
 calibrated probes. An applied edit or active steering changes the key, so nothing cached is served for it.
-Also kept: GGUF conversions of original models, converted public datasets, and the llama.cpp converter.
-`wsr cache show` lists them; `wsr cache clear models|gguf|datasets|converter|all` (or `--model KEY`) deletes
-only what wsr wrote. `WSR_CACHE=off` turns caching off.
+Also kept: GGUF conversions of original models, converted public datasets, the llama.cpp converter, and the
+exact tensor hashes of model checkpoints. `wsr cache show` lists them; `wsr cache clear
+models|gguf|datasets|converter|identity|legacy|all` (or `--model KEY`) deletes only what wsr wrote (`legacy` is
+probe caches of older versions). Clearing never deletes `confirmations.json` or remembered answers: a used
+confirmation set stays used. `WSR_CACHE=off` turns caching off.
 
 ## Files wsr writes
 
@@ -295,9 +371,12 @@ only what wsr wrote. `WSR_CACHE=off` turns caching off.
 | `deep --out DIR` | `report.json`, `contrast.json`, `traces.json`, `direction.pt`, `localisation.json`, `weights.json` |
 | `repair --out DIR` | `REPAIR.md`, `repair.json`, `deep/`, `patch/` (`patch.json`, `patch.safetensors`), `steering/`, `model/` (`--save-model`) |
 | with `--agent` | `agent_transcript.json`, `agent_state/` (for `--resume`), `agent_proposals/`, `capability_requests.json` |
-| `program --out DIR` | `PROGRAM.md`, `program.json`, `deep/`, `patch/` or `candidate/`, `candidate_playbook/`, `steering/`, `served/` (GGUFs judged on llama-server), the agent's files |
+| `program --out DIR` | `PROGRAM.md`, `program.json`, `deep/`, `patch/` or `candidate/`, `candidate_playbook/`, `steering/`, `settings/`, `served/` (GGUFs judged on llama-server), the agent's files |
+| every judged fix | `MANIFEST.json` (in `patch/`, `steering/` or `settings/`); a patch also `identity.json` |
+| `patch apply --out DIR` | the patched model, with `wsr_patch.json` |
 | `evaluate`, `program` | `<goal>.heldout_log.jsonl` next to the goal file |
-| `objective from-failure` | `goal.json`, `practice/`, `heldout/` |
+| confirmation | `confirmations.json` under the cache base, and `<file>.used.json` next to the confirmation file |
+| `objective from-failure` | `goal.json`, `practice/`, `heldout/`, `confirmation/` |
 
 ## Environment variables
 
@@ -512,6 +591,8 @@ Surgery: diagnose (as wsr deep), then find and verify the smallest weight edit t
 | `--confirm` |  | --deep: a further prompt for the fresh confirmation (failing or working, judged on the unpatched model) |
 | `--serve-dtype` `auto\|bfloat16\|float16\|none` | `auto` | check the patch again after rounding to the serving precision (auto: the checkpoint's 16-bit type, else bfloat16; none: skip) |
 | `--check` `PATCH_DIR` |  | do not search: check this patch (e.g. one a fast repair found) with the mode's checks |
+| `--allow-base-mismatch` |  | use a patch on weights that differ from the ones it was made for (its checks then do not apply; the output records it) |
+| `--allow-unverified-legacy` |  | use a patch that records no exact identity of its model (made by an older wsr): nothing shows its checks apply to these weights |
 | `--agent` |  | when the rule-based playbook cannot fix it, hand the diagnosis and every failed trial to a frontier model with tools to inspect and edit the weights; only a patch that passes the same checks is accepted |
 | `--agent-provider` `anthropic\|openai` | `anthropic` | anthropic: Claude (ANTHROPIC_API_KEY, pip install anthropic); openai: any model behind the OpenAI Chat Completions API - OpenAI itself, or with --agent-base-url any compatible server: OpenRouter, Together, Groq, DeepSeek, Mistral, Gemini's OpenAI endpoint, a local vLLM / Ollama / llama-server (pip install openai) |
 | `--agent-model` |  | the agent's model id (anthropic default: claude-opus-5-5; openai: required) |
@@ -534,15 +615,16 @@ Surgery: diagnose (as wsr deep), then find and verify the smallest weight edit t
 
 ### `wsr patch`
 
-Apply or revert a surgery patch, or export the patched model as a GGUF.
+Apply, revert, export, show or check a fix (a patch, steering or settings directory with its MANIFEST.json).
 
 | Option | Default | What it does |
 |---|---|---|
 | `action` |  | apply, revert, or export (a GGUF) |
-| `model_dir` |  | Hugging Face model directory (full precision) |
-| `patch_dir` (optional) |  | the patch directory written by wsr repair / program (<out>/patch); export without it writes the unpatched model (the comparison file) |
+| `model_dir` |  | apply / revert / export: the model directory; show / check: the fix's directory (<out>/patch, <out>/steering or <out>/settings) |
+| `patch_dir` (optional) |  | apply / revert / export: the patch directory written by wsr repair / program (<out>/patch); export without it writes the unpatched model (the comparison file); check: optionally the model directory to check the fix against |
 | `--out` |  | apply / revert: where to write the patched model |
-| `--force` |  | apply: also when the patch records other weights than this model's |
+| `--allow-base-mismatch` |  | use a patch on weights that differ from the ones it was made for (its checks then do not apply; the output records it) |
+| `--allow-unverified-legacy` |  | use a patch that records no exact identity of its model (made by an older wsr): nothing shows its checks apply to these weights |
 | `--gguf` |  | export: the GGUF file to write |
 | `--quant` | `Q8_0` | export: F16, BF16, Q8_0 (converter) or any llama-quantize type such as Q4_K_M (default Q8_0) |
 | `--llama-cpp` |  | export: a llama.cpp checkout with convert_hf_to_gguf.py (else WSR_LLAMA_CPP, then one wsr fetched before, then ask to download it) |
@@ -551,6 +633,7 @@ Apply or revert a surgery patch, or export the patched model as a GGUF.
 | `--no` |  | answer no to every question (fall back where possible) |
 | `--allow` `KINDS` |  | answer yes for these kinds: download, llama-server, convert, sandbox, network |
 | `--deny` `KINDS` |  | answer no for these kinds |
+| `--json` |  | show / check: print JSON |
 
 ### `wsr quant`
 
@@ -640,6 +723,7 @@ Turn a failure (a prompt, or a profile group) into a goal file: confirm it, find
 | `--grader` |  | default: the failure's detector (detector:<group>) |
 | `--samples` | `200` | dataset rows to run (default 200) |
 | `--heldout-share` | `0.5` | share of the items that goes to the held-out set |
+| `--confirm-share` | `0.25` | share of the failing items kept as a confirmation set (used once, for one frozen candidate); none when too few items fail: 0 for none |
 | `--max-new` | `256` | tokens generated per reply |
 | `--no-thinking` |  | render the chat template with enable_thinking=false |
 | `--expect-lang` |  | language the reply must be in (ISO code) |
@@ -747,6 +831,7 @@ One command, one model load: from a failing prompt to a judged patch (objective 
 | `--no-thinking` |  | render the chat template with enable_thinking=false |
 | `--samples` | `200` | dataset rows to run |
 | `--heldout-share` | `0.5` | share of the items that goes to the held-out set |
+| `--confirm-share` | `0.25` | share of the failing items kept as a confirmation set (used once, for one frozen candidate); none when too few items fail: 0 for none |
 | `--seed` | `0` | random seed |
 | `--out` |  | goal/ (the objective) and run/ (PROGRAM.md, patch) go here |
 | `--profile-limit` | `40` | practice items to profile |
@@ -868,6 +953,8 @@ Score a model, or a patch against the original, on a goal file's held-out set an
 | `--allow` `KINDS` |  | answer yes for these kinds: download, llama-server, convert, sandbox, network |
 | `--deny` `KINDS` |  | answer no for these kinds |
 | `--patched-gguf` |  | llama-server backend: the patched model's GGUF (wsr patch export --gguf); without it a patch is scored on PyTorch |
+| `--allow-base-mismatch` |  | use a patch on weights that differ from the ones it was made for (its checks then do not apply; the output records it) |
+| `--allow-unverified-legacy` |  | use a patch that records no exact identity of its model (made by an older wsr): nothing shows its checks apply to these weights |
 | `--json` |  | machine-readable report |
 | `-v`, `--verbose` |  | show passing checks and sources |
 

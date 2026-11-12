@@ -7,8 +7,10 @@ outside the weights (file, config, request, sampling, runtime) get an exact fix.
 that survives all of those is diagnosed inside the network at full precision, and wsr looks
 for the smallest fix that passes its checks: a weight patch, an activation steering, or
 serving settings. A rule-based playbook goes first; a frontier model with weight-editing
-tools can take over when it fails. Nothing ships without a paired held-out judge and a
-regression suite, and refusals of harmful requests are kept by default.
+tools can take over when it fails. Nothing ships without a paired judge on data the fix never saw (an exact
+sign test and a minimum gain), a regression suite and a semantic canary; refusals of harmful requests are kept
+by default. Every judged fix carries a `MANIFEST.json` that says what it was made for, how it was judged and
+why it shipped or not, and a patch refuses any weights other than the exact ones it was made on.
 
 The triage layer combines the techniques of llm-output-guard, llm-stopcheck, LLMDoctor,
 ModelVet and Raschka's repetition checklist into one layered pipeline, with a verdict engine
@@ -21,22 +23,24 @@ how each part was built.
 
 ## Results so far
 
-Held-out results from `wsr program`: the original and the fix answer the same held-out items with the same
-seeds, and a fix ships only when the paired gain is above 2 standard errors and every guardrail holds.
+Results from `wsr program` under the current rules: the original and the fix answer the same validation items
+with the same seeds; a fix is accepted only when the exact one-sided sign test is below 0.05 (divided by the
+number of candidates the run may judge), the gain is at least 5 points and every guardrail holds; then one
+evaluation on a confirmation set, used once, decides whether it ships.
 
-| Goal | Model | Fix | Held-out | Verdict |
-|---|---|---|---|---|
-| Blank replies (a neuron planted in real weights) | Qwen2.5-0.5B | zero the neuron wsr found blind | 30% → 85% (z 4.82) | shipped |
-| The same, weights not allowed to change | Qwen2.5-0.5B | clamp steering at the planted layer | 30% → 85% (z 4.82) | steering recommended |
-| Over-refusal of safe prompts (XSTest) | Llama-3.2-1B | three gated neurons, built by the agent | 81.1% → 91.9% (z 2.09), no refusal of a harmful request lost | shipped |
-| Under-refusal of harmful prompts (XSTest) | Qwen2.5-0.5B | a learned low-rank edit, by the agent | 62.5% → 87.5% (z 3.21), safe prompts still answered | shipped |
-| The blank-reply patch on the served GGUF | Llama-3.2-1B | exported to Q8_0 and Q4_K_M | blank replies 53% → 0% on both | survives quantisation |
-| Reasoning loops (MATH-500) | Llama-3.2-1B | none passed (edits, steering, penalties) | — | no candidate: a capability limit |
+| Goal | Model | Fix | Validation | Confirmation | Decision |
+|---|---|---|---|---|---|
+| Blank replies (a bug planted in real weights) | Qwen2.5-0.5B | sparse projection on the neurons wsr found blind | 35.7% → 100%, 18 better / 0 worse, p 0.000004 | 15 / 0, p 0.00003 | **shipped, confirmed** |
+| The same, weights not allowed to change | Qwen2.5-0.5B | clamp steering after layer 14 | 6 / 0, p 0.016 | 5 / 0, p 0.031 | **steering recommended, confirmed** |
+| The same bug, a smaller goal | Qwen2.5-0.5B | zero the planted neuron | 6 / 0, p 0.016 | 4 / 0, p 0.0625 | inconclusive: confirmation one item short |
+| Over-refusal of safe prompts (XSTest) | Llama-3.2-1B | a learned edit by the agent (Opus 5.5) | 2 / 0, every refusal kept | not used | inconclusive: too few fixed |
+| Under-refusal of harmful prompts (XSTest) | Qwen2.5-0.5B | a learned edit by the agent (Opus 5.5) | 88% → 96%, 6 / 0 | not used | rejected: the canary lost 3 answers |
+| The blank-reply patch on the served GGUF | Qwen2.5-0.5B | exported to Q8_0, judged on llama-server | 6 / 0; canary and suite hold on the GGUF | (already used) | the patch survives quantisation |
 
-Every unsafe or overfitted candidate was stopped: an over-refusal fix that dropped refusals of harmful requests,
-an under-refusal steering that fitted the practice set (93.8% there, 71.9% held out), a learned edit that made
-safe prompts refused. Triage and deep diagnosis are proven on 15 failure types against a known answer. All of
-it, with the setups and the failures, is in [docs/RESULTS.md](docs/RESULTS.md).
+Earlier runs under a looser rule (z > 2) also shipped an over-refusal and an under-refusal fix; the first
+(4 better, 0 worse) would not pass the exact test and neither reproduced, so they are not claimed. Every unsafe
+or overfitted candidate was stopped. Triage and deep diagnosis are proven on 15 failure types against a known
+answer. All of it, with the setups and the failures, is in [docs/RESULTS.md](docs/RESULTS.md).
 
 ## What it does
 
@@ -48,7 +52,8 @@ it, with the setups and the failures, is in [docs/RESULTS.md](docs/RESULTS.md).
 | **Repair** | a playbook of verified edits (direction removal, local projection, neuron and head scaling, gated neurons), then activation steering (add or clamp); checked on the failing and working prompts, a regression suite that keeps refusals, serving precision, fresh variants and a random control |
 | **Surgery agent** | a frontier model (Claude, or any OpenAI-compatible model) with weight-editing tools in a workspace that cannot touch files, the network or processes; only an edit that passes the same checks is accepted |
 | **Weight-space programming** | goal files with practice and held-out data, dataset profiles, a paired held-out judge with guardrails; `wsr program` and `wsr fix` ship a patch, a steering or serving settings, only when the judge accepts it |
-| **Shipping** | apply, revert, or export a patch to GGUF through llama.cpp; a patch refuses weights it was not made for |
+| **Verification and provenance** | three data sets (practice, validation, a confirmation set evaluated once and recorded as used), a 32-item semantic canary, guardrails on the served GGUF, exact SHA-256 hashes of every tensor of the base model, and a `MANIFEST.json` per fix with its evidence and decision (`wsr patch show`, `wsr patch check`) |
+| **Shipping** | apply, revert, or export a patch to GGUF through llama.cpp; a patch refuses weights it was not made for, and a revert is checked to restore them exactly |
 | **Around it** | llama-server or batched PyTorch backends, results cached per model, questions before any download or server start |
 
 **Status: beta.** Deep diagnosis is tested on models up to 1.5B parameters, repair and `wsr program`
@@ -126,6 +131,9 @@ wsr repair ./model --prompt "..." --agent --agent-allow large --resume ./repair-
 wsr repair ./model --prompt "..." --deep --agent --agent-provider openai --agent-base-url https://openrouter.ai/api/v1 \
     --agent-key-env OPENROUTER_API_KEY --agent-model <provider/model> --agent-price 1.0 4.0
 wsr patch apply ./model ./repair/patch --out ./model-repaired
+# what a fix is, how it was judged and why it shipped; and whether it still matches its files and its model
+wsr patch show ./run/patch
+wsr patch check ./run/patch ./model
 
 # beyond one prompt: a goal file, a dataset profile, a paired judge
 wsr objective init goal.json --name my-goal --grader math          # or exact | contains | regex:<p> | detector:<group>
@@ -133,7 +141,7 @@ wsr objective split all.jsonl --practice data/practice.jsonl --heldout heldout/h
 wsr objective check goal.json                                      # files, gradable rows, practice/held-out overlap
 wsr profile ./model --objective goal.json --limit 50 --out profile.json   # triage verdicts over the data
 # from one failure to a goal file: confirm it, find items that fail the same way, stratified split
-wsr objective from-failure ./model --prompt "..." --out-dir ./goal-blank
+wsr objective from-failure ./model --prompt "..." --out-dir ./goal-blank   # practice / validation / confirmation
 wsr objective from-failure --profile profile.json --group TRUNCATED_LOOP --out-dir ./goal-loops
 wsr evaluate --objective goal.json --patch ./repair/patch           # paired, same seeds; every held-out look is logged
 # work towards the goal: profile, diagnose the largest weight-level group, playbook, then (--agent) the agent;
@@ -177,20 +185,36 @@ A run ends in one of these, each judged on a held-out set the agent never sees, 
 
 `wsr program` and `wsr fix` exit 0 for the first three outcomes (a judged fix exists) and 1 for the last row.
 
-**The judge's bar.** "Improved" needs the paired gain above 2 standard errors, every guardrail holding, and at
-least 5 scored held-out items (one or two fixed items prove nothing). The report also prints the exact
-one-sided sign test next to z: z is a normal approximation and runs optimistic when few items change (4 wins
-and no loss is z 2.09 on 37 items, and p 0.0625 by the sign test). Every look at the held-out set is logged
-next to the goal file, the steering and settings judges included.
+**The judge's bar.** "Improved" needs the exact one-sided sign test (items that changed; ties ignored) below
+the goal's alpha (0.05), divided by the number of candidates the run may judge (2 when an agent may follow the
+playbook), a gain of at least 5 points, at least 5 scored items and every guardrail holding. z is printed but
+decides nothing: it runs optimistic when few items change (4 wins and no loss is z 2.09, and p 0.0625 by the
+exact test). A result that cannot reach the bar is "inconclusive" with the reason, never "worse". Every look at
+the validation set is logged next to the goal file, the steering and settings judges included.
+
+**Confirmation, once.** A goal may name a `confirmation` set. Before any candidate runs, wsr checks that the set
+could prove a fix at all (the best possible p-value with its failing items); a set too small for that gives
+"inconclusive: insufficient confirmation sample size" and is not spent. The one frozen candidate that passes
+validation is evaluated on it once, and the set is recorded as used by its content, so a second fix, or the same
+file renamed, cannot be confirmed on it. `wsr objective from-failure` splits three ways (`--confirm-share`).
+
+**Guardrails.** The regression suite (new failures, drift, top-token agreement, harmful-request refusals) and a
+semantic canary: 32 deterministic items (arithmetic, units, sequences, comparisons, facts, instruction formats);
+only items the original gets right count, and a fix may lose at most one. On llama-server, the canary and the
+suite's reply checks run on the patched GGUF against the unpatched GGUF of the same quantisation; drift is
+marked "not supported" there, and the manifest records which format each check ran on.
 
 **The agent's limits.** The goal file's `budget` (`practice_evals`, `verifications`, `usd`; defaults 10, 6
 and 5) sets how much the agent may do and spend; `--practice-evals`, `--agent-verifications` and
 `--agent-budget-usd` override it for one run.
 
-**A patch belongs to its model.** A saved patch records marks of the tensors it was made on. `wsr patch
-apply`, `wsr evaluate --patch` and `wsr repair --check` refuse a patch made for other weights (a different
-fine-tune of the same shape would take it silently and get a different edit); `wsr patch apply --force`
-overrides, and a model loaded in another precision only gets a warning.
+**A patch belongs to its model.** A saved patch records the SHA-256 of every tensor of the model it was made on
+(and of the edited tensors after the edit), with the architecture, the tokenizer and config file hashes and
+the Hub revision, in `identity.json`. `wsr patch apply`, `wsr patch export`, `wsr evaluate --patch` and
+`wsr repair --check` refuse any other weights, a fine-tune of the same shape included; a model loaded in
+another precision is compared in the precision of its file. `--allow-base-mismatch` overrides on purpose, and a
+patch from an older wsr without exact hashes needs `--allow-unverified-legacy`. `wsr patch show <fix>` prints
+the manifest; `wsr patch check <fix> <model dir>` checks the files, the hashes and the base model.
 
 The rule-based playbook goes first. When it cannot fix the failure, or its candidate passes its own checks but
 not the held-out judge, the agent gets the objective (told only that the candidate was rejected). Agent tools:
@@ -248,7 +272,7 @@ given as `WSR_API_KEY` instead of `--api-key`, which keeps it out of the shell h
 ## Tests
 
 ```bash
-python -m pytest -q               # 337 tests; the CUDA comparison is skipped without a GPU
+python -m pytest -q               # 363 tests; the CUDA comparison is skipped without a GPU
 python -m ruff check src tests
 ```
 

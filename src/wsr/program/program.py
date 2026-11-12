@@ -362,7 +362,8 @@ def steering_kwargs(wb, vector: Any, alpha: Any, layers: Any, mode: str = "add")
     return {mode: (v / v.norm() if mode == "clamp" else v, a, ls)}
 
 
-def judge_steering(lm, obj: Objective, st: dict, *, limit: Optional[int] = None, say=lambda s: None) -> dict:
+def judge_steering(lm, obj: Objective, st: dict, *, limit: Optional[int] = None, say=lambda s: None,
+                   m: int = 1) -> dict:
     """Steering on the held-out set: the same weights without and with the steering hooks, same items and seeds,
     paired. Guardrails: the regression suite compared under the steering exactly as for a patch (new failures,
     drift, top-token agreement, refusals; the goal's limits), and every data guardrail under both."""
@@ -382,7 +383,13 @@ def judge_steering(lm, obj: Objective, st: dict, *, limit: Optional[int] = None,
     rails = []
     tk = obj.protocol.template_kwargs or None
     for g in obj.guardrails:
-        if g.suite:
+        if g.suite == EV.CANARY:
+            from ..surgery import canary as CN
+            c0 = CN.run(lm, obj.protocol.template_kwargs, original=True)
+            with lm.steer(**kw):
+                c1 = CN.run(lm, obj.protocol.template_kwargs, original=False)
+            rails.append({**CN.compare(c0, c1, g.max_lost), "name": g.name})
+        elif g.suite:
             base = R.baseline(lm, template_kwargs=tk)
             with lm.steer(**kw):
                 reg = R.compare(lm, base, template_kwargs=tk)
@@ -398,25 +405,105 @@ def judge_steering(lm, obj: Objective, st: dict, *, limit: Optional[int] = None,
             with lm.steer(**kw):
                 ga = EV._run_set(rg, gi, samples=1, seed=0)
             rails.append(EV._guard_result(g, gb, ga, 2 * len(gi)))
-    verdict = EV._verdict(paired, all(x["holds"] is not False for x in rails))
+    dec = EV.decide(paired, all(x["holds"] is not False for x in rails), m=m, **EV.judge_settings(obj))
+    verdict = dec["verdict"]
     looks = EV.HeldoutLog(obj).add({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "patch": f"steering: {st['vector']}",
                                     "items": len(items), "verdict": verdict})
-    return {"vector": st["vector"], "mode": st.get("mode", "add"), "power": EV.power(a), "alpha": st["alpha"],
+    return {"vector": st["vector"], "mode": st.get("mode", "add"), "power": EV.power(a, m=m, **EV.judge_settings(obj)),
+            "decision": dec, "verdict_reason": dec["reason"], "alpha": st["alpha"],
             "layers": st["layers"], "n": len(items),
             "metric": "accuracy" if graded else "share with no failure", "paired": paired,
             "rates_before": EV._rates(before), "rates_after": EV._rates(after), "guardrails": rails,
             "verdict": verdict, "heldout_looks": looks, "seconds": round(time.time() - t0, 1)}
 
 
-def save_steering(st: dict, out: Path) -> Path:
+def save_steering(st: dict, out: Path, dirname: str = "steering") -> Path:
     """The steering as files (surgery/steer.py): the vector, its settings and APPLY.md."""
     from ..surgery import steer as SV
 
-    return SV.save(st["_vector"], st["alpha"], st["layers"], st["vector"], out, mode=st.get("mode", "add"))
+    return SV.save(st["_vector"], st["alpha"], st["layers"], st["vector"], out, mode=st.get("mode", "add"),
+                   dirname=dirname)
+
+
+def _settings_files(settings: dict, proto: Protocol, d: Path) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "settings.json").write_text(json.dumps(settings, indent=1, sort_keys=True), encoding="utf-8")
+    (d / "APPLY.md").write_text("# Applying these settings\n\n" + "\n".join(x for x in settings_howto(proto, settings)
+                                                                          if x) + "\n", encoding="utf-8")
+    return d
+
+
+def _accept(lm, obj: Objective, rec: dict, *, kind: str, label: str, by: str, val: dict, stage: Path,
+            write_files, run_after, evidence: Optional[dict], say) -> bool:
+    """After the validation judge: the confirmation stage (when the goal has a confirmation set), then the fix's
+    MANIFEST.json. Returns whether the fix ships.
+
+    * rejected on validation: not shipped;
+    * no confirmation set: shipped, as "validated, not confirmed";
+    * a confirmation set: shipped only when the frozen candidate, run once on it, passes the same policy (exact
+      sign test at alpha, the minimum gain); a set already used, or too small to show anything, does not ship."""
+    from .. import evidence as EVD
+    from .. import manifest as MF
+    from . import confirm as CF
+
+    write_files(stage)
+    model, evaluation = MF.model_record(lm), MF.goal_record(obj)
+    cand = MF.candidate_hash(model, MF.artifact_hash(stage), evaluation)
+    conf = None
+    if val.get("verdict") != "improved":
+        ship, status, why = False, "rejected on validation", val.get("verdict_reason") or val.get("verdict")
+    elif not obj.confirmation:
+        ship, status, why = True, "validated, not confirmed", "the goal has no confirmation set"
+    else:
+        say(f"\nconfirming {label} on the confirmation set (once; the candidate is frozen)")
+        conf = CF.run(lm, obj, run_after=run_after, say=say,
+                      record={"goal": obj.name, "goal_version": evaluation["goal_version"], "candidate": cand,
+                              "model": (model.get("digests") or {}).get("float32"), "kind": kind, "label": label})
+        ship = conf["verdict"] == "improved"
+        status = ("confirmed" if ship else "inconclusive" if conf["verdict"] == "inconclusive" else "not confirmed")
+        why = conf["reason"]
+        say(f"  confirmation: {status} ({why})")
+    passed = val.get("verdict") == "improved"
+    ev = EVD.merge(evidence or EVD.make(intervention=True),
+                   EVD.make(generalization=(["validation_set"] if passed else []) + (["confirmation_set"] if ship and conf
+                                                                                      else [])))
+    fmt = "gguf:" + val["judge"]["quant"] if (val.get("judge") or {}).get("kind") == "llama-server" and \
+        (val.get("judge") or {}).get("quant") else "pytorch"
+    by_fmt = val.get("guardrails_by_format") or {}
+    rails = {f: MF.guardrails({"guardrails": list(rs.values())}, f)[f] for f, rs in by_fmt.items()} if by_fmt \
+        else MF.guardrails(val, "pytorch")
+    # Deployable in a format only when every guardrail that ran on that format held (the target was judged on
+    # `fmt`); a format nothing ran on is not claimed.
+    deploy = {}
+    for f, rs in (rails or {"pytorch": {}}).items():
+        deploy[f] = ship and all(g.get("holds") is not False for g in rs.values())
+    if not deploy:
+        deploy = {"pytorch": ship}
+    judge = val.get("judge") or {}
+    MF.write(stage, {"kind": kind, "artifact": {"label": label, "by": by}, "model": model, "evaluation": evaluation,
+                     "statistics": {"validation": MF.statistics(val), "confirmation": conf},
+                     "judged_on": fmt, "server_version": judge.get("server_version"), "guardrails": rails,
+                     "evidence": ev,
+                     "decision": {"status": status, "shipped": ship, "why": why, "deployable": deploy}})
+    rec["status"], rec["status_why"] = status, why
+    if conf is not None:
+        rec["stages"]["confirmation"] = conf
+    return ship
+
+
+def _final_dir(stage: Path, final: Path) -> Path:
+    import shutil
+
+    if final.resolve() == stage.resolve():
+        return final
+    if final.exists():
+        shutil.rmtree(final)
+    stage.replace(final)
+    return final
 
 
 def judge_settings(lm, obj: Objective, settings: dict, *, limit: Optional[int] = None,
-                   say=lambda s: None) -> dict[str, Any]:
+                   say=lambda s: None, m: int = 1) -> dict[str, Any]:
     """Serving settings on the held-out set: the original weights with the objective's protocol vs the same
     weights with these settings, same items and seeds, paired. Guardrails: every data guardrail under both, and
     the regression-suite prompts generated under both (no reply that was fine may fail, every refusal kept)."""
@@ -433,7 +520,7 @@ def judge_settings(lm, obj: Objective, settings: dict, *, limit: Optional[int] =
     b, _ = EV._metric(after)
     paired = EV._paired(a, b)
     rails = []
-    sg = next((g for g in obj.guardrails if g.suite), None)
+    sg = next((g for g in obj.guardrails if g.suite == "wsr_regression"), None)
     keep_refusals = not (sg is not None and sg.allow_safety_loss)
     suite = [{"id": n, "messages": [{"role": "user", "content": p}], "lang": lang,
               **({"expect": "refuse"} if kind == "safety" and keep_refusals else {})}
@@ -447,6 +534,13 @@ def judge_settings(lm, obj: Objective, settings: dict, *, limit: Optional[int] =
     broke = [x["id"] for x, u, v in zip(s0, m0, m1) if u > v]
     rails.append({"name": "wsr_regression (generated under the settings)", "kind": "suite", "prompts": len(suite),
                   "new_failures": broke, "holds": not broke})
+    cg = next((g for g in obj.guardrails if g.suite == EV.CANARY), None)
+    if cg is not None:
+        from ..surgery import canary as CN
+        c0 = CN.run(lm, proto.template_kwargs, original=True)
+        c1 = EV._run_set(PF.Runner(TorchBackend(lm), with_settings(CN.protocol(proto.template_kwargs), settings), "item"),
+                         items_for(settings, CN.items()), samples=1, seed=0)
+        rails.append({**CN.compare(c0, c1, cg.max_lost), "name": cg.name})
     for g in obj.guardrails:
         if g.data:
             gi = EV._guard_items(obj, g)
@@ -455,11 +549,13 @@ def judge_settings(lm, obj: Objective, settings: dict, *, limit: Optional[int] =
             ga = EV._run_set(PF.Runner(TorchBackend(lm), new, g.grader or "detector:any"), items_for(settings, gi),
                              samples=1, seed=0)
             rails.append(EV._guard_result(g, gb, ga, 2 * len(gi)))
-    verdict = EV._verdict(paired, all(x["holds"] is not False for x in rails))
+    dec = EV.decide(paired, all(x["holds"] is not False for x in rails), m=m, **EV.judge_settings(obj))
+    verdict = dec["verdict"]
     looks = EV.HeldoutLog(obj).add({"time": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                     "patch": f"settings: {json.dumps(settings)}", "items": len(items),
                                     "verdict": verdict})
-    return {"settings": dict(settings), "n": len(items), "power": EV.power(a),
+    return {"settings": dict(settings), "n": len(items), "power": EV.power(a, m=m, **EV.judge_settings(obj)),
+            "decision": dec, "verdict_reason": dec["reason"],
             "metric": "accuracy" if graded else "share with no failure",
             "paired": paired, "rates_before": EV._rates(before), "rates_after": EV._rates(after),
             "guardrails": rails, "verdict": verdict, "heldout_looks": looks, "seconds": round(time.time() - t0, 1)}
@@ -469,7 +565,7 @@ def render_settings(js: dict, proto: Protocol) -> list[str]:
     p = js["paired"]
     lines = [f"Settings `{json.dumps(js['settings'])}` on {js['n']} held-out items ({js['metric']}): "
              f"{p.get('before', 0):.1%} -> {p.get('after', 0):.1%} ({p.get('diff', 0):+.1%} +- {p.get('se', 0):.1%} SE)"
-             f"; verdict: **{js['verdict']}**",
+             f"; verdict: **{js['verdict']}** ({js.get('verdict_reason', '')})",
              "- failure groups before: " + ", ".join(f"{k} {v:.0%}" for k, v in js["rates_before"].items()),
              "- failure groups after: " + ", ".join(f"{k} {v:.0%}" for k, v in js["rates_after"].items())]
     for g in js["guardrails"]:
@@ -621,9 +717,11 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
     say(f"diagnosis: {res.summary}")
     # The verification uses the limits of the goal's own suite guardrail (the judge applies the same ones), so a
     # candidate is not verified against one set of limits and judged against another.
-    sg = next((g for g in obj.guardrails if g.suite), None)
+    sg = next((g for g in obj.guardrails if g.suite == "wsr_regression"), None)
+    cg = next((g for g in obj.guardrails if g.suite == EV.CANARY), None)
     reg_budget = (R.Budget(sg.max_drift, sg.min_agreement, sg.allow_safety_loss or allow_safety_loss)
                   if sg is not None else R.Budget(allow_safety_loss=allow_safety_loss))
+    reg_budget.canary_max_lost = cg.max_lost if cg is not None else None
     if not weight_edits:
         # The weights must not change: the playbook may only steer, and the agent's edit tools are refused.
         steering = "only"
@@ -642,6 +740,10 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
     # The verification already ran the regression suite on this patch with this template; the judge's
     # guardrail reuses it (same computation, same numbers) instead of running it again.
     suite_result = rep.regression if rep.status == "fixed" else None
+    # The held-out (validation) set may judge one candidate from the playbook and, with an agent, one more: each is
+    # tested at alpha / slots, so two looks at the same set cannot double the chance of a false acceptance.
+    slots = 1 + (provider is not None)
+    rec["stages"]["candidate_slots"] = slots
 
     # 4. agent, 5. the judge. A playbook candidate that the held-out judge rejects hands over to the agent once
     # (when there is one): it hears only that the candidate was rejected, not the held-out numbers.
@@ -649,10 +751,10 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
     from . import judge as JG
 
     def judge_patch(candidate, by, suite_result) -> dict:
-        from ..surgery.edits import base_marks
+        from .. import identity as ID
 
-        if not candidate.base:
-            candidate.base = base_marks(lm, candidate)   # the unedited weights: saved with the patch
+        if not candidate.identity:
+            candidate.identity = ID.for_patch(lm, candidate)   # the unedited weights: saved with the patch
         say(f"\njudging {candidate.label} ({by}) on the held-out set")
         jd = JG.choose(judge, lm=lm, model_dir=model_dir, patch=candidate, out=out, consent=consent or Consent(),
                        quant=judge_quant, server_bin=server_bin, max_new=proto.max_new_tokens, log=say)
@@ -662,7 +764,7 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
                 try:
                     ev = EV.evaluate(jd.source, obj, patched_source=jd.patched, guard_source=lm, patch=candidate,
                                      patch_name=candidate.label, split="heldout", limit=eval_limit,
-                                     suite_result=suite_result, log=False)
+                                     suite_result=suite_result, log=False, m=slots, fmt=f"gguf:{judge_quant}")
                     EV.HeldoutLog(obj).add({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "patch": candidate.label,
                                             "items": ev["items"], "verdict": ev["verdict"]})
                     ev["heldout_looks"] = EV.HeldoutLog(obj).count()
@@ -674,10 +776,12 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
                     jd.kind, ev = "pytorch", None
             if ev is None:
                 ev = EV.evaluate(lm, obj, patch=candidate, patch_name=candidate.label, split="heldout",
-                                 limit=eval_limit, suite_result=suite_result)
+                                 limit=eval_limit, suite_result=suite_result, m=slots)
         finally:
             jd.close()
-        ev["judge"] = {"kind": jd.kind, "notes": jd.notes, "files": jd.files}
+        ev["judge"] = {"kind": jd.kind, "notes": jd.notes, "files": jd.files,
+                       **({"quant": judge_quant, "server_version": jd.server_version} if jd.kind == "llama-server"
+                          else {})}
         say(EV.render(ev))
         return ev
 
@@ -686,7 +790,7 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
     if candidate is not None and provider is not None and rep.ctx is not None:
         ev = judge_patch(candidate, by, suite_result)
         if ev["verdict"] == "improved":
-            return _ship(rec, out, t0, candidate, by, ev, obj, consent, decisions)
+            return _ship(rec, out, t0, candidate, by, ev, obj, consent, decisions, lm=lm, say=say)
         candidate.checks["objective"] = {"name": obj.name, "verdict": ev["verdict"], "paired": ev.get("paired"),
                                          "by": by}
         candidate.save(out / "candidate_playbook")
@@ -699,15 +803,20 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
         st = {"_vector": sv.vector, "alpha": sv.alpha, "layers": sv.layers, "vector": sv.label, "mode": sv.mode}
         say(f"\njudging the playbook's steering ({sv.label}, alpha {sv.alpha:.3f} after layers {sv.layers}) on the "
             "held-out set")
-        js = judge_steering(lm, obj, st, limit=eval_limit, say=say)
+        js = judge_steering(lm, obj, st, limit=eval_limit, say=say, m=slots)
         js["by"] = "playbook"
         js["practice"] = None
         say(f"  steering: {js['verdict']}")
         if js["verdict"] == "improved":
-            js["files"] = str(save_steering(st, out))
+            ok = _accept(lm, obj, rec, kind="steering", label=sv.label, by="playbook", val=js,
+                         stage=out / "candidate_steering", write_files=lambda d: save_steering(st, d.parent, d.name),
+                         run_after=_steer_runner(lm, obj, st), evidence=(rep.checks or {}).get("evidence"), say=say)
+            js["files"] = str(_final_dir(out / "candidate_steering", out / ("steering" if ok else "candidate_steering")))
             rec["stages"]["steering"] = js
-            rec["outcome"] = "steering recommended"
-            rec["says"] = f"serve with the playbook's steering ({sv.label}): held-out {js['verdict']}"
+            rec["outcome"] = "steering recommended" if ok else "not shipped"
+            rec["says"] = (f"serve with the playbook's steering ({sv.label}): {rec['status']}" if ok else
+                           f"the playbook's steering ({sv.label}) passed validation, then {rec['status']}: "
+                           f"{rec['status_why']}")
             return _finish(rec, out, t0)
         rec["stages"]["steering_playbook"] = js
         rejected = f"steering: {sv.label}"
@@ -748,17 +857,21 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
         by = f"agent (final choice: {tools.wb.done['rationale'][:200]})"
         say(f"\njudging the steering {st['vector']} x {st['alpha']} after layers {st['layers']} ({by}) on the "
             "held-out set")
-        js = judge_steering(lm, obj, st, limit=eval_limit, say=say)
+        js = judge_steering(lm, obj, st, limit=eval_limit, say=say, m=slots)
         js["by"] = by
         js["practice"] = {k: st.get(k) for k in ("n", "before", "after", "diff", "se")}
         rec["stages"]["steering"] = js
         rec["stages"]["agent"]["steer_evals"] = {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
                                                  for k, v in tools.steerings.items()}
-        if js["verdict"] == "improved":
-            js["files"] = str(save_steering(st, out))
         say(f"  steering: {js['verdict']}")
-        rec["outcome"] = "steering recommended" if js["verdict"] == "improved" else "no candidate"
-        rec["says"] = f"steering {st['vector']} x {st['alpha']} after layers {st['layers']}: held-out {js['verdict']}"
+        ok = _accept(lm, obj, rec, kind="steering", label=st["vector"], by=by, val=js, stage=out / "candidate_steering",
+                     write_files=lambda d: save_steering(st, d.parent, d.name), run_after=_steer_runner(lm, obj, st),
+                     evidence=None, say=say)
+        js["files"] = str(_final_dir(out / "candidate_steering", out / ("steering" if ok else "candidate_steering")))
+        rec["outcome"] = ("steering recommended" if ok else "not shipped" if js["verdict"] == "improved"
+                          else "no candidate")
+        rec["says"] = (f"steering {st['vector']} x {st['alpha']} after layers {st['layers']}: {rec['status']}"
+                       + (f" ({rec['status_why']})" if not ok else ""))
         return _finish(rec, out, t0)
     pick = None
     if tools is not None:
@@ -775,14 +888,19 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
     if pick is not None and candidate is None:
         sel, by = pick
         say(f"\njudging the settings {sel['settings']} ({by}) on the held-out set")
-        js = judge_settings(lm, obj, sel["settings"], limit=eval_limit, say=say)
+        js = judge_settings(lm, obj, sel["settings"], limit=eval_limit, say=say, m=slots)
         js["by"] = by
         js["practice"] = {k: sel.get(k) for k in ("n", "before", "after", "diff", "se")}
         rec["stages"]["settings"] = js
         say("\n".join(render_settings(js, proto)))
-        rec["outcome"] = "settings recommended" if js["verdict"] == "improved" else "no candidate"
-        rec["says"] = (f"serve with {json.dumps(sel['settings'])}: held-out {js['verdict']}"
-                       if js["verdict"] == "improved" else f"settings {json.dumps(sel['settings'])}: {js['verdict']}")
+        ok = _accept(lm, obj, rec, kind="settings", label=json.dumps(sel["settings"], sort_keys=True), by=by, val=js,
+                     stage=out / "candidate_settings", write_files=lambda d: _settings_files(sel["settings"], proto, d),
+                     run_after=_settings_runner(lm, obj, sel["settings"]), evidence=None, say=say)
+        js["files"] = str(_final_dir(out / "candidate_settings", out / ("settings" if ok else "candidate_settings")))
+        rec["outcome"] = ("settings recommended" if ok else "not shipped" if js["verdict"] == "improved"
+                          else "no candidate")
+        rec["says"] = (f"serve with {json.dumps(sel['settings'])}: {rec['status']}" if ok else
+                       f"settings {json.dumps(sel['settings'])}: {rec['status']} ({rec['status_why']})")
         return _finish(rec, out, t0)
     if candidate is None:
         rec["outcome"] = "not shipped" if rejected else "no candidate"
@@ -794,20 +912,49 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
             rec["patch"] = {"label": rejected, "by": "playbook", "dir": str(out / "candidate_playbook")}
         return _finish(rec, out, t0)
     ev = judge_patch(candidate, by, suite_result)
-    return _ship(rec, out, t0, candidate, by, ev, obj, consent, decisions)
+    return _ship(rec, out, t0, candidate, by, ev, obj, consent, decisions, lm=lm, say=say)
 
 
-def _ship(rec: dict, out: Path, t0: float, candidate, by: str, ev: dict, obj: Objective, consent, decisions) -> dict:
+def _steer_runner(lm, obj: Objective, st: dict):
+    def run(items: list[dict]) -> list[dict]:
+        kw = {st.get("mode", "add"): (st["_vector"], st["alpha"], st["layers"])}
+        r = PF.Runner(TorchBackend(lm), obj.protocol, obj.grader)
+        with lm.steer(**kw):
+            return EV._run_set(r, items, samples=1, seed=0)
+    return run
+
+
+def _settings_runner(lm, obj: Objective, settings: dict):
+    def run(items: list[dict]) -> list[dict]:
+        r = PF.Runner(TorchBackend(lm), with_settings(obj.protocol, settings), obj.grader)
+        return EV._run_set(r, items_for(settings, items), samples=1, seed=0)
+    return run
+
+
+def _ship(rec: dict, out: Path, t0: float, candidate, by: str, ev: dict, obj: Objective, consent, decisions, *,
+          lm=None, say=lambda s: None) -> dict:
+    from ..surgery.edits import applied
+
     rec["stages"]["judge"] = ev
-    shipped = ev["verdict"] == "improved"
     candidate.checks["objective"] = {"name": obj.name, "verdict": ev["verdict"], "paired": ev.get("paired"),
                                      "by": by}
-    candidate.save(out / ("patch" if shipped else "candidate"))
+
+    def run_after(items: list[dict]) -> list[dict]:
+        r = PF.Runner(TorchBackend(lm), obj.protocol, obj.grader)
+        with applied(lm, candidate):
+            return EV._run_set(r, items, samples=1, seed=0)
+    shipped = _accept(lm, obj, rec, kind="patch", label=candidate.label, by=by, val=ev, stage=out / "candidate",
+                      write_files=lambda d: candidate.save(d, lm), run_after=run_after,
+                      evidence=(candidate.checks or {}).get("evidence"), say=say)
+    final = _final_dir(out / "candidate", out / ("patch" if shipped else "candidate"))
     rec["outcome"] = "shipped" if shipped else "not shipped"
-    rec["patch"] = {"label": candidate.label, "by": by, "dir": str(out / ("patch" if shipped else "candidate"))}
+    rec["patch"] = {"label": candidate.label, "by": by, "dir": str(final)}
     pw = ev.get("power") or {}
-    rec["says"] = ev["verdict"] + (f" ({pw['note']})" if not shipped and pw and not pw["can_show_improvement"]
-                                   else "")
+    rec["says"] = (rec["status"] if shipped else
+                   f"{ev['verdict']}: {rec['status_why']}" if ev["verdict"] != "improved" else
+                   f"passed validation, then {rec['status']}: {rec['status_why']}")
+    if not shipped and pw and not pw.get("can_show_improvement") and ev["verdict"] != "improved":
+        rec["says"] += f" ({pw['note']})"
     if consent is not None and consent.decisions:
         rec["decisions"] = consent.decisions
     elif decisions:
@@ -850,6 +997,16 @@ def report(rec: dict) -> str:
         for n in a.get("notes") or []:
             lines.append(f"- note: {n}")
         lines.append("")
+    if rec.get("status"):
+        lines += ["## Decision", f"**{rec['status']}** - {rec.get('status_why', '')}"]
+        cf = st.get("confirmation")
+        if cf:
+            p = cf.get("paired") or {}
+            lines.append(f"- confirmation set ({cf.get('items')} items, evaluated once, per-item results not shown): "
+                         f"{cf['verdict']}" + (f", {p.get('before', 0):.1%} -> {p.get('after', 0):.1%} "
+                                               f"({p.get('wins')} better, {p.get('losses')} worse)" if p else "")
+                         + f"; {cf.get('reason', '')}")
+        lines.append("")
     if "judge_playbook" in st:
         lines += ["## Held-out judge on the playbook's candidate (not accepted; handed to the agent)", "", "```",
                   EV.render(st["judge_playbook"]), "```", ""]
@@ -879,7 +1036,8 @@ def report(rec: dict) -> str:
         p = js["paired"]
         how = (f"Clamp `{js['vector']}` to {js['alpha']:.3f}" if js.get("mode") == "clamp"
                else f"Add {js['alpha']} x `{js['vector']}`")
-        lines += ["## Recommended steering" if js["verdict"] == "improved" else "## Steering tried on the held-out set",
+        lines += ["## Recommended steering" if rec["outcome"] == "steering recommended"
+                  else "## Steering tried on the held-out set",
                   f"Chosen by: {js.get('by', '')}; practice: {js.get('practice')}", "",
                   f"{how} after layers {js['layers']} (every position). Held-out "
                   f"({js['n']} items, {js['metric']}): {p.get('before', 0):.1%} -> {p.get('after', 0):.1%} "
@@ -899,7 +1057,8 @@ def report(rec: dict) -> str:
         lines.append("")
     if "settings" in st:
         js = st["settings"]
-        lines += ["## Recommended settings" if js["verdict"] == "improved" else "## Settings tried on the held-out set",
+        lines += ["## Recommended settings" if rec["outcome"] == "settings recommended"
+                  else "## Settings tried on the held-out set",
                   f"Chosen by: {js.get('by', '')}; practice: {js.get('practice')}", "",
                   *render_settings(js, Protocol(**{k: v for k, v in o.get("protocol", {}).items()
                                                    if k in ("template_kwargs", "sampling", "max_new_tokens", "system")})),

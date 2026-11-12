@@ -294,32 +294,6 @@ def test_steering_candidates_are_tried_once_each(lm, monkeypatch):
     assert cands and len(keys) == len(set(keys))
 
 
-def test_a_saved_patch_records_the_weights_it_was_made_on(lm, tmp_path):
-    """A patch is a difference from exact weights. Applied to another fine-tune of the same shape it used to go
-    through silently; now the saved patch carries marks of its base tensors and the CLI paths check them."""
-    patch = E.scale_neurons(lm, [(0, 1)], 0.0)
-    patch.save(tmp_path / "p", lm)
-    back = E.Patch.load(tmp_path / "p")
-    assert set(back.base) == {d.name for d in patch.deltas}
-    assert E.base_check(lm, back)[0] == "same"
-    w = E._param(lm, patch.deltas[0].name)
-    keep = w.detach().clone()
-    with torch.no_grad():
-        w.mul_(1 + 1e-5)
-    assert E.base_check(lm, back)[0] == "close"                 # as after loading in another precision
-    with torch.no_grad():
-        w.copy_(keep * 1.5)
-    verdict, why = E.base_check(lm, back)
-    assert verdict == "different" and patch.deltas[0].name in why
-    from wsr.cli import _check_base
-    with pytest.raises(ValueError, match="not made for this model"):
-        _check_base(lm, back)
-    _check_base(lm, back, force=True)                           # --force: a warning, no refusal
-    with torch.no_grad():
-        w.copy_(keep)
-    assert E.base_check(lm, E.scale_neurons(lm, [(0, 1)], 0.0))[0] == "unknown"   # never saved with a model
-
-
 def test_a_full_disk_while_saving_the_patched_model_is_a_clear_error(lm, tmp_path, monkeypatch):
     """safetensors raises its own error type for a full disk; `wsr patch apply` showed a traceback."""
     def full(*a, **k):

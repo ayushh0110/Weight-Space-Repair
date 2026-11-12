@@ -59,6 +59,36 @@ def _split(items: list[dict], share: float, rng: random.Random) -> tuple[list[di
     return items[k:], items[:k]
 
 
+# Failing items a set needs before any fix can pass the exact sign test there: 0.5^k below alpha. Validation is
+# judged at alpha / 2 when an agent may add a second candidate (6 items); confirmation once at alpha (5 items).
+MIN_FAILING_VALIDATION = 6
+MIN_FAILING_CONFIRMATION = 5
+
+
+def _three_way(fail: list[dict], work: list[dict], heldout_share: float, confirm_share: float,
+               rng: random.Random) -> tuple[list[dict], list[dict], Optional[str]]:
+    """Take the confirmation set out first, when the failing items allow it without shrinking validation below what
+    it needs. Returns (confirmation failing, confirmation working, why there is none)."""
+    if confirm_share <= 0:
+        return [], [], "no confirmation set requested (--confirm-share 0)"
+    n = len(fail)
+    n_conf = max(MIN_FAILING_CONFIRMATION, int(round(confirm_share * n)))
+    rest = n - n_conf
+    n_val = int(round(heldout_share * rest))
+    need = MIN_FAILING_CONFIRMATION + MIN_FAILING_VALIDATION + 1
+    if n_val < MIN_FAILING_VALIDATION or rest - n_val < 1:
+        return [], [], (f"no confirmation set: {n} failing items, and a confirmation set needs "
+                        f"{MIN_FAILING_CONFIRMATION} failing items next to {MIN_FAILING_VALIDATION} for validation and "
+                        f"at least 1 for practice ({need} in all); validation is not reduced to make room. Add items "
+                        "that fail (a dataset, more --failing prompts) to get one")
+    fail[:] = rng.sample(fail, len(fail))
+    work[:] = rng.sample(work, len(work)) if work else []
+    cf, fail[:] = fail[:n_conf], fail[n_conf:]
+    k = int(round(len(work) * n_conf / max(1, n)))
+    cw, work[:] = work[:k], work[k:]
+    return cf, cw, None
+
+
 def msg_hash(messages: list[dict]) -> str:
     import hashlib
     return hashlib.sha256(json.dumps(messages, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
@@ -98,7 +128,7 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
                  dataset: Optional[Path] = None, auto: bool = False, profile: Optional[dict] = None,
                  group: Optional[str] = None, grader: Optional[str] = None, samples: int = 200,
                  heldout_share: float = 0.5, seed: int = 0, deep: bool = False, name: Optional[str] = None,
-                 expect_lang: Optional[str] = None, consent=None) -> dict[str, Any]:
+                 expect_lang: Optional[str] = None, consent=None, confirm_share: float = 0.25) -> dict[str, Any]:
     rng = random.Random(seed)
     res: dict[str, Any] = {"steps": []}
     step = res["steps"].append
@@ -231,7 +261,10 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
                                                      "split into practice and held-out; add --failing prompts or a "
                                                      "dataset"}
 
-    # 4. stratified split; 5. the goal file
+    # 4. stratified split (confirmation first, when there are enough failing items); 5. the goal file
+    cf, cw, no_conf = _three_way(fail_items, work_items, heldout_share, confirm_share, rng)
+    if no_conf:
+        step(no_conf)
     fp, fh = _split(fail_items, heldout_share, rng)
     wp, wh = _split(work_items, heldout_share, rng) if work_items else ([], [])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -240,17 +273,24 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
     if r is not None and labels:
         save_labels(out_dir / "practice" / "labels.json", fp + wp, labels, protocol, r, lm)
     _write(out_dir / "heldout" / "heldout.jsonl", fh + wh)
+    if cf:
+        _write(out_dir / "confirmation" / "confirmation.jsonl", cf + cw)
     goal = {"name": nm, "kind": "repair" if label != "WRONG_ANSWER" else "capability", "model": model,
             "protocol": {"template_kwargs": protocol.template_kwargs, "sampling": protocol.sampling,
                          "max_new_tokens": protocol.max_new_tokens, "system": protocol.system},
             "practice": "practice/practice.jsonl", "heldout": "heldout/heldout.jsonl", "grader": grader,
-            "guardrails": [{"suite": "wsr_regression"}], "budget": {"practice_evals": 10, "verifications": 6, "usd": 5}}
+            "guardrails": [{"suite": "wsr_regression"}, {"suite": "semantic_regression_canary"}],
+            "budget": {"practice_evals": 10, "verifications": 6, "usd": 5}}
+    if cf:
+        goal["confirmation"] = "confirmation/confirmation.jsonl"
     O.from_dict(goal)
     path = out_dir / "goal.json"
     path.write_text(json.dumps(goal, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-    step(f"split: practice {len(fp)} failing + {len(wp)} working; held-out {len(fh)} failing + {len(wh)} working")
+    step(f"split: practice {len(fp)} failing + {len(wp)} working; validation (held-out) {len(fh)} failing + "
+         f"{len(wh)} working" + (f"; confirmation {len(cf)} failing + {len(cw)} working (used once)" if cf else ""))
     return {**res, "stopped": None, "goal": str(path), "label": label, "grader": grader, "source": source,
-            "practice": {"failing": len(fp), "working": len(wp)}, "heldout": {"failing": len(fh), "working": len(wh)}}
+            "practice": {"failing": len(fp), "working": len(wp)}, "heldout": {"failing": len(fh), "working": len(wh)},
+            "confirmation": {"failing": len(cf), "working": len(cw)} if cf else {"none": no_conf}}
 
 
 def render(res: dict[str, Any]) -> str:

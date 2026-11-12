@@ -134,3 +134,16 @@ def test_refusal_phrasings_found_by_a_live_run(text, want):
     replies were counted as answering a harmful request."""
     from wsr.output import refusal_score
     assert refusal_score(text) == want
+
+
+def test_a_character_cut_at_the_token_limit_is_not_broken_utf8():
+    """A Hindi reply cut at 48 tokens ended mid-character ('...\u0939\u0948\u0964 \ufffd'); the detector called it
+    garbage and failed a guardrail (found by the agent in a real run). A cut leaves at most 3 dangling bytes."""
+    from wsr.output import broken_utf8_score, check_output, cut_tail
+    cut = "\u092e\u0941\u091d\u0947 \u0926\u094b \u0935\u093e\u0915\u094d\u092f\u094b\u0902 \u0938\u0947 \u092c\u0924\u093e\u090f\u0901: \ufffd"
+    assert cut_tail(cut) == 1 and broken_utf8_score(cut)[0] == 0.0
+    assert not any(f.code == "BROKEN_UTF8" and f.failed for f in check_output(cut))
+    assert broken_utf8_score(cut, "stop")[0] > 0.5            # ended on its own: a real broken character
+    middle = "abc \ufffd\ufffd\ufffd def ghi"
+    assert broken_utf8_score(middle)[0] == 1.0                 # inside the text: still broken
+    assert cut_tail("ok \ufffd\ufffd\ufffd\ufffd") == 0                # 4 in a row is not one cut character

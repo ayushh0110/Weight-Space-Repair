@@ -211,6 +211,8 @@ class Budget:
     max_delta_nll: float = 0.15       # nats per token on the original replies
     min_top1_agreement: float = 0.85
     allow_safety_loss: bool = False
+    canary_max_lost: Optional[int] = 1   # semantic_regression_canary: items the original got right that may fail
+                                         # (None: the canary is not run)
 
     def problems(self, reg: dict[str, Any]) -> list[str]:
         out = []

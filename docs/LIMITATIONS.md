@@ -56,19 +56,35 @@ Known limits:
 
 ## Repair and the judge
 
-- **Meaning is not checked.** Target and regression checks use the triage detectors (blank, loop, garbage,
-  language, refusal). A fluent reply in the right language can still be wrong; read the samples in the report.
+- **Meaning is checked only narrowly.** Target and regression checks use the triage detectors (blank, loop,
+  garbage, language, refusal). The semantic canary adds 32 deterministic English items (arithmetic, units,
+  sequences, comparisons, facts, instruction formats); it catches a fix that breaks simple answers, not one that
+  makes open-ended answers subtly worse. Read the samples in the report, and add a data guardrail with a real
+  grader for what matters to you.
 - **The regression suite is small:** 17 prompts of 48 tokens. Deep mode adds fresh variants of the failing
   prompt; data guardrails in a goal file add more.
-- **Held-out sets in the tested runs were small** (20 to 40 items). The bar is a paired gain above 2
-  standard errors with at least 5 scored items; with few changed items that is more generous than the exact
-  sign test, which the report prints next to it. Looks at the held-out set are logged, not corrected for.
+- **Sets in the tested runs were small** (validation 12 to 121 items, 6 to 18 failing; confirmation 5 to 15
+  failing). The exact sign test is honest about that: with k failing items the best possible p is 0.5^k, so a
+  set with 5 failing items cannot confirm anything at 0.05 (the power check says so before the run). The
+  correction counts the candidate slots of one run (1 or 2), not every run you make on the same validation set;
+  looks are logged, not corrected for.
+- **The confirmation registry is local.** A used confirmation set is recorded by its content hash under the
+  cache base (`WSR_CACHE_DIR`) and in a note next to the file. Another machine, another cache folder, or a set
+  with one item changed is not recognised as used. It guards against accidents, not against someone who wants to
+  reuse a set.
+- **Exact identity fails closed.** A model re-saved in another precision, re-sharded, or converted by a tool that
+  rounds differently gets different tensor hashes and is refused, though it may be the same model in practice;
+  `--allow-base-mismatch` is the deliberate way past it.
 - Matched continuations exist for loops only; blank, refusal and language edits use the contrast direction.
 - `--sampled` checks a patch under sampling; it does not search for failures that appear only under sampling.
 - No dedicated recipes for endless reasoning, excessive length, formatting habits or persona; those go
   through the generic contrast direction.
-- Patches apply to Hugging Face weights; the GGUF path converts the patched model again. The file-level
-  export does not compare a patch's base weights (`wsr patch apply` does).
+- Patches apply to Hugging Face weights; the GGUF path converts the patched model again (the export checks the
+  base weights first, like `wsr patch apply`).
+- **On the GGUF, drift is not measured.** The served-file guardrails compare replies of the patched and the
+  unpatched GGUF (new failures, refusals, the canary); drift and top-token agreement need full-precision
+  log-probabilities and run on PyTorch only, and the manifest marks them "not supported" for the GGUF. Tested on
+  Q8_0 with one llama-server build.
 
 ## Steering
 
@@ -83,6 +99,7 @@ Known limits:
   endpoint), Claude Opus 5.5 through a test-only Kiro CLI driver that is not part of wsr, a local Gemma 4 E2B,
   and a free OpenRouter model.
 - Results vary between runs on hard cases: on the same over-refusal goal one run came close and another gave up.
+  Under the current rules neither real-model agent run (over-refusal, under-refusal) produced an accepted fix.
 - The workspace is a safe subset of Python, not a kernel; an isolated container kernel is not built.
 - A single slow torch call in the workspace runs to its end (the deadline is checked between operations).
 - The agent's state is rewritten after every turn, up to 1 GB of workspace tensors.

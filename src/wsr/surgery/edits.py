@@ -71,7 +71,8 @@ class Patch:
     deltas: list[Delta] = field(default_factory=list)
     untie: bool = False                        # untie lm_head from the embeddings before applying
     checks: dict[str, Any] = field(default_factory=dict)    # what verified it (mode, results); saved
-    base: dict[str, list] = field(default_factory=dict)     # the weights it was made on (base_marks); saved
+    identity: dict[str, Any] = field(default_factory=dict)  # the model it was made on (wsr/identity.py); saved
+    legacy_base: bool = False                  # saved by an older wsr with two aggregate sums instead of hashes
 
     @property
     def n_params_touched(self) -> int:
@@ -106,12 +107,14 @@ class Patch:
 
     # -- persistence -----------------------------------------------------------------------------
     def save(self, out: Path, lm: Optional["LM"] = None) -> None:
-        """`lm`: the unedited model the patch was made on; its marks are written with the patch (base_marks),
-        so applying the patch to other weights can be noticed."""
+        """`lm`: the unedited model the patch was made on. Its exact identity (wsr/identity.py) is written with the
+        patch as identity.json, so applying the patch to other weights is refused."""
         from safetensors.torch import save_file
 
-        if lm is not None and not self.base:
-            self.base = base_marks(lm, self)
+        from .. import identity as ID
+
+        if lm is not None and not self.identity:
+            self.identity = ID.for_patch(lm, self)
         out.mkdir(parents=True, exist_ok=True)
         tensors = {}
         for k, d in enumerate(self.deltas):
@@ -125,8 +128,12 @@ class Patch:
         save_file(tensors, str(out / "patch.safetensors"))
         meta = {"label": self.label, "kind": self.kind, "untie": self.untie,
                 "params": [d.name for d in self.deltas], "spec": _jsonable(self.spec),
-                "checks": _jsonable(self.checks), "base": self.base}
+                "checks": _jsonable(self.checks)}
         (out / "patch.json").write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
+        if self.identity:
+            (out / "identity.json").write_text(json.dumps(self.identity), encoding="utf-8")
+        else:
+            (out / "identity.json").unlink(missing_ok=True)
 
     @classmethod
     def load(cls, path: Path) -> "Patch":
@@ -139,8 +146,10 @@ class Patch:
         for k in list(spec):
             if f"spec.{k}" in t:
                 spec[k] = t[f"spec.{k}"]
+        ident = json.loads((path / "identity.json").read_text(encoding="utf-8")) \
+            if (path / "identity.json").exists() else {}
         return cls(meta["label"], meta["kind"], spec, deltas, meta.get("untie", False), meta.get("checks", {}),
-                   meta.get("base") or {})
+                   ident, legacy_base=bool(meta.get("base")) and not ident)
 
 
 def _jsonable(x: Any) -> Any:
@@ -200,50 +209,17 @@ def _param(lm: LM, name: str) -> nn.Parameter:
     return p
 
 
-@torch.no_grad()
-def base_marks(lm: LM, patch: "Patch") -> dict[str, list]:
-    """For every tensor the patch changes: [sum of squares, sum of absolute values] of the tensor as it is now.
-    Call it on the unedited model. A patch is a difference from these exact weights: a gate or set_columns
-    stores new minus old, so on other weights it writes something else."""
-    out: dict[str, list] = {}
-    for name in dict.fromkeys(d.name for d in patch.deltas):
-        flat = _param(lm, name).detach().reshape(-1)
-        s2 = sa = 0.0
-        for i in range(0, flat.numel(), 1 << 22):
-            c = flat[i:i + (1 << 22)].double()
-            s2 += float((c * c).sum())
-            sa += float(c.abs().sum())
-        out[name] = [s2, sa]
-    return out
+def identity_check(lm: LM, patch: "Patch", *, patched: bool = False) -> dict[str, Any]:
+    """Is this the model the patch was made on (or, with `patched`, that model with this patch applied)? Exact, by
+    tensor hashes (wsr/identity.py): {verdict: same | different | unverified, why, ...}. "unverified": the patch
+    records no identity (saved by an older wsr, or without the model)."""
+    from .. import identity as ID
 
-
-SAME, CLOSE = 1e-9, 1e-3      # relative difference of the marks: summation order only / another 16-bit rounding
-
-
-def base_check(lm: LM, patch: "Patch") -> tuple[str, str]:
-    """Is this the model the patch was made on? ("same" | "close" | "different" | "unknown", why).
-    "close": the marks differ a little, as when the model is loaded in another precision; "unknown": the patch
-    carries no marks (made by an older wsr)."""
-    if not patch.base:
-        return "unknown", "the patch does not record the weights it was made on"
-    named = dict(lm.model.named_parameters(remove_duplicate=False))
-    missing = [n for n in patch.base if n not in named]
-    if missing:
-        return "different", f"this model has no tensor {missing[0]}"
-    now = base_marks(lm, Patch("", "", deltas=[Delta(n, torch.zeros(1, 1), torch.zeros(1, 1)) for n in patch.base]))
-    worst, where = 0.0, ""
-    for n, was in patch.base.items():
-        for a, b in zip(was, now[n]):
-            r = abs(a - b) / max(abs(a), abs(b), 1e-30)
-            if r > worst:
-                worst, where = r, n
-    if worst <= SAME:
-        return "same", ""
-    if worst <= CLOSE:
-        return "close", (f"the weights differ slightly from the ones the patch was made on (relative {worst:.1e} in "
-                         f"{where}): another precision, or a close variant of the model")
-    return "different", (f"{where} differs from the tensor the patch was made on (relative {worst:.1e}): these are "
-                         "other weights")
+    if not patch.identity:
+        why = ("the patch records only two aggregate sums of its base tensors (an older wsr), which cannot identify "
+               "the weights" if patch.legacy_base else "the patch records no identity of the model it was made on")
+        return {"verdict": "unverified", "why": why}
+    return ID.check(lm, patch.identity, patched=patch.identity.get("patched") if patched else None)
 
 
 def fits(lm: LM, patch: "Patch") -> None:

@@ -482,8 +482,10 @@ _ROLE_HEADER = re.compile(
     r"<\|im_start\|>\s*(?:user|assistant|system)|<start_of_turn>\s*(?:user|model)|"
     r"<\|start_header_id\|>\s*(?:user|assistant)|<\|(?:user|assistant)\|>", re.I)
 _THINK = re.compile(r"</?think>|</?thinking>|<\|channel\|?>|^thought\s*\n", re.I | re.M)
+# Finish reasons that mean the model ended the reply itself (not a length cap).
+_NATURAL_STOP = {"stop", "end_turn", "stop_sequence", "eos"}
 # Bump when a detector changes: cached labels (regression baselines, original replies) are keyed on it.
-DETECTOR_VERSION = 2
+DETECTOR_VERSION = 3
 
 _REFUSAL = re.compile(
     r"\b(?:i(?:'m| am)?\s*(?:sorry|afraid)[^.]{0,120}?\b(?:can(?:no|')t|unable|not able|won't|will not|"
@@ -622,9 +624,30 @@ def repetition_avoidance_score(text: str, penalised: bool = False, min_tokens: i
     return _clamp((pivot - r) / 0.10), {"recurrence": round(r, 3), "tokens": len(toks)}
 
 
-def broken_utf8_score(text: str) -> tuple[float, int]:
-    """Replacement characters and lone surrogates: bytes that never formed valid UTF-8."""
-    n = sum(1 for c in text if c == "\ufffd" or 0xD800 <= ord(c) <= 0xDFFF)
+def _bad(c: str) -> bool:
+    return c == "\ufffd" or 0xD800 <= ord(c) <= 0xDFFF
+
+
+def cut_tail(text: str) -> int:
+    """Replacement characters at the very end (up to 3, after optional whitespace): the bytes of one character
+    whose remaining bytes were never generated because the reply stopped there. A UTF-8 character has at most 4
+    bytes, so a cut leaves at most 3 dangling ones."""
+    t = text.rstrip()
+    k = 0
+    while k < len(t) and k < 4 and _bad(t[len(t) - 1 - k]):
+        k += 1
+    return k if 0 < k <= 3 else 0
+
+
+def broken_utf8_score(text: str, finish_reason: Optional[str] = None) -> tuple[float, int]:
+    """Replacement characters and lone surrogates: bytes that never formed valid UTF-8.
+
+    A reply cut at a token limit can end in the middle of a multibyte character (Devanagari, CJK, emoji): the
+    last 1-3 bytes then decode as replacement characters, though nothing is wrong with the text. Those trailing
+    ones are not counted unless the reply is known to have ended on its own (a stop finish reason)."""
+    n = sum(1 for c in text if _bad(c))
+    if finish_reason is None or finish_reason not in _NATURAL_STOP:
+        n -= cut_tail(text)
     return (1.0 if n >= 3 or (text and n / len(text) > 0.01) else (0.5 if n else 0.0)), n
 
 
@@ -791,7 +814,7 @@ def check_output(text: str, *, preset: str = "chat", finish_reason: Optional[str
     out.append(_f("TOKEN_SALAD", ts, 0.5, f"{ts_ev.get('mixed_words')} of {ts_ev.get('words')} words glue "
                   f"several scripts together ({', '.join(ts_ev.get('scripts', []))})" if ts > 0.5 else
                   "words are single-script", evidence=ts_ev or None))
-    bu, n_bad = broken_utf8_score(text)
+    bu, n_bad = broken_utf8_score(text, finish_reason)
     out.append(_f("BROKEN_UTF8", bu, 0.5, f"{n_bad} invalid UTF-8 sequence(s) (replacement chars / lone "
                   "surrogates)" if n_bad else "valid UTF-8", evidence={"count": n_bad} if n_bad else None))
     ra, ra_ev = repetition_avoidance_score(text, penalised)

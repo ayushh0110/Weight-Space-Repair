@@ -9,9 +9,13 @@ How each part was built is in [DESIGN.md](DESIGN.md); what is not tested is in [
   planted in real weights, or a real failure with a control that rules out chance.
 - **Repair** fixed planted and real failures on Qwen2.5-0.5B and Llama-3.2-1B, and refused, with reasons, to ship
   fixes whose side effects were too large.
-- **`wsr program`** shipped weight patches and steerings that a paired held-out judge accepted: blank replies
-  30% → 85% (z 4.82), over-refusal 81.1% → 91.9% with no harmful-request refusal lost, under-refusal 62.5% →
-  87.5% (z 3.21). It shipped nothing where the judge or a guardrail said no.
+- **Under the current acceptance rules** (an exact sign test, a minimum gain, a confirmation set evaluated once,
+  a semantic canary), two fixes for a bug planted in real weights were accepted and confirmed: a weight patch
+  (validation 18 better / 0 worse, confirmation 15 / 0, p 0.00003) and an activation steering (confirmation 5 / 0,
+  p 0.031). The agent's fixes for Llama's over-refusal and Qwen's under-refusal were not accepted: the first
+  fixed too few items, the second lost simple arithmetic the original model could do.
+- **Earlier runs, under the looser rule (z > 2)**, also shipped an over-refusal fix (4 better, 0 worse) and an
+  under-refusal fix; the first would not pass the exact test, and neither reproduced in the reruns.
 - **The agent** (Claude Opus 5.5, Gemini 3.8 Flash and smaller models) found the exact planted cause in every
   planted case. The guardrails stopped every edit that broke something else.
 - **Scale:** deep diagnosis is tested on models up to 1.5B parameters; repair and `wsr program` up to 1B. Every
@@ -27,10 +31,13 @@ How each part was built is in [DESIGN.md](DESIGN.md); what is not tested is in [
 | Bugs planted in real weights | blank-reply neurons (Qwen layer 16 #0, Llama layer 10 #0), a self-reinforcing "Penguin" neuron (Qwen layer 18 #0), corrupted MLP columns (Qwen layer 12), RoPE positions aliased to multiples of 8, damaged Q4_0 blocks |
 | Real failures | over-refusal (Qwen 1.5B, Llama-1B on XSTest), under-refusal (Qwen 0.5B on XSTest), wrong language (Qwen 0.5B), loops (Qwen 0.5B lists, Llama-1B on MATH-500), the official Q4_0 refusing a harmless request |
 | Controls | shuffled-label directions, random heads and neurons, an unrelated language pair, random edits and random steering directions of the same size, held-out prompts |
-| The judge | the original and the candidate on the same held-out items and seeds; "improved" needs a paired gain above 2 standard errors, at least 5 scored items and every guardrail holding; the one-sided sign test is reported beside it |
+| The judge (current) | the original and the candidate on the same items and seeds; "improved" needs the exact one-sided sign test below 0.05 (divided by the number of candidates a run may judge), a gain of at least 5 points and every guardrail holding; z is reported only |
+| The judge (earlier runs) | a paired gain above 2 standard errors and at least 5 scored items; the rows below say which earlier results the current rule would reject |
+| Confirmation | a third data set, evaluated once on the one frozen candidate that passed validation, then recorded as used (by its content); its size is fixed before anything runs |
+| Semantic canary | 32 deterministic items (arithmetic, units, sequences, comparisons, facts, instruction formats) with computed or hand-checked answers; only items the original gets right count; at most 1 may be lost |
 | Agents | Claude Opus 5.5 (through a test-only driver for the Kiro CLI, not part of wsr), Gemini 3.8 Flash (AI Studio's OpenAI-compatible endpoint), Nemotron 3 Ultra (OpenRouter free tier), Gemma 4 E2B (local, llama-server on the CPU) |
 | Hardware | GTX 1650 4 GB, CUDA 12.4, float32 by default (float16 for 1.5B), 15 GB RAM |
-| Automated tests | 340 passing, including regression tests built from real model replies |
+| Automated tests | 363 passing, including regression tests built from real model replies |
 
 ## Triage and deep diagnosis: proven against a known answer
 
@@ -132,9 +139,33 @@ the middle layers chose 12 and 22, which stayed selective on held-out pairs (rep
 nats per token), as did the published layers 15 and 19. Measured on teacher-forced pairs, not generated
 solutions.
 
-## `wsr program`: judged on held-out data
+## `wsr program` under the current rules
 
-Each row is a goal with a practice set the tools may use and a held-out set they never see.
+Rerun on new goals built for these rules: practice, validation and a confirmation set, split from the same data
+before any candidate ran, with the confirmation share fixed in advance. Every run records its decision in the
+fix's `MANIFEST.json`.
+
+| Goal | Model | Fix | Validation | Confirmation (once) | Decision |
+|---|---|---|---|---|---|
+| Planted blank replies, goal A (5 failing items held for confirmation) | Qwen2.5-0.5B | zero neuron 16 #0 (playbook) | 6 better, 0 worse of 12, p 0.016; suite and canary hold | 4 better, 0 worse of 11, p 0.0625 | **inconclusive, not shipped**: one item short of significance on a set this small |
+| Planted blank replies, goal A2 (fresh questions; confirmation share fixed at 0.3, at least 10 failing items required in advance) | Qwen2.5-0.5B | sparse projection on the neurons writing the failure (playbook) | 18 better, 0 worse of 28, p 0.000004; drift 0.015, canary 22 eligible, 1 lost | 15 better, 0 worse of 23, p 0.00003 | **shipped, confirmed** |
+| Planted blank replies, goal B, weights not allowed to change | Qwen2.5-0.5B | clamp steering after layer 14, the most causal layer | 6 better, 0 worse, p 0.016 | 5 better, 0 worse, p 0.031 | **steering recommended, confirmed** |
+| Goal A judged on the served file (llama-server, Q8_0, both files on build b10244) | Qwen2.5-0.5B | the same patch as goal A | 6 better, 0 worse on Q8_0, p 0.016; on the GGUF the canary (25 eligible, 0 lost) and the suite's reply checks hold; drift checks on PyTorch | refused: the set was already used | not shipped (the confirmation set is used once) |
+| Over-refusal (XSTest safe prompts, 14 refused) | Llama-3.2-1B | playbook | — | not used | **no candidate**: the edit that fixed it stopped refusing 2 of 3 harmful requests |
+| Over-refusal, the same goal | Llama-3.2-1B | agent (Opus 5.5, 27 turns): a rank-4 learned edit at layer 8 | 2 better, 0 worse of 7 failing, p 0.5 after the correction for 2 candidates; every refusal kept, canary 0 lost | not used | **inconclusive**: too few items fixed |
+| Under-refusal (XSTest harmful prompts, 24 answered) | Qwen2.5-0.5B | playbook | — | not used | **no candidate**: the closest steering drifted 0.180 nats per token (limit 0.15) |
+| Under-refusal, the same goal | Qwen2.5-0.5B | agent (Opus 5.5, 32 turns): a rank-4 learned edit on attention layers 10-12 | 88% → 96%, 6 better, 0 worse, p 0.031 | not used | **rejected by guardrails**: the canary lost 3 items the original got right (one sum, two comparisons) |
+
+The under-refusal run also flagged a Hindi suite reply as garbage: the reply had been cut by the token limit in
+the middle of a character. The agent worked this out in its notes (the original model's reply does the same at
+96 tokens). The detector now ignores a character cut at the very end of a reply that stopped at the limit; the
+canary loss alone still rejects that edit.
+
+## Earlier `wsr program` runs (before the stricter rules)
+
+Judged by the earlier rule (a paired gain above 2 standard errors, at least 5 items), with no confirmation set
+and no canary. The current rule would reject the over-refusal fix below (4 better, 0 worse: exact p 0.0625), and
+neither it nor the under-refusal fix reproduced in the reruns above.
 
 | Goal | Model | Who found it | What | Held-out | Verdict |
 |---|---|---|---|---|---|
@@ -176,7 +207,8 @@ practice set that looked like wins, and the guardrails stopped every edit that t
 | Gemma 4 E2B (local, CPU, free) | planted Llama blank, playbook skipped | 7 | fixed, 1 verification, after 3 earlier runs exposed a crash, runaway thinking and unclear tool errors (all fixed) |
 | Nemotron 3 Ultra (OpenRouter free tier) | Llama's router over-refusal | 25 and 20 | explored but built no edit before the turn limit; since then the agent is told its remaining budget every turn |
 | Gemini 3.8 Flash | Llama MATH loops | 64 | 4 edits built (3 refused by the size cap or the gate guard), 0/8 decision flips; stopped at the $1.50 cap; 92% of input from the prompt cache |
-| Claude Opus 5.5 | eight failure types (table above) | 15 (toy), 24 (over-refusal, MATH loops) | found the exact planted cause each time; 4 fixes shipped, every unsafe or overfitted edit stopped |
+| Claude Opus 5.5 | eight failure types (earlier table) | 15 (toy), 24 (over-refusal, MATH loops) | found the exact planted cause each time; 4 fixes shipped under the earlier rule, every unsafe or overfitted edit stopped |
+| Claude Opus 5.5, current rules | Llama over-refusal; Qwen under-refusal | 27; 32 | a learned edit that kept every refusal but fixed 2 of 7 (inconclusive); a learned edit that fixed the task but lost canary items (rejected) |
 
 The runs found and fixed eight wsr bugs: a verification demand no edit could meet, a system-prompt setting that
 never reached the model, no diagnosis kind for under-refusal, over-cautious memory estimates in `fit_edit`, a
@@ -213,12 +245,25 @@ the fix: a saved patch's base check says "same" for its own model (also loaded i
 another model of the same shape (0.8% difference in the edited tensor). The full list is in DESIGN.md
 section 18.
 
+## Second review: stricter acceptance
+
+After two outside reviews, the acceptance rules were tightened before the reruns above: the exact sign test and a
+minimum gain decide (z is reported only), runs that may judge two candidates test each at half the level, an
+optional confirmation set is evaluated once per frozen candidate and recorded as used by its content, a semantic
+canary checks answers the original got right, a patch records exact hashes of every tensor of its model (and
+the commands that apply or export it refuse other weights), guardrails run on the served GGUF against the
+unpatched GGUF of the same quantisation, and every judged fix carries a MANIFEST.json with its evidence. The
+reruns found four bugs, all fixed: the converter's output decoded with the wrong code page on Windows, the
+report crashing on a served-file guardrail, a steering's control recorded under the wrong name, and the
+truncated-character false alarm above. DESIGN.md section 19 has the details.
+
 ## Not proven
 
 The short list; [LIMITATIONS.md](LIMITATIONS.md) has all of it.
 
 - Nothing above 1.5B parameters (diagnosis) or 1B (repair); Gemma and Mistral untested at the weight level.
-- Held-out sets of 20 to 40 items, and one agent run per case except where noted.
+- Small sets: validation sets of 12 to 121 items with 6 to 18 failing, confirmation sets with 5 to 15 failing;
+  one agent run per case.
 - The Anthropic provider (the default for `--agent`) has not been run live.
 - No baseline comparisons with other tools (abliteration tools, fine-tuning).
 - Failures that only llama.cpp's integer kernels cause, real long-context RoPE failures, and naturally occurring

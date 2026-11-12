@@ -151,7 +151,9 @@ GROUPS = {"models": "per-model results: regression baselines, original replies, 
                     "calibrated probes",
           "gguf": "GGUF conversions of original models (for the llama-server judge)",
           "datasets": "converted public datasets (wsr data fetch)",
-          "converter": "the downloaded llama.cpp converter source"}
+          "converter": "the downloaded llama.cpp converter source",
+          "identity": "exact tensor hashes of model checkpoints (computed again when needed)",
+          "legacy": "probe caches written by older wsr versions (no longer read)"}
 
 _MODEL_ENTRY = re.compile(r".+-[0-9a-f]{20}$")                    # <model folder name>-<key>, as model_key writes it
 _GGUF_ENTRY = re.compile(r".+-[0-9a-f]{12}\.[A-Za-z0-9_]+\.gguf$")  # <model>-<key>.<quant>.gguf (program/judge.py)
@@ -174,6 +176,13 @@ def _group_paths(group: str) -> list[Path]:
         return sorted(p for p in (d / f"{n}.jsonl" for n in SOURCES) if p.is_file())
     if group == "converter":
         return sorted(p for p in b.glob("llama.cpp-*") if (p / "convert_hf_to_gguf.py").is_file())
+    if group == "identity":
+        d = b / "identity"
+        if not d.is_dir():
+            return []
+        return sorted(p for p in d.iterdir() if p.is_file() and re.match(r".+-[0-9a-f]{20}\.json$", p.name))
+    if group == "legacy":
+        return [p for p in (b / "langprobe", b / "copyheads") if p.is_dir()]
     return []
 
 

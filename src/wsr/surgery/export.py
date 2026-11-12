@@ -47,7 +47,7 @@ def server_tag(server: Optional[Path]) -> Optional[str]:
     if server is None:
         return None
     try:
-        out = subprocess.run([str(server), "--version"], capture_output=True, text=True, timeout=30,
+        out = subprocess.run([str(server), "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
                              cwd=str(server.parent))
     except (OSError, subprocess.SubprocessError):
         return None
@@ -111,6 +111,29 @@ def _quantize_bin(server: Optional[Path]) -> Optional[Path]:
 
 def _model_bytes(d: Path) -> int:
     return sum(f.stat().st_size for f in d.glob("*.safetensors")) or sum(f.stat().st_size for f in d.glob("*.bin"))
+
+
+def verify_source(model_dir: Path, patch_dir: Path, *, allow_base_mismatch: bool = False,
+                  allow_unverified_legacy: bool = False, log=None) -> dict:
+    """Before a patch is written into files: are these the files of the model it was made for? Exact, in each
+    tensor's stored dtype (wsr/identity.py). Refuses (ValueError) unless the user allowed the difference."""
+    from .. import identity as ID
+    from . import edits as E
+
+    patch = E.Patch.load(patch_dir)
+    if not patch.identity:
+        if not allow_unverified_legacy:
+            raise ValueError("cannot verify the source checkpoint: the patch records no exact identity of its model "
+                             "(--allow-unverified-legacy to export it anyway)")
+        r = {"verdict": "unverified"}
+    else:
+        r = ID.check_files(model_dir, patch.identity)
+        if r["verdict"] != "same" and not allow_base_mismatch:
+            raise ValueError(f"{r['why']}: the patch was not made for these files, so the GGUF would not hold the edit "
+                             "that was checked (--allow-base-mismatch to export it anyway)")
+    if r["verdict"] != "same" and log:
+        log(f"  WARNING: exporting a patch whose source could not be verified ({r['verdict']})")
+    return r
 
 
 def patch_files(model_dir: Path, patch_dir: Path, dst: Path) -> bool:
@@ -210,11 +233,15 @@ def _ram_available() -> Optional[int]:
 
 
 def export(model_dir: Path, patch_dir: Optional[Path], out: Path, *, quant: str = "Q8_0", consent: Consent,
-           llama_cpp: Optional[str] = None, server: Optional[Path] = None, log=print, lm=None) -> dict:
+           llama_cpp: Optional[str] = None, server: Optional[Path] = None, log=print, lm=None,
+           allow_base_mismatch: bool = False, allow_unverified_legacy: bool = False) -> dict:
     """Write `out` (a GGUF of the patched model, or of the model itself when patch_dir is None). `lm`: the model
     already in memory (unpatched), used to write the patched copy instead of loading a second one."""
     say = log or (lambda s: None)
     quant = quant.upper()
+    source_check = (verify_source(model_dir, patch_dir, allow_base_mismatch=allow_base_mismatch,
+                                  allow_unverified_legacy=allow_unverified_legacy, log=say)
+                    if patch_dir is not None else None)
     size = _model_bytes(model_dir)
     # The in-memory model is reused only in float32: a 16-bit checkpoint round-trips exactly through float32,
     # but not through another 16-bit type (bf16 <-> fp16 loses small weights), and the candidate must be
@@ -284,13 +311,13 @@ def export(model_dir: Path, patch_dir: Optional[Path], out: Path, *, quant: str 
         env = {**os.environ, "PYTHONPATH": str(conv / "gguf-py") + os.pathsep + os.environ.get("PYTHONPATH", ""),
                "NO_LOCAL_GGUF": ""}
         r = subprocess.run([sys.executable, str(conv / "convert_hf_to_gguf.py"), str(src), "--outfile", str(first),
-                            "--outtype", outtype], capture_output=True, text=True, env=env)
+                            "--outtype", outtype], capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
         if r.returncode != 0:
             raise ValueError("llama.cpp's converter failed: " + _tool_error(r))
         say(f"  converted -> {first.name} ({outtype})")
         if quant not in FLOAT_TYPES:
             assert qbin is not None
-            r = subprocess.run([str(qbin), str(first), str(out), quant], capture_output=True, text=True,
+            r = subprocess.run([str(qbin), str(first), str(out), quant], capture_output=True, text=True, encoding="utf-8", errors="replace",
                                cwd=str(qbin.parent))
             if r.returncode != 0:
                 raise ValueError("llama-quantize failed: " + _tool_error(r))
@@ -300,8 +327,12 @@ def export(model_dir: Path, patch_dir: Optional[Path], out: Path, *, quant: str 
         raise
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    from ..identity import _file_sha
+
     return {"gguf": str(out), "quant": quant, "converter": str(conv), "tag": tag,
-            "bytes": out.stat().st_size if out.exists() else 0}
+            "bytes": out.stat().st_size if out.exists() else 0,
+            "sha256": _file_sha(out) if out.exists() else None,
+            "source_check": (source_check or {}).get("verdict")}
 
 
 __all__ = ["export", "find_converter", "fetch_converter", "server_tag", "NeedsConsent"]

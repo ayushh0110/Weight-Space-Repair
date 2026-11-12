@@ -695,6 +695,7 @@ class _Ctx:
     sampled: Optional[dict] = None          # {"cfg": ..., "before": [...]}
     pairs: list = field(default_factory=list)
     sel0: Optional[dict] = None
+    canary: Optional[list] = None           # the unedited model's canary rows (surgery/canary.py)
 
 
 def _verify(x: _Ctx, patch: Optional[E.Patch], step: dict[str, Any]) -> list[str]:
@@ -712,6 +713,12 @@ def _verify(x: _Ctx, patch: Optional[E.Patch], step: dict[str, Any]) -> list[str
     probs = x.budget.problems(reg)
     if probs:
         return ["fixes it, but " + "; ".join(probs)]
+    if x.canary is not None and getattr(x.budget, "canary_max_lost", None) is not None:
+        from . import canary as CN
+        cn = CN.compare(x.canary, CN.run(lm, x.template_kwargs, original=False), x.budget.canary_max_lost)
+        step["canary"] = cn
+        if not cn["holds"]:
+            return ["fixes it, but " + "; ".join(cn["problems"])]
     if x.mode == "deep" and x.fresh is not None:
         if x.fresh["failing"]:
             x.fresh["consulted"] += 1
@@ -830,6 +837,15 @@ def _prepare(lm: LM, res: Any, *, mode: str, clf: Classifier, confirm: tuple[str
     return fresh, sb, prs, sel0, sm
 
 
+def _canary0(lm: LM, budget: R.Budget, template_kwargs: Optional[dict]) -> Optional[list]:
+    """The unedited model on the canary (cached with its batch plan), unless the budget turns it off."""
+    if getattr(budget, "canary_max_lost", None) is None:
+        return None
+    from . import canary as CN
+
+    return CN.run(lm, template_kwargs, original=True)
+
+
 def _mode_name(mode: str, sampled: Optional[dict]) -> str:
     return mode + ("+sampled" if sampled and mode == "deep" else "")
 
@@ -889,7 +905,8 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
             cands = sorted([sc] + cands, key=lambda cd: _SCOPE_ORDER.get(cd.scope, 9))
     if not cands:
         base = R.baseline(lm, keep=keep, keep_lang=expect_lang or "en", template_kwargs=template_kwargs)
-        x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0)
+        x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0,
+             canary=_canary0(lm, budget, template_kwargs))
         trials: list[dict] = []
         if playbook and steering != "off":
             got = _try_steering(x, A.targets(lm, c), trials, say)
@@ -910,7 +927,8 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
         if g:
             cands = sorted(cands + g, key=lambda cd: _SCOPE_ORDER.get(cd.scope, 9))
             say(f"  + {g[0].label}: {g[0].evidence}")
-    x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0)
+    x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0,
+             canary=_canary0(lm, budget, template_kwargs))
     trials: list[dict] = []
     for cand in cands:
         row: dict[str, Any] = {"candidate": cand.label, "scope": cand.scope, "evidence": cand.evidence, "steps": []}
@@ -1186,12 +1204,25 @@ def _steered(entry: Entry, st: Steering, step: dict, trials: list, checks: dict,
             f"{tg['of']} failing prompts pass, {tg['passing_kept']}/{tg['passing']} working prompts still pass; on "
             f"{reg['prompts']} regression prompts {_drift(reg)}, harmful requests still refused "
             f"{reg['safety_refused_before'] - len(reg['safety_lost'])}/{reg['safety_refused_before']}")
-    for key in ("fresh", "sampled", "control"):
+    for key in ("fresh", "sampled", "control", "canary"):
         if key in step:
             checks[key] = step[key]
     checks["steering"] = st.as_dict()
+    checks["evidence"] = repair_evidence(checks)
     return Repair("steered", entry.name, summ, trials=trials, regression=reg, target=tg, seconds=seconds, mode=mname,
                   checks=checks, ctx=x, steering=st)
+
+
+def repair_evidence(checks: dict) -> dict:
+    """What an accepted fix rests on (wsr/evidence.py): the edit or steering is an intervention; a random control
+    that the fix beat is a control; fresh variants that took no part in the choice are generalization."""
+    from ..evidence import make
+
+    co = checks.get("control") or {}
+    fr = checks.get("fresh") or {}
+    control = "random_direction_same_size" if "steering" in checks else "random_edit_same_size"
+    return make(intervention=True, controls=[control] if co.get("specific") else [],
+                generalization=["fresh_variants"] if "fixed" in fr and fr.get("of") else [])
 
 
 def _fixed(entry: Entry, patch: E.Patch, tg: dict, reg: dict, step: dict, trials: list, checks: dict, c: Any,
@@ -1205,7 +1236,7 @@ def _fixed(entry: Entry, patch: E.Patch, tg: dict, reg: dict, step: dict, trials
             f"{reg['safety_refused_before']}"
             + (f"; it also fixes {len(reg['also_fixed'])} regression prompt(s) that failed before ("
                + ", ".join(r["prompt"] for r in reg["also_fixed"]) + ")" if reg.get("also_fixed") else ""))
-    for key in ("serving", "fresh", "sampled", "control", "continuations"):
+    for key in ("serving", "fresh", "sampled", "control", "continuations", "canary"):
         if key in step:
             checks[key] = step[key]
     if x.fresh is not None and isinstance(checks.get("fresh"), dict):
@@ -1232,6 +1263,7 @@ def _fixed(entry: Entry, patch: E.Patch, tg: dict, reg: dict, step: dict, trials
         # no sense, and the model's own likelihood ranks a correct Ukrainian answer lower still.
         summ += ("; note: the detectors check the reply's language, not its meaning - read the "
                  "samples in REPAIR.md before shipping the patch")
+    checks["evidence"] = repair_evidence(checks)
     patch.checks = {"mode": mname, "status": status, **{k: v for k, v in checks.items() if k != "sites"}}
     return Repair(status, entry.name, summ, patch=patch, trials=trials, regression=reg, target=tg,
                   seconds=seconds, mode=mname, checks=checks, ctx=x)
@@ -1254,7 +1286,8 @@ def check(lm: LM, res: Any, patch: E.Patch, *, expect_lang: Optional[str] = None
     fresh, sb, prs, sel0, _ = _prepare(lm, res, mode=mode, clf=clf, confirm=confirm,
                                        sampled=sampled if mode == "deep" else None, say=say)
     base = R.baseline(lm, keep=keep, keep_lang=expect_lang or "en", template_kwargs=template_kwargs)
-    x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0)
+    x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0,
+             canary=_canary0(lm, budget, template_kwargs))
     checks: dict[str, Any] = {}
     step: dict[str, Any] = {"strength": "as saved", "weights_changed": patch.n_weights_changed}
     trials = [{"candidate": patch.label, "scope": "given", "evidence": "the patch given to --check", "steps": [step]}]
@@ -1386,6 +1419,30 @@ def save_patched_model(lm: LM, patch: E.Patch, out: Path, dtype: Optional[torch.
     lm.tok.save_pretrained(str(out))
 
 
+def _repair_manifest(rep: Repair, d: Path, lm: LM, kind: str, label: str) -> None:
+    """MANIFEST.json for a fix from `wsr repair`: the checks it passed on its own prompts and the regression suite.
+    There is no held-out judgement here (wsr program gives one), and the manifest says so."""
+    from .. import manifest as MF
+
+    ok = rep.status in ("fixed", "verified", "steered")
+    reg = rep.regression or {}
+    rails = {"wsr_regression": {"kind": "suite", "holds": ok,
+                                **{k: reg.get(k) for k in ("new_failures", "safety_lost", "mean_delta_nll",
+                                                           "top1_agreement") if k in reg}}}
+    cn = (rep.checks or {}).get("canary")
+    if cn:
+        rails["semantic_regression_canary"] = {"kind": "canary", **{k: cn.get(k) for k in ("holds", "eligible", "lost")}}
+    MF.write(d, {"kind": kind, "artifact": {"label": label, "by": "wsr repair (" + rep.mode + ")"},
+                 "model": MF.model_record(lm),
+                 "statistics": {"target": rep.target and {k: rep.target.get(k) for k in ("fixed", "of", "passing_kept",
+                                                                                         "passing")}},
+                 "guardrails": {"pytorch": rails}, "evidence": (rep.checks or {}).get("evidence"),
+                 "decision": {"status": rep.status, "shipped": ok,
+                              "why": "checked on its failing and working prompts and the regression suite; not judged "
+                                     "on held-out data (wsr program does that)",
+                              "deployable": {"pytorch": ok}}})
+
+
 def write(rep: Repair, out: Path, lm: Optional[LM] = None, save_model: bool = False) -> None:
     import json
 
@@ -1403,6 +1460,8 @@ def write(rep: Repair, out: Path, lm: Optional[LM] = None, save_model: bool = Fa
         from . import steer as SV
         d = SV.save(rep.steering.vector, rep.steering.alpha, rep.steering.layers, rep.steering.label, out,
                     mode=rep.steering.mode)
+        if lm is not None:
+            _repair_manifest(rep, d, lm, "steering", rep.steering.label)
         lines += [f"Steering: {rep.steering.label} ({rep.steering.mode}, alpha {rep.steering.alpha:.3f}, layers "
                   f"{rep.steering.layers}); no weights change. Files in `{d}` (vector, settings, APPLY.md).", ""]
     if rep.patch:
@@ -1429,5 +1488,7 @@ def write(rep: Repair, out: Path, lm: Optional[LM] = None, save_model: bool = Fa
     (out / "REPAIR.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if rep.patch:
         rep.patch.save(out / "patch", lm)
+        if lm is not None:
+            _repair_manifest(rep, out / "patch", lm, "patch", rep.patch.label)
         if save_model and lm is not None:
             save_patched_model(lm, rep.patch, out / "model", serve_dtype(lm, "auto"))

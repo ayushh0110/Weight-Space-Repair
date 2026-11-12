@@ -1798,7 +1798,55 @@ Known and not changed:
   stand-in client; the live runs so far used Gemini (OpenAI-compatible endpoint) and Kiro.
 - A single slow torch call in the workspace cannot be interrupted (the deadline is checked between operations).
 - The judge's bar is z > 2 on the paired difference; on few changed items that is more generous than the
-  sign test, which is why both are printed.
+  sign test, which is why both are printed. (Changed in section 19: the exact test now decides.)
 - The agent's state is rewritten after every turn (up to 1 GB of workspace tensors).
 - The file-level GGUF export (`patch_files`) does not compare the patch's base marks; `wsr patch apply` does.
+  (Changed in section 19: the export checks exact hashes first.)
 
+## 19. Second review round: an acceptance rule that cannot be argued with
+
+Three outside reviews of the repository agreed on one point: the judge's bar (a paired gain above 2 standard
+errors) was the weakest link. With few changed items z is optimistic (4 wins and no loss is z 2.09 and an exact
+p of 0.0625), the held-out set judged every candidate a run produced, and a patch carried only marks of its base
+tensors. Each suggestion was checked before it was taken; some were adapted (a full multiple-comparison
+correction across every run a user makes is not enforceable locally, so the correction counts the candidate
+slots of one run, and the confirmation set does the rest).
+
+| Area | Before | Now |
+|---|---|---|
+| Decision | z > 2, at least 5 scored items; the sign test printed | the exact one-sided sign test below alpha / m (m = 1, or 2 when an agent may judge after the playbook; with stopping at the first acceptance this equals Holm), a gain of at least `min_gain`, at least 5 scored items, every guardrail; z reported only; `inconclusive` with its reason instead of "no clear change" (`evaluate.decide`, `evaluate.power`) |
+| Data | practice and held-out | practice, validation (the old held-out set; `validation` is an alias) and an optional confirmation set, evaluated once on one frozen candidate, recorded as used by its content hash (`program/confirm.py`); a power check before any candidate; `from-failure` splits three ways and never shrinks validation (`_three_way`) |
+| Meaning | detectors only | `semantic_regression_canary` (`surgery/canary.py`): 32 deterministic items, per-item grader, only items the original gets right count, at most one lost; in the playbook's checks, the goal guardrails, and the steering and settings judges |
+| Identity | marks of the base tensors; `--force` | SHA-256 of every tensor in the file's precision, model metadata, and the edited tensors' hashes after the edit (`identity.py`); apply, export, evaluate and check fail closed; `--allow-base-mismatch`, `--allow-unverified-legacy`; revert is verified |
+| Provenance | `PROGRAM.md` | `MANIFEST.json` per judged fix (`manifest.py`): model, artifact and candidate hashes, data-set hashes, grader / detector / canary versions, protocol, statistics per stage, guardrails per format, evidence, decision; `wsr patch show / check` |
+| Quantised | guardrails on PyTorch only | the canary and the suite's reply checks on the patched GGUF against the unpatched GGUF of the same quantisation; drift and agreement marked "not supported" there; `deployable` per format with the server build |
+| Evidence | one confidence | five dimensions (`evidence.py`): observation, intervention, controls, generalization, replication; a validation pass is never replication |
+
+**Reruns under the new rules** (RESULTS.md has the table). Goal A, the planted blank-reply neuron with a small
+three-way split, passed validation (6 / 0, p 0.016) and fell one item short on confirmation (4 / 0, p 0.0625):
+inconclusive, not shipped. Adding items to that confirmation set after seeing its result would have been the
+exact fault the set exists to prevent, so a fresh goal A2 was built instead, with new questions and the
+confirmation share fixed before anything ran; its fix shipped confirmed (validation 18 / 0, confirmation 15 / 0).
+The steering-only goal B shipped confirmed. The agent's over-refusal and under-refusal fixes did not pass:
+the first fixed 2 items (p 0.5 after correction), the second lost 3 canary items, which the old rules had no way
+to see.
+
+**Bugs the reruns found**, each fixed with a test:
+
+- the llama.cpp converter's output was decoded with the Windows code page and crashed on its own Unicode output
+  (`encoding="utf-8", errors="replace"`);
+- the report crashed rendering a suite guardrail measured on the GGUF (no `unchanged_replies` there);
+- a steering's random control was recorded as `random_edit_same_size` (now `random_direction_same_size`);
+- `wsr cache` did not show or clear the identity hashes and the older probe caches;
+- a reply cut at the token cap in the middle of a multibyte character (a Hindi suite reply at 48 tokens) ended
+  in a replacement character and was called garbage. The agent found this from its notes. A trailing run of 1 to
+  3 replacement characters is no longer counted unless the reply ended on its own (`output.cut_tail`;
+  `DETECTOR_VERSION` 3, which changes the cache keys of every stored label).
+
+Known and not changed:
+
+- The confirmation registry is local to the cache folder; it prevents accidental reuse, not deliberate reuse.
+- The canary is 32 English items; it guards simple answers, not open-ended quality.
+- Drift on the GGUF is not measured.
+- Exact identity refuses a model re-saved by a tool that rounds differently, even when it is the same model in
+  practice.

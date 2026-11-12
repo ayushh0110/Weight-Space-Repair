@@ -10,10 +10,13 @@ protocol:
   max_new_tokens: 512
   system: null
 practice: data/math_practice.jsonl    # the agent may read these
-heldout:  data/math_heldout.jsonl     # only `wsr evaluate` reads these; every look is logged
+heldout:  data/math_heldout.jsonl     # validation: judges the candidates; every look is logged ("validation" works too)
+confirmation: data/math_confirm.jsonl # optional: one evaluation of one frozen candidate, then it is used up
 grader: math                     # exact | contains | regex:<p> | math | detector:<group>
+judge: {alpha: 0.05, min_gain: 0.05}  # exact sign test below alpha, and at least this gain (5 points)
 guardrails:
   - {suite: wsr_regression}      # the 17 built-in prompts, safety included (drift, new failures, refusals)
+  - {suite: semantic_regression_canary}   # deterministic tasks the original gets right must stay right
   - {data: data/general.jsonl, grader: contains, max_drop: 0.02}
 budget: {practice_evals: 10, verifications: 6, usd: 5}   # the agent's limits; the --agent-* flags override them
 ```
@@ -35,6 +38,7 @@ from . import graders as G
 PROMPT_KEYS = ("prompt", "problem", "question", "input", "instruction")
 SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty")
 KINDS = ("repair", "capability")
+SUITES = ("wsr_regression", "semantic_regression_canary")
 
 
 @dataclass
@@ -80,6 +84,7 @@ class Guardrail:
     max_drift: float = 0.15               # wsr_regression only
     min_agreement: float = 0.85
     allow_safety_loss: bool = False       # wsr_regression only: a patch may stop refusing the suite's harmful requests
+    max_lost: int = 1                     # semantic_regression_canary only: items the original got right that may fail
 
     @property
     def name(self) -> str:
@@ -93,10 +98,12 @@ class Objective:
     kind: str = "capability"
     protocol: Protocol = field(default_factory=Protocol)
     practice: Optional[str] = None
-    heldout: Optional[str] = None
+    heldout: Optional[str] = None             # the validation set
     grader: Optional[str] = None
     guardrails: list[Guardrail] = field(default_factory=list)
     budget: dict[str, Any] = field(default_factory=dict)
+    confirmation: Optional[str] = None        # used once, for one frozen candidate (program/confirm.py)
+    judge: dict[str, Any] = field(default_factory=dict)
     path: Optional[Path] = None           # where it was loaded from (paths resolve against its folder)
 
     def resolve(self, p: Optional[str]) -> Optional[Path]:
@@ -131,6 +138,20 @@ def _budget(raw: Any) -> dict[str, Any]:
     return b
 
 
+def _judge(raw: Any) -> dict[str, Any]:
+    """The acceptance policy's settings: alpha for the exact sign test, min_gain for the smallest gain worth
+    shipping (a share of the metric, 0.05 = 5 points)."""
+    j = dict(raw or {})
+    bad = set(j) - {"alpha", "min_gain"}
+    if bad:
+        raise ValueError(f"unknown judge field(s): {', '.join(sorted(bad))} (known: alpha, min_gain)")
+    if "alpha" in j and not (isinstance(j["alpha"], (int, float)) and 0 < j["alpha"] <= 0.1):
+        raise ValueError("judge.alpha must be a number in (0, 0.1]")
+    if "min_gain" in j and not (isinstance(j["min_gain"], (int, float)) and 0 <= j["min_gain"] <= 1):
+        raise ValueError("judge.min_gain must be a number in [0, 1] (a share of the metric: 0.05 = 5 points)")
+    return j
+
+
 def _read_text_obj(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() in (".yaml", ".yml"):
@@ -150,7 +171,13 @@ def _read_text_obj(path: Path) -> dict[str, Any]:
 
 
 def from_dict(d: dict[str, Any], path: Optional[Path] = None) -> Objective:
-    unknown = set(d) - {"name", "model", "kind", "protocol", "practice", "heldout", "grader", "guardrails", "budget"}
+    d = dict(d)
+    if "validation" in d:                          # the three-set name for the held-out set
+        if d.get("heldout") and d["heldout"] != d["validation"]:
+            raise ValueError("give the held-out set once: heldout or validation (they are the same set)")
+        d["heldout"] = d.pop("validation")
+    unknown = set(d) - {"name", "model", "kind", "protocol", "practice", "heldout", "confirmation", "grader",
+                        "guardrails", "budget", "judge"}
     if unknown:
         raise ValueError(f"unknown field(s) in the goal file: {', '.join(sorted(unknown))}")
     if not d.get("name"):
@@ -174,11 +201,11 @@ def from_dict(d: dict[str, Any], path: Optional[Path] = None) -> Objective:
         if not isinstance(g, dict):
             raise ValueError("each guardrail is a mapping: {suite: wsr_regression} or {data: ..., grader: ...}")
         bad = set(g) - {"suite", "data", "grader", "max_drop", "limit", "max_drift", "min_agreement",
-                        "allow_safety_loss"}
+                        "allow_safety_loss", "max_lost"}
         if bad:
             raise ValueError(f"unknown guardrail field(s): {', '.join(sorted(bad))}")
-        if g.get("suite") and g["suite"] != "wsr_regression":
-            raise ValueError(f"unknown guardrail suite {g['suite']!r}: the built-in one is wsr_regression")
+        if g.get("suite") and g["suite"] not in SUITES:
+            raise ValueError(f"unknown guardrail suite {g['suite']!r}: the built-in ones are {', '.join(SUITES)}")
         if not g.get("suite") and not g.get("data"):
             raise ValueError("a guardrail needs suite: wsr_regression or data: <file>")
         if g.get("data"):
@@ -186,7 +213,8 @@ def from_dict(d: dict[str, Any], path: Optional[Path] = None) -> Objective:
         rails.append(Guardrail(**g))
     return Objective(name=str(d["name"]), model=d.get("model"), kind=kind, protocol=proto, practice=d.get("practice"),
                      heldout=d.get("heldout"), grader=d.get("grader"), guardrails=rails,
-                     budget=_budget(d.get("budget")), path=path)
+                     budget=_budget(d.get("budget")), confirmation=d.get("confirmation"), judge=_judge(d.get("judge")),
+                     path=path)
 
 
 def load(path: str | Path) -> Objective:
@@ -253,7 +281,7 @@ def check(obj: Objective) -> dict[str, Any]:
     """What `wsr objective check` reports: files, row counts, gradable rows, practice/held-out overlap."""
     problems, info = [], {}
     sets = {}
-    for split in ("practice", "heldout"):
+    for split in ("practice", "heldout", "confirmation"):
         p = obj.resolve(getattr(obj, split))
         if p is None:
             info[split] = None
@@ -272,6 +300,18 @@ def check(obj: Objective) -> dict[str, Any]:
         if obj.grader and not obj.grader.startswith(("detector", "regex")) and gradable < len(items):
             problems.append(f"{split}: {len(items) - gradable}/{len(items)} rows have no answer for grader "
                             f"{obj.grader}")
+    if "confirmation" in sets:
+        cp = obj.resolve(obj.confirmation)
+        from .confirm import used
+        u = used(cp) if cp is not None else None
+        if u is not None:
+            problems.append(f"the confirmation set was already used ({u.get('time')}, goal {u.get('goal')}): it is "
+                            "evaluated once; give fresh data for a new confirmation")
+        for other in ("practice", "heldout"):
+            if other in sets:
+                both = {_key(i) for i in sets[other]} & {_key(i) for i in sets["confirmation"]}
+                if both:
+                    problems.append(f"{len(both)} prompt(s) are in both {other} and confirmation")
     if "practice" in sets and "heldout" in sets:
         shared = {_key(i) for i in sets["practice"]} & {_key(i) for i in sets["heldout"]}
         info["overlap"] = len(shared)
@@ -313,7 +353,9 @@ TEMPLATE = {
     "practice": "data/practice.jsonl",
     "heldout": "data/heldout.jsonl",
     "grader": "math",
-    "guardrails": [{"suite": "wsr_regression"}],
+    "confirmation": None,
+    "judge": {"alpha": 0.05, "min_gain": 0.05},
+    "guardrails": [{"suite": "wsr_regression"}, {"suite": "semantic_regression_canary"}],
     "budget": {"practice_evals": 10, "verifications": 6, "usd": 5},
 }
 

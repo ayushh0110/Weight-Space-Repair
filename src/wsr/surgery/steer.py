@@ -16,12 +16,13 @@ WHERE = {"add": "alpha x vector added to each listed decoder layer's output hidd
                   "`alpha` wherever it is above it, at every position; elsewhere it is unchanged"}
 
 
-def save(vector: torch.Tensor, alpha: float, layers: list[int], source: str, out: Path, mode: str = "add") -> Path:
+def save(vector: torch.Tensor, alpha: float, layers: list[int], source: str, out: Path, mode: str = "add",
+         dirname: str = "steering") -> Path:
     from safetensors.torch import save_file
 
     if mode not in WHERE:
         raise ValueError(f"unknown steering mode {mode!r}")
-    d = out / "steering"
+    d = out / dirname
     d.mkdir(parents=True, exist_ok=True)
     save_file({"vector": vector.detach().float().cpu().contiguous()}, str(d / "steer.safetensors"))
     spec = {"mode": mode, "alpha": float(alpha), "layers": [int(i) for i in layers],
