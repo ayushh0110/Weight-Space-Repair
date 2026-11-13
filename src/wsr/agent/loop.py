@@ -90,6 +90,13 @@ def brief(res: Any, rep: P.Repair, wb: Workbench) -> str:
         lines.append("## Diagnosis findings")
         lines += [f"- [{f.severity}] {f.code}: {_clip(f.message, 300)}" for f in fs]
         lines.append("")
+    hp = getattr(res, "harm", None) or {}
+    if hp.get("version"):
+        lines += ["## The model's own reading of harm (harm_probe)",
+                  f"- {'viable' if hp.get('viable') else 'NOT viable'}: {_clip(hp.get('why', ''), 400)}",
+                  f"- probe after layer {hp.get('after_layer')}, held-out AUC {hp.get('auc')} ({hp.get('held_out')}); "
+                  f"this prompt's logit {hp.get('prompt_logit')} (> 0 reads harmful); "
+                  f"{hp.get('failing_read')}/{hp.get('failing')} failing variants read the way a gate would change", ""]
     lines.append("## Contrast set")
     for e in c.failing[:8]:
         lines.append(f"- FAILING {e.name}: {_clip(e.messages[-1].get('content', ''), 120)!r} -> {_clip(e.text, 120)!r}")

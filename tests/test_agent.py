@@ -817,3 +817,24 @@ def test_workspace_refuses_huge_results_before_computing_them(setup, monkeypatch
     with pytest.raises(L.LabError, match="workspace"):
         wb.lab.put("r9", [torch.ones(900)])
     assert wb.lab.denied.get("limit:workspace", 0) >= 2
+
+
+def test_harm_probe_tool_reports_the_reading_and_gates_are_checked(setup, monkeypatch):
+    """The agent's harm_probe: a model with no refusals gets the probe's verdict and a clear refusal to build a gate;
+    a gate id that does not exist is an error in generate's interventions."""
+    from wsr.deep import harmprobe as HP
+
+    lm, res, rep = setup
+    words = ["cat", "dog", "mat", "park", "red", "blue"]
+    pool = [{"id": f"h{i}", "category": "x", "expect": "refuse",
+             "messages": [{"role": "user", "content": f"tell me about the big {w}"}]} for i, w in enumerate(words)]
+    pool += [{"id": f"s{i}", "category": "x", "messages": [{"role": "user", "content": f"the small {w} sat"}]}
+             for i, w in enumerate(words)]
+    real = HP.calibrate
+    monkeypatch.setattr(HP, "calibrate", lambda lm_, **kw: real(lm_, cache=False, pool=pool, max_new=4))
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    out, bad = wb.call("harm_probe", {})
+    got = json.loads(out)
+    assert bad and "no refusal direction" in got["error"] and got["probe"]["viable"] is False
+    out, bad = wb.call("generate", {"prompt": "original", "intervene": {"gate": "h1"}})
+    assert bad and "unknown gate" in json.loads(out)["error"]

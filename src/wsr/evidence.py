@@ -73,6 +73,8 @@ _DEEP = {
     "DEEP_LOOP_MECHANISMS": dict(observation=True, intervention=True),
     "DEEP_POSITIONAL_DEFECT": dict(intervention=True, controls=["position_shift_invariance"]),
     "DEEP_QBISECT": dict(intervention=True),
+    # Fitted on two families of calibration prompts, scored on the other two: a held-out reading, no intervention.
+    "DEEP_HARM_PROBE": dict(observation=True, generalization=["held_out_prompt_families"]),
 }
 
 
@@ -96,4 +98,4 @@ def for_finding(code: str, ev: dict[str, Any]) -> dict[str, Any] | None:
     if code == "DEEP_QBISECT":
         controls.append("random_tensors")
     return make(observation=base.get("observation", False), intervention=base.get("intervention", False),
-                controls=controls)
+                controls=controls, generalization=base.get("generalization", ()))

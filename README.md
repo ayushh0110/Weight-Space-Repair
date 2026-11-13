@@ -33,6 +33,7 @@ evaluation on a confirmation set, used once, decides whether it ships.
 | Blank replies (a bug planted in real weights) | Qwen2.5-0.5B | sparse projection on the neurons wsr found blind | 35.7% → 100%, 18 better / 0 worse, p 0.000004 | 15 / 0, p 0.00003 | **shipped, confirmed** |
 | The same, weights not allowed to change | Qwen2.5-0.5B | clamp steering after layer 14 | 6 / 0, p 0.016 | 5 / 0, p 0.031 | **steering recommended, confirmed** |
 | The same bug, a smaller goal | Qwen2.5-0.5B | zero the planted neuron | 6 / 0, p 0.016 | 4 / 0, p 0.0625 | inconclusive: confirmation one item short |
+| Over-refusal of safe prompts (XSTest) | Qwen2.5-0.5B | probe-gated steering (the refusal tied to the model's own harm reading; judged with the experiment's scripts, since built in and found by `wsr program` on its own) | 64% → 84%, 12 / 3, p 0.018; harmful requests still refused | 70% → 93%, 10 / 0, p 0.001 | **confirmed** |
 | Over-refusal of safe prompts (XSTest) | Llama-3.2-1B | a learned edit by the agent (Opus 5.5) | 2 / 0, every refusal kept | not used | inconclusive: too few fixed |
 | Under-refusal of harmful prompts (XSTest) | Qwen2.5-0.5B | a learned edit by the agent (Opus 5.5) | 88% → 96%, 6 / 0 | not used | rejected: the canary lost 3 answers |
 | The blank-reply patch on the served GGUF | Qwen2.5-0.5B | exported to Q8_0, judged on llama-server | 6 / 0; canary and suite hold on the GGUF | (already used) | the patch survives quantisation |
@@ -47,9 +48,9 @@ answer. All of it, with the setups and the failures, is in [docs/RESULTS.md](doc
 | | |
 |---|---|
 | **Triage** | seven layers (file, config, request and response, output, live probes with one-factor reruns, known issues) and a verdict that names one cause and its fix; no GPU, no dependencies |
-| **Deep diagnosis** | on the full-precision model: token trace, failure direction, patching of layers, heads and neurons, known directions (refusal, end-of-turn, language, repetition), calibrated language and loop probes, causal tests against random controls |
+| **Deep diagnosis** | on the full-precision model: token trace, failure direction, patching of layers, heads and neurons, known directions (refusal, end-of-turn, language, repetition), calibrated language and loop probes, a harm probe for refusal failures (does the model itself read harm, and do its refusals follow it?), causal tests against random controls |
 | **Quantisation** | GGUF tensor health and error against the original weights; bisection to the tensors that cause a failure |
-| **Repair** | a playbook of verified edits (direction removal, local projection, neuron and head scaling, gated neurons), then activation steering (add or clamp); checked on the failing and working prompts, a regression suite that keeps refusals, serving precision, fresh variants and a random control |
+| **Repair** | a playbook of verified edits (direction removal, local projection, neuron and head scaling, gated neurons), then activation steering (add, clamp, or probe-gated: the refusal tied to the model's own reading of harm); checked on the failing and working prompts, a regression suite that keeps refusals, serving precision, fresh variants and a random control |
 | **Surgery agent** | a frontier model (Claude, or any OpenAI-compatible model) with weight-editing tools in a workspace that cannot touch files, the network or processes; only an edit that passes the same checks is accepted |
 | **Weight-space programming** | goal files with practice and held-out data, dataset profiles, a paired held-out judge with guardrails; `wsr program` and `wsr fix` ship a patch, a steering or serving settings, only when the judge accepts it |
 | **Verification and provenance** | three data sets (practice, validation, a confirmation set evaluated once and recorded as used), a 32-item semantic canary, guardrails on the served GGUF, exact SHA-256 hashes of every tensor of the base model, and a `MANIFEST.json` per fix with its evidence and decision (`wsr patch show`, `wsr patch check`) |
@@ -164,6 +165,7 @@ wsr program goal.json ./model --out ./run --steering only
 # public datasets (asks before downloading; already-cached files are used without asking)
 wsr data list
 wsr data fetch gsm8k
+wsr data fetch wsr-refusal       # built in: safe prompts that sound alarming, harmful ones, plain ones (practice data)
 wsr objective from-failure ./model --prompt "..." --dataset auto --out-dir ./goal
 # ship a patch as a GGUF (asks before fetching llama.cpp's converter and before converting)
 wsr patch export ./model ./run/patch --gguf patched.Q4_K_M.gguf --quant Q4_K_M --llama-server /path/to/llama.cpp
@@ -220,8 +222,9 @@ The rule-based playbook goes first. When it cannot fix the failure, or its candi
 not the held-out judge, the agent gets the objective (told only that the candidate was rejected). Agent tools:
 reads and generation with interventions (`generate` takes up to 8 prompts in one call, batched to free GPU
 memory), directions, neuron and head attribution, hand-built edits, `fit_edit` (a rank-r change fitted by
-gradient descent on texts it chooses, kept inside the size limit, memory- and time-guarded), `steer_eval`,
-`settings_eval`, `practice_eval`, `verify_edit`. Its workspace is a small numeric language with no file,
+gradient descent on texts it chooses, kept inside the size limit, memory- and time-guarded), `harm_probe` (for
+refusal failures: the model's own reading of harm, its verdict, and a gate built on it), `steer_eval` (add, clamp or
+gated), `settings_eval`, `practice_eval`, `verify_edit`. Its workspace is a small numeric language with no file,
 network or process access; every edit is undone after the call that tried it. The workspace is bounded: 64M
 elements per value (checked from the arguments before a large result is computed), 2 GB in all, capped
 integers, 120 s per run. A fault inside a tool is reported to the agent as a tool error and the run goes on.
@@ -266,13 +269,13 @@ given as `WSR_API_KEY` instead of `--api-key`, which keeps it out of the shell h
 | 7 Deep | `deep/` (needs torch) | failure kinds: blank, loop, refusal, under-refusal (`complied`: a harmful request answered), wrong language, and others; on full-precision HF weights: reproduce, contrast set, logit-lens token trace, failing-vs-passing direction, patching (layers, MLPs, heads, neurons), ablation / addition tests, known directions (end-of-turn, refusal, language, repetition), weight dossier; `wsr quant`: GGUF tensor stats and quantisation error vs the original |
 | Surgery | `surgery/` (needs torch) | playbook per failure (over-refusal, wrong language, premature end-of-turn, loops, generic contrast direction): candidate edits from the deep evidence (direction orthogonalisation, neuron / head scaling), each checked against the hook it came from, tried weakest first, verified on the failing and working prompts and a 17-prompt regression suite (new failures, drift, harmful-request refusals); the patch re-checked at serving precision (bf16 / fp16); a rank-1 patch file or an honest "could not fix" with the next step. `--deep`: local edits (only the layers, or only the MLP neurons, that write the failure, strengths up to 6; for loops the direction from a failing and a working continuation of the same prompt), fresh prompt variants that took no part in choosing the patch, a same-size random edit as a control; `--sampled`: paired sampled runs. Works on hybrid linear-attention models (Qwen3.5) |
 | Program | `program/` (needs torch) | goal files, dataset profiles, the held-out judge with guardrails, `wsr program` / `wsr fix`; settings and steering candidates; the llama-server judge and GGUF export; the replies cache |
-| Surgery agent | `agent/` (needs torch, `anthropic`) | after the playbook says "could not fix": a frontier model (Claude Opus 5.5 by default; any OpenAI-compatible model with `--agent-provider openai`) gets the diagnosis and every failed trial, and works through tools: a numeric workspace over every weight (no file, network or process access), teacher-forced reads with interventions, sampled paired generation, its own matched pairs and a held-out layer screen, the playbook's edits and free-form low-rank edits (never the embedding, output layer or final norm), screen and verify; every trial edit is undone after its call, only an edit that passed the playbook's own checks can be submitted, and turns, verifications and spend are capped; the transcript is saved. In `wsr program` it also has `fit_edit` (learned low-rank edits), `attribute_heads`, `settings_eval`, `steer_eval` and `practice_eval` |
+| Surgery agent | `agent/` (needs torch, `anthropic`) | after the playbook says "could not fix": a frontier model (Claude Opus 5.5 by default; any OpenAI-compatible model with `--agent-provider openai`) gets the diagnosis and every failed trial, and works through tools: a numeric workspace over every weight (no file, network or process access), teacher-forced reads with interventions, sampled paired generation, its own matched pairs and a held-out layer screen, the playbook's edits and free-form low-rank edits (never the embedding, output layer or final norm), screen and verify; every trial edit is undone after its call, only an edit that passed the playbook's own checks can be submitted, and turns, verifications and spend are capped; the transcript is saved. For refusal failures it has `harm_probe` (the model's own reading of harm and a gate on it). In `wsr program` it also has `fit_edit` (learned low-rank edits), `attribute_heads`, `settings_eval`, `steer_eval` and `practice_eval` |
 | 8 Verdict | `verdict.py` | config / request / sampling / runtime / quantisation / provider / known bug / weight-level / unexplained |
 
 ## Tests
 
 ```bash
-python -m pytest -q               # 363 tests; the CUDA comparison is skipped without a GPU
+python -m pytest -q               # 384 tests; the CUDA comparison is skipped without a GPU
 python -m ruff check src tests
 ```
 

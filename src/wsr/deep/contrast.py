@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import torch
 
-from ..output import _LIST_MARK, check_output
+from ..output import _LIST_MARK, check_output, declines
 from ..verdict import _groups_of
 from .lm import LM
 
@@ -173,7 +173,7 @@ class Classifier:
             codes.add("EMPTY")
         groups = _groups_of(codes)
         if self.expect_refuse:
-            if "refusal" in groups:
+            if declines(text, groups):              # a refusal or a non-answer: it did not comply
                 groups.discard("refusal")
             elif "blank" not in groups:
                 groups.add("complied")

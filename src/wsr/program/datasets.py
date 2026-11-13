@@ -28,8 +28,9 @@ class Source:
     file: str
     about: str
     size: str
-    convert: Callable[[Path], list[dict]]
+    convert: Callable[[Optional[Path]], list[dict]]
     grader: Optional[str] = None
+    builtin: bool = False            # shipped with wsr: written without a download or a question
 
 
 def _read_jsonl(p: Path) -> list[dict]:
@@ -71,6 +72,12 @@ def _ifeval(p: Path) -> list[dict]:
     return [{"id": f"ifeval:{r.get('key', i)}", "prompt": r["prompt"]} for i, r in enumerate(_read_jsonl(p))]
 
 
+def _wsr_refusal(p: Optional[Path]) -> list[dict]:
+    from ..deep import refusal_pools as RP
+
+    return RP.dataset_rows()
+
+
 def _mgsm(lang: str):
     def conv(p: Path) -> list[dict]:
         out = []
@@ -91,6 +98,10 @@ SOURCES: dict[str, Source] = {s.name: s for s in [
     Source("xstest", "Paul/XSTest", "xstest_prompts.csv",
            "250 safe prompts that sound unsafe, and 200 unsafe ones that must stay refused", "0.05 MB", _xstest,
            "detector:refusal"),
+    Source("wsr-refusal", "", "", "wsr's own refusal contrast pools: 640 safe requests that sound alarming, 240 "
+           "harmful ones that must be refused (50 as matched pairs), 61 plain ones. The harm probe is calibrated on "
+           "them: use them as practice data, not for validation", "0.1 MB", _wsr_refusal, "detector:refusal",
+           builtin=True),
     Source("ifeval", "google/IFEval", "ifeval_input_data.jsonl", "541 prompts with format instructions (graded by "
            "wsr's detectors only: the IFEval checker is not built)", "0.2 MB", _ifeval, "detector:any"),
     *[Source(f"mgsm-{lg}", "juletxara/mgsm", f"{lg}/test-00000-of-00001.parquet",
@@ -129,7 +140,10 @@ def fetch(name: str, consent: Consent, *, required: bool = True) -> Optional[Pat
         raise ValueError(f"unknown dataset {name!r}: one of {', '.join(SOURCES)}")
     src = SOURCES[name]
     out = data_dir() / f"{name}.jsonl"
-    if out.exists():
+    if out.exists() and not src.builtin:
+        return out
+    if src.builtin:                                      # shipped with wsr: nothing to download, nothing to ask
+        _write_rows(out, src.convert(None))
         return out
     raw = _cached(src)
     if raw is None:
@@ -144,17 +158,21 @@ def fetch(name: str, consent: Consent, *, required: bool = True) -> Optional[Pat
         except ImportError as e:
             raise ValueError("downloading needs huggingface_hub (pip install huggingface_hub)") from e
         raw = Path(hf_hub_download(src.repo, src.file, repo_type="dataset"))
-    rows = src.convert(raw)
+    _write_rows(out, src.convert(raw))
+    return out
+
+
+def _write_rows(out: Path, rows: list[dict]) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".jsonl.tmp")                  # whole or not at all: an interrupted run leaves no half file
     with open(tmp, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     tmp.replace(out)
-    return out
 
 
 def listing() -> list[dict[str, Any]]:
-    return [{"name": s.name, "repo": s.repo, "about": s.about, "size": s.size, "grader": s.grader,
-             "local": (data_dir() / f"{s.name}.jsonl").exists() or _cached(s) is not None} for s in SOURCES.values()]
+    return [{"name": s.name, "repo": s.repo, "about": s.about, "size": s.size, "grader": s.grader, "builtin": s.builtin,
+             "local": s.builtin or (data_dir() / f"{s.name}.jsonl").exists() or _cached(s) is not None}
+            for s in SOURCES.values()]
 

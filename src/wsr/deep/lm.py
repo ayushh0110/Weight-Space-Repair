@@ -413,14 +413,19 @@ class LM:
                            clamp: Optional[tuple[torch.Tensor, float, Sequence[int]]] = None,
                            zero_heads: Optional[Sequence[tuple[int, int]]] = None,
                            zero_neurons: Optional[Sequence[tuple[int, int]]] = None,
-                           project_sites: Optional[tuple[Sequence[Any], float]] = None
+                           project_sites: Optional[tuple[Sequence[Any], float]] = None,
+                           gated: Optional[Any] = None
                            ) -> list[tuple[nn.Module, str, Callable]]:
         """Hooks that patch activations at `pos`, ablate a direction everywhere, add a steering vector,
         remove attention heads (zero their output at every position, generation steps included), or
         take alpha of a direction out of chosen output projections' writes (`project_sites`:
         (sites, alpha); each site has layer, part "mlp" / "attn", unit u and optional input columns -
-        the hook form of `surgery.edits.project`)."""
+        the hook form of `surgery.edits.project`), or apply probe-gated steering (`gated`: a
+        deep.harmprobe.Gate, which reads the harm probe where the reply starts and moves the refusal
+        component accordingly)."""
         regs: list[tuple[nn.Module, str, Callable]] = []
+        if gated is not None:
+            regs += gated.hooks(self)
         if project_sites is not None:
             sites, alpha = project_sites
             for s in sites:

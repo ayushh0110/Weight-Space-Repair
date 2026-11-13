@@ -174,17 +174,18 @@ class ObjectiveTools:
              "spread over many layers that no small weight edit separates. vector: a direction id ('d1', 'd1@12') "
              "or a workspace variable of d_model numbers. mode \"clamp\" instead lowers the component along the "
              "vector to the level alpha wherever it is above it and leaves every other position alone: for a "
-             "failure that fires only sometimes (a constant shift also moves healthy text). A steering candidate "
-             "can be the final_choice: it is "
+             "failure that fires only sometimes (a constant shift also moves healthy text). mode \"gated\" takes a "
+             "gate id from harm_probe as the vector (alpha and layers are ignored): the refusal tied to the model's "
+             "own reading of harm, for over- and under-refusal. A steering candidate can be the final_choice: it is "
              "judged on the held-out set with the regression suite run under the steering, and reported as a "
              "steering vector to apply at inference (no weights change). To REMOVE a direction instead, "
              "build_edit orthogonalise does it exactly in the weights. Shares the practice_eval budget.",
              "input_schema": {"type": "object", "properties": {
                  "vector": {"type": "string"}, "alpha": {"type": "number"},
-                 "mode": {"type": "string", "enum": ["add", "clamp"]},
+                 "mode": {"type": "string", "enum": ["add", "clamp", "gated"]},
                  "layers": {"type": "array", "items": {"type": "integer"}},
                  "n": {"type": "integer", "minimum": 1}, "why": {"type": "string"}},
-                 "required": ["vector", "alpha", "layers"]}},
+                 "required": ["vector"]}},
             {"name": "checkpoint", "description": "Keep an edit on the leaderboard with a note (its last "
              "practice_eval is attached). Returns the leaderboard.",
              "input_schema": {"type": "object", "properties": {"edit_id": {"type": "string"},
@@ -211,7 +212,9 @@ class ObjectiveTools:
                "- if the evidence says decoding causes or cures the failure (loops that sampling or a repetition "
                "penalty escape), measure that with settings_eval: a settings fix needs no weight edit\n"
                "- if the behaviour is spread over many layers and every small edit also changes what must stay (a "
-               "shared mechanism), measure activation steering with steer_eval")
+               "shared mechanism), measure activation steering with steer_eval"
+               "\n- for over- or under-refusal, harm_probe says whether the model itself reads harm and builds a gate "
+               "on that reading; steer_eval {vector: <gate id>, mode: gated} measures it")
         if self.note:
             out += "\n- " + self.note
         for n, base in sorted(self.base.items()):
@@ -278,8 +281,8 @@ class ObjectiveTools:
         self.settings[sid] = res
         return res
 
-    def _steer_eval(self, wb, vector: str, alpha: float, layers: list, n: Optional[int] = None,
-                    why: str = "", mode: str = "add") -> dict[str, Any]:
+    def _steer_eval(self, wb, vector: str, alpha: Optional[float] = None, layers: Optional[list] = None,
+                    n: Optional[int] = None, why: str = "", mode: str = "add") -> dict[str, Any]:
         if self.evals >= self.max_evals:
             return {"error": f"practice_eval budget used ({self.max_evals}); choose with final_choice"}
         try:
@@ -298,12 +301,18 @@ class ObjectiveTools:
         a, graded = EV._metric(base)
         b, _ = EV._metric(after)
         sid = f"t{len(self.steerings) + 1}"
+        g = kw.get("gated")
+        if g is not None:
+            alpha = g.up if g.up is not None else g.down
+            layers = g.layers
         res = {"steering_id": sid, "mode": mode, "vector": str(vector), "alpha": float(alpha),
                "layers": [int(i) for i in layers],
                "n": n, "metric": "accuracy" if graded else "share with no failure", **EV._paired(a, b),
                "rates_before": EV._rates(base), "rates_after": EV._rates(after),
                "practice_evals_left": self.max_evals - self.evals}
-        self.steerings[sid] = {**res, "_vector": kw[mode][0].detach().float().cpu().clone(), "why": why}
+        vec = g.r if g is not None else kw[mode][0]
+        self.steerings[sid] = {**res, "_vector": vec.detach().float().cpu().clone(), "why": why,
+                               **({"_gate": g, "gate": g.as_dict(), "vector": g.label} if g is not None else {})}
         return res
 
     def _checkpoint(self, wb, edit_id: str, note: str) -> dict[str, Any]:
@@ -342,10 +351,17 @@ class ObjectiveTools:
 
 
 def steering_kwargs(wb, vector: Any, alpha: Any, layers: Any, mode: str = "add") -> dict[str, Any]:
-    """lm.steer arguments, checked: "add" alpha x vector after these layers, or "clamp" the component along the
-    vector to the level alpha wherever it is above it."""
+    """lm.steer arguments, checked: "add" alpha x vector after these layers, "clamp" the component along the
+    vector to the level alpha wherever it is above it, or "gated" a gate from harm_probe (vector = its id)."""
+    if mode == "gated":
+        g = getattr(wb, "gates", {}).get(str(vector))
+        if g is None:
+            raise ValueError(f"mode gated needs a gate id from harm_probe as the vector, not {vector!r}")
+        return {"gated": g}
     if mode not in ("add", "clamp"):
-        raise ValueError("mode must be add or clamp")
+        raise ValueError("mode must be add, clamp or gated")
+    if alpha is None or layers is None:
+        raise ValueError("add and clamp need alpha and layers")
     if not isinstance(layers, list) or not layers or len(layers) > wb.lm.n_layers:
         raise ValueError(f"layers: a list of 1-{wb.lm.n_layers} layer indices")
     ls = sorted({int(i) for i in layers})
@@ -362,6 +378,14 @@ def steering_kwargs(wb, vector: Any, alpha: Any, layers: Any, mode: str = "add")
     return {mode: (v / v.norm() if mode == "clamp" else v, a, ls)}
 
 
+def steer_kw(st: dict) -> dict[str, Any]:
+    """lm.steer arguments for a steering record: {"mode", "_vector", "alpha", "layers"}, or a gated one with "_gate"
+    (deep/harmprobe.py)."""
+    if st.get("mode") == "gated":
+        return {"gated": st["_gate"]}
+    return {st.get("mode", "add"): (st["_vector"], st["alpha"], st["layers"])}
+
+
 def judge_steering(lm, obj: Objective, st: dict, *, limit: Optional[int] = None, say=lambda s: None,
                    m: int = 1) -> dict:
     """Steering on the held-out set: the same weights without and with the steering hooks, same items and seeds,
@@ -370,7 +394,7 @@ def judge_steering(lm, obj: Objective, st: dict, *, limit: Optional[int] = None,
     from ..surgery import regress as R
 
     t0 = time.time()
-    kw = {st.get("mode", "add"): (st["_vector"], st["alpha"], st["layers"])}
+    kw = steer_kw(st)
     items = load_items(obj.resolve(obj.heldout), system=obj.protocol.system, limit=limit)
     say(f"  held-out: {len(items)} items, without then with the steering")
     r0, r1 = PF.Runner(TorchBackend(lm), obj.protocol, obj.grader), PF.Runner(TorchBackend(lm), obj.protocol, obj.grader)
@@ -422,7 +446,7 @@ def save_steering(st: dict, out: Path, dirname: str = "steering") -> Path:
     from ..surgery import steer as SV
 
     return SV.save(st["_vector"], st["alpha"], st["layers"], st["vector"], out, mode=st.get("mode", "add"),
-                   dirname=dirname)
+                   dirname=dirname, gate=st.get("_gate"))
 
 
 def _settings_files(settings: dict, proto: Protocol, d: Path) -> Path:
@@ -731,8 +755,11 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
         if agent_budget is not None:
             agent_budget.weight_edits = False
         rec["weight_edits"] = False
+    # Refusal goals: the harm probe is calibrated on the practice set too (the user's own kind of request, labelled by
+    # `expect`), so the gate reads harm the way this goal means it. Practice data only: validation stays unseen.
+    harm_extra = [it for it in practice if it.get("messages")] if kind in ("refusal", "complied") else None
     rep = P.repair(lm, res, max_new=max_new, template_kwargs=tk, mode=mode, playbook=playbook, log=say,
-                   budget=reg_budget, steering=steering)
+                   budget=reg_budget, steering=steering, harm_extra=harm_extra)
     rec["stages"]["playbook"] = {"status": rep.status, "summary": rep.summary,
                                  "patch": rep.patch.label if rep.patch is not None else None,
                                  "reference_runs": (rep.checks or {}).get("reference_runs")}
@@ -740,9 +767,15 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
     # The verification already ran the regression suite on this patch with this template; the judge's
     # guardrail reuses it (same computation, same numbers) instead of running it again.
     suite_result = rep.regression if rep.status == "fixed" else None
-    # The held-out (validation) set may judge one candidate from the playbook and, with an agent, one more: each is
-    # tested at alpha / slots, so two looks at the same set cannot double the chance of a false acceptance.
-    slots = 1 + (provider is not None)
+    # Refusal goals: when the playbook's candidate is a weight patch, its steering (probe-gated first: the refusal
+    # tied to the model's own harm reading) never ran, because steering is the fallback when no weight edit passes.
+    # If the validation set rejects that patch, the playbook gets one steering pass. Its slot is declared here, before
+    # anything is judged, so it is part of the correction whether it is used or not.
+    steer_pass = kind in ("refusal", "complied") and steering != "off" and rep.status == "fixed"
+    # The held-out (validation) set may judge one candidate from the playbook, with an agent one more, and for a
+    # refusal goal one steering from the playbook: each is tested at alpha / slots, so several looks at the same set
+    # cannot multiply the chance of a false acceptance.
+    slots = 1 + (provider is not None) + steer_pass
     rec["stages"]["candidate_slots"] = slots
 
     # 4. agent, 5. the judge. A playbook candidate that the held-out judge rejects hands over to the agent once
@@ -787,7 +820,7 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
 
     tools = None
     rejected = None                                       # the playbook's candidate, when the judge said no
-    if candidate is not None and provider is not None and rep.ctx is not None:
+    if candidate is not None and (provider is not None or steer_pass) and rep.ctx is not None:
         ev = judge_patch(candidate, by, suite_result)
         if ev["verdict"] == "improved":
             return _ship(rec, out, t0, candidate, by, ev, obj, consent, decisions, lm=lm, say=say)
@@ -797,10 +830,18 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
         rec["stages"]["judge_playbook"] = ev
         rejected = candidate.label
         candidate, by, suite_result = None, None, None
+        if steer_pass:
+            say("\nthe held-out judge did not accept the playbook's weight patch; refusal goal: the playbook's "
+                "steering pass (probe-gated first), in the slot declared for it")
+            rep = P.repair(lm, res, max_new=max_new, template_kwargs=tk, mode=mode, playbook=playbook, log=say,
+                           budget=reg_budget, steering="only", harm_extra=harm_extra)
+            rec["stages"]["playbook_steering"] = {"status": rep.status, "summary": rep.summary,
+                                                  "steering": rep.steering.as_dict() if rep.steering else None}
     if rep.status == "steered" and rep.steering is not None:
         # The playbook's steering: judged like the agent's (same weights with and without it, the suite under it).
         sv = rep.steering
-        st = {"_vector": sv.vector, "alpha": sv.alpha, "layers": sv.layers, "vector": sv.label, "mode": sv.mode}
+        st = {"_vector": sv.vector, "alpha": sv.alpha, "layers": sv.layers, "vector": sv.label, "mode": sv.mode,
+              "_gate": sv.gate}
         say(f"\njudging the playbook's steering ({sv.label}, alpha {sv.alpha:.3f} after layers {sv.layers}) on the "
             "held-out set")
         js = judge_steering(lm, obj, st, limit=eval_limit, say=say, m=slots)
@@ -917,7 +958,7 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
 
 def _steer_runner(lm, obj: Objective, st: dict):
     def run(items: list[dict]) -> list[dict]:
-        kw = {st.get("mode", "add"): (st["_vector"], st["alpha"], st["layers"])}
+        kw = steer_kw(st)
         r = PF.Runner(TorchBackend(lm), obj.protocol, obj.grader)
         with lm.steer(**kw):
             return EV._run_set(r, items, samples=1, seed=0)

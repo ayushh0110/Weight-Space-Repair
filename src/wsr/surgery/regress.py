@@ -88,7 +88,7 @@ def _run_all(lm: LM, rows: list[tuple[str, str, str, str]], template_kwargs: Opt
 
 
 def _reply(lm: LM, e, name: str, prompt: str, lang: str, kind: str, template_kwargs: Optional[dict]) -> Reply:
-    from ..output import refusal_score
+    from ..output import declines
 
     clf = Classifier(lm, expect_lang=lang or None, max_new=MAX_NEW, template_kwargs=template_kwargs)
     groups = set(clf.groups_of(e.text, e.gen, request=prompt))
@@ -96,7 +96,7 @@ def _reply(lm: LM, e, name: str, prompt: str, lang: str, kind: str, template_kwa
         groups.discard("refusal")                       # refusing is the right answer here
     groups.discard("structure")
     return Reply(name, prompt, kind, lang, e.prompt_ids, e.gen, e.text, groups,
-                 refused=refusal_score(e.text) > 0.5 or "refusal" in e.groups)
+                 refused=declines(e.text, e.groups))
 
 
 @torch.no_grad()

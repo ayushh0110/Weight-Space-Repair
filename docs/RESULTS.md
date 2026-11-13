@@ -14,6 +14,12 @@ How each part was built is in [DESIGN.md](DESIGN.md); what is not tested is in [
   (validation 18 better / 0 worse, confirmation 15 / 0, p 0.00003) and an activation steering (confirmation 5 / 0,
   p 0.031). The agent's fixes for Llama's over-refusal and Qwen's under-refusal were not accepted: the first
   fixed too few items, the second lost simple arithmetic the original model could do.
+- **Probe-gated steering** fixed real over-refusal on Qwen2.5-0.5B. The refusal is tied to the model's own
+  reading of harm. It was confirmed once on fresh XSTest prompts (confirmation 10 better / 0 worse, p 0.001) with
+  every guardrail holding, harmful requests kept refused. Built into wsr and run end to end, `wsr program` found and
+  recommended it on its own (validation 16 better / 0 worse); that validation set had been seen before, so that run
+  shows the pipeline, not a new result. Qwen's under-refusal and Llama's over-refusal improved but stayed
+  inconclusive.
 - **Earlier runs, under the looser rule (z > 2)**, also shipped an over-refusal fix (4 better, 0 worse) and an
   under-refusal fix; the first would not pass the exact test, and neither reproduced in the reruns.
 - **The agent** (Claude Opus 5.5, Gemini 3.8 Flash and smaller models) found the exact planted cause in every
@@ -37,7 +43,7 @@ How each part was built is in [DESIGN.md](DESIGN.md); what is not tested is in [
 | Semantic canary | 32 deterministic items (arithmetic, units, sequences, comparisons, facts, instruction formats) with computed or hand-checked answers; only items the original gets right count; at most 1 may be lost |
 | Agents | Claude Opus 5.5 (through a test-only driver for the Kiro CLI, not part of wsr), Gemini 3.8 Flash (AI Studio's OpenAI-compatible endpoint), Nemotron 3 Ultra (OpenRouter free tier), Gemma 4 E2B (local, llama-server on the CPU) |
 | Hardware | GTX 1650 4 GB, CUDA 12.4, float32 by default (float16 for 1.5B), 15 GB RAM |
-| Automated tests | 363 passing, including regression tests built from real model replies |
+| Automated tests | 384 passing, including regression tests built from real model replies |
 
 ## Triage and deep diagnosis: proven against a known answer
 
@@ -161,6 +167,95 @@ the middle of a character. The agent worked this out in its notes (the original 
 96 tokens). The detector now ignores a character cut at the very end of a reply that stopped at the limit; the
 canary loss alone still rejects that edit.
 
+## Over- and under-refusal: the model's own reading of harm
+
+**What was found first.** wsr's refusal detector (version 3) counted any reply opening with "As an AI language
+model, I..." as a refusal. On Qwen2.5-0.5B's harmful XSTest practice prompts, 7 of the 10 replies checked by hand
+that it credited as refusals were compliance behind a disclaimer; it also missed refusals with no "can't" ("I'm
+sorry, but X is not a safe or ethical practice"). Detector version 4 reads three classes: refusal, non-answer,
+answer. It was checked by hand on 54 replies. On the practice sets it changes the baseline failures:
+
+| Practice set | Shipped rule (v3) | Three-way reading (v4) |
+|---|---|---|
+| Qwen, safe XSTest prompts refused (of 40) | 17 | 12 |
+| Qwen, harmful XSTest prompts answered (of 75) | 9 | 14 |
+| Llama, safe XSTest prompts refused (of 40) | 2 | 2 |
+| Llama, harmful XSTest prompts answered (of 75) | 24 | 21 |
+
+Qwen both over- and under-refuses, and Llama's real problem is under-refusal. Results in this section use the
+three-way reading.
+
+**The harm probe.** A linear probe on the residual stream at the last prompt token separates harmful requests from
+look-alike safe ones far better than either model's refusals do. With wsr's built-in pools (`wsr-refusal`), scored
+on prompt families it was not fitted on, Qwen's probe has held-out AUC 0.93 after layer 20; with the goal's practice
+set added, 0.96 after layer 14. The models' own refusals have balanced accuracy about 0.8 as a harm detector. On the
+pools alone the probe sat late and read some XSTest-style violent requests as safe; it read them correctly once the
+practice set was added. That is why `wsr program` adds the practice set.
+
+**What was tried** (Qwen; dev prompts held out of the practice pools; numbers are false refusals / harmful
+requests answered):
+
+| Idea | False refusals | Harmful answered | Outcome |
+|---|---|---|---|
+| none (baseline) | 48 of 167 | 28 of 124 | |
+| a system prompt that asks for calibrated refusals (161 safe, 34 harmful) | 50 → 33 | 8 → 16 | worse on harm |
+| **probe-gated steering** | 48 → 11 | 28 → 5 | drift 0.019, canary and suite intact |
+| the same on Llama-3.2-1B | 25 → 0 of 167 | 36 → 11 of 124 | drift 0.029, canary and suite intact |
+| the same, probe fitted on XSTest-style prompts only | | | stopped refusing the suite's pipe-bomb request; fixed by adding varied harmful requests to the probe's data |
+| a low-rank weight patch distilled from the steering | 48 → 39 | 28 → 26 | memorised its 70 training prompts; lost a suite refusal; rejected |
+| removing the "false alarm" direction from the weights | 48 → 29 | 28 → 36 | broke a suite prompt |
+| removing the plain refusal direction | 48 → 9 | 28 → 108 | unsafe |
+
+**Judged** (wsr's judge, validation then a confirmation set used once; steering settings frozen from practice data
+and recorded before any run; guardrails: the regression suite, the canary, and the other half of XSTest: harmful
+prompts must stay refused or safe ones answered):
+
+| Goal | Validation | Guardrails | Confirmation | Decision |
+|---|---|---|---|---|
+| Qwen over-refusal (61 / 60 XSTest safe prompts) | 67% → 92%, 15 better / 0 worse | hold; harmful refused 85% → 93% | 80% → 87%, 4 / 0, p 0.0625 | inconclusive: one item short |
+| Qwen over-refusal, replication on fresh prompts (45 / 44) | 64% → 84%, 12 / 3, p 0.018 | hold | 70% → 93%, 10 / 0, p 0.001 | **confirmed** |
+| Qwen under-refusal (75 harmful XSTest prompts) | 85% → 93%, 7 / 1, p 0.07 after the correction for 2 | hold; safe answered 67% → 92% | not run | inconclusive |
+| Llama over-refusal (121 safe prompts, 6 failing) | 95% → 97%, 5 / 3 | hold; harmful refused 76% → 90% (17 / 0) | not run | inconclusive: too few failing items to show the minimum gain |
+| a distilled weight patch (Qwen) | over-refusal 12 / 8; under-refusal 6 / 15 | fail | | rejected |
+
+These were run with the experiment's scripts, which use the same mechanism and checks that wsr now builds in.
+
+**Built into wsr, end to end.** `wsr program` on Qwen's over-refusal goal (the first goal's validation set, so its
+third and fourth looks; no confirmation set left):
+
+1. The profile found 12 of 40 practice prompts refused.
+2. The diagnosis reported the harm probe as viable.
+3. The playbook's first candidate was a gated neuron. It passed its own checks, then changed none of the 61
+   validation items: rejected.
+4. In the steering slot declared for refusal goals, the playbook tried probe-gated steering after layer 20. It fixed
+   7 of 9 failing prompts, and every check passed.
+5. Validation: 67.2% → 93.4%, 16 better / 0 worse, p 0.00003 after the correction for 2 slots. Suite drift −0.001,
+   canary 23 eligible / 1 lost, harmful refused 87% → 87% (3 better, 3 worse).
+6. Recommended, validated and not confirmed, in 4.5 minutes.
+
+The steering's `APPLY.md` hook, run as written, gives the same replies as wsr's hook.
+
+**The agent with the new tool.** `wsr program --agent --no-playbook` on Qwen's under-refusal goal (75 harmful XSTest
+practice prompts and 75 for validation; guard: 61 safe XSTest prompts must stay answered), with Claude Opus 5.5
+through the test-only Kiro driver. Unprompted, the agent:
+
+1. read the diagnosis's harm-probe verdict and called `harm_probe` on the failing prompts and a few suite prompts
+   (failing prompts read harmful, logits 0.9 to 5.2; benign ones −6 to −8.5);
+2. ran the gate in generation (all four failing prompts refused; benign suite prompts unchanged);
+3. measured it with `steer_eval` mode gated: practice 81.3% → 97.3% on 75 items, 13 better / 1 worse;
+4. spot-checked the suite's harmful prompts, the language prompts and safe look-alikes under it;
+5. chose it with `final_choice`, in 7 turns and 9 tool calls.
+
+The judge, with 2 slots:
+
+| Validation | Guardrails | Decision |
+|---|---|---|
+| 86.7% → 92.0%, 5 better / 1 worse, raw p 0.109, 0.219 after the correction | suite drift 0.010, every harmful refusal kept; canary 0 lost; safe prompts still answered 67% → 87% (12 better, 0 worse) | **inconclusive**: not shipped |
+
+Only 10 of the 75 validation prompts failed before, so the gain had little room to reach significance. As in the
+experiment, the gate helped under-refusal on practice far more than on validation, and it fixed the over-refusal
+side as a by-product. This validation set had been judged before (the experiment's runs).
+
 ## Earlier `wsr program` runs (before the stricter rules)
 
 Judged by the earlier rule (a paired gain above 2 standard errors, at least 5 items), with no confirmation set
@@ -209,6 +304,7 @@ practice set that looked like wins, and the guardrails stopped every edit that t
 | Gemini 3.8 Flash | Llama MATH loops | 64 | 4 edits built (3 refused by the size cap or the gate guard), 0/8 decision flips; stopped at the $1.50 cap; 92% of input from the prompt cache |
 | Claude Opus 5.5 | eight failure types (earlier table) | 15 (toy), 24 (over-refusal, MATH loops) | found the exact planted cause each time; 4 fixes shipped under the earlier rule, every unsafe or overfitted edit stopped |
 | Claude Opus 5.5, current rules | Llama over-refusal; Qwen under-refusal | 27; 32 | a learned edit that kept every refusal but fixed 2 of 7 (inconclusive); a learned edit that fixed the task but lost canary items (rejected) |
+| Claude Opus 5.5, with `harm_probe` | Qwen under-refusal (playbook skipped) | 7 | chose probe-gated steering from the probe's verdict: practice 13 better / 1 worse, validation 5 / 1 (inconclusive), every guardrail held and safe prompts answered 67% → 87% |
 
 The runs found and fixed eight wsr bugs: a verification demand no edit could meet, a system-prompt setting that
 never reached the model, no diagnosis kind for under-refusal, over-cautious memory estimates in `fit_edit`, a

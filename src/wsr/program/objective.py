@@ -325,6 +325,16 @@ def check(obj: Objective) -> dict[str, Any]:
     if not obj.heldout:
         problems.append("no held-out file: wsr evaluate can only score the practice set, which an agent may "
                         "have fitted")
+    # wsr's harm probe is calibrated on its built-in refusal pools: a validation or confirmation set drawn from them
+    # would judge probe-gated steering on prompts it was fitted on.
+    from ..deep import refusal_pools as RP
+    pool = RP.texts()
+    for split in ("heldout", "confirmation"):
+        if split in sets:
+            n = sum(RP.norm(it["messages"][-1].get("content", "")) in pool for it in sets[split])
+            if n:
+                problems.append(f"{n} {split} prompt(s) are in wsr's built-in refusal pools (wsr-refusal), which the "
+                                "harm probe is calibrated on: use them for practice, not for judging")
     # A control character in a prompt is almost always a JSON escape by accident: a backslash-b in a JSON
     # string (as in a LaTeX boxed command written with one backslash) is a backspace.
     texts = [("protocol.system", obj.protocol.system or "")]

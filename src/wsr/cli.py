@@ -1021,8 +1021,9 @@ def cmd_data_list(args: argparse.Namespace) -> int:
     from .program import datasets as D
 
     for d in D.listing():
-        print(f"  {d['name']:<10} {'on disk' if d['local'] else d['size']:>8}  {d['about']} "
-              f"(huggingface.co/datasets/{d['repo']}; grader {d['grader']})")
+        where = "built into wsr" if d.get("builtin") else f"huggingface.co/datasets/{d['repo']}"
+        print(f"  {d['name']:<11} {'on disk' if d['local'] else d['size']:>8}  {d['about']} "
+              f"({where}; grader {d['grader']})")
     print(f"  files go to {D.data_dir()}")
     return 0
 

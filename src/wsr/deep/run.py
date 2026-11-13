@@ -60,6 +60,7 @@ class DeepResult:
     loop: dict[str, Any] = field(default_factory=dict)
     qbisect: dict[str, Any] = field(default_factory=dict)
     known_vectors: Any = None                       # A.KnownDirections, for surgery
+    harm: dict[str, Any] = field(default_factory=dict)   # refusal kinds: the harm probe's reading (harmprobe.py)
     lm: Any = None
     summary: str = ""
     confidence: str = "low"
@@ -201,6 +202,11 @@ def _diagnose(lm: LM, messages: list[dict], *, kind: str = "auto", failing: tupl
         res.lang = _language_probe(lm, c, expect_lang, max_new, template_kwargs, rep)
     if probes and c.kind == "loop" and ts:
         res.copy = _copy_probe(lm, c, ts, expect_lang, max_new, template_kwargs, rep)
+    if probes and c.kind in ("refusal", "complied"):
+        # Does the model itself read harm, and do its refusals follow? Decides whether probe-gated steering can work
+        # before the playbook spends verifications on it (the probe is cached per model).
+        lm.stage("harm_probe")
+        res.harm = _harm_probe(lm, c, template_kwargs, rep)
 
     if not c.passing:
         res.summary = f"{c.kind} reproduces on full precision; no passing variant to localise against"
@@ -350,6 +356,8 @@ def _diagnose(lm: LM, messages: list[dict], *, kind: str = "auto", failing: tupl
     lm.stage("summary")
     # 8. summary
     res.summary, res.confidence = _summarise(lm, res)
+    if res.harm.get("summary"):
+        res.summary += "; " + res.harm["summary"]
     cause, fix = Cause.WEIGHT_LEVEL, f"hand the package in the output directory to the surgery playbook ({_playbook(c.kind)})"
     sup = set(res.loop.get("supported") or [])
     weight_mech = sup & {"attractor", "MLP self-reinforcement", "copy heads", "positional (RoPE)"}
@@ -432,6 +440,44 @@ def _language_probe(lm: LM, c: Contrast, expect: str, max_new: int, template_kwa
     elif fixed:
         summ += "; steering restores it, but so does an unrelated language pair, so the direction is not specific"
     return dict(ev, steer=st, summary=summ, fixed=fixed, specific=specific)
+
+
+def _harm_probe(lm: LM, c: Contrast, template_kwargs: Optional[dict], rep: Report) -> dict[str, Any]:
+    """The harm probe (deep/harmprobe.py) on this model, and what it says about the failing prompts: would a gate
+    built on the model's own reading of harm change them?"""
+    from . import harmprobe as HP
+
+    try:
+        probe = HP.calibrate(lm, template_kwargs=template_kwargs)
+    except ValueError as e:
+        rep.findings.append(_f("DEEP_HARM_PROBE", Severity.INFO, f"harm probe skipped: {e}"))
+        return {}
+    over = c.kind == "refusal"
+    fails = c.failing[:6]
+    logits = [probe.read(lm, e.messages, template_kwargs) for e in fails]
+    # Over-refusal: a gate lowers the refusal where the probe reads safe; under-refusal: raises it where it reads harmful.
+    reads = [z < 0 if over else z > 0 for z in logits]
+    z0 = logits[0] if logits else None
+    msg = probe.summary() + ". "
+    if not probe.viable:
+        msg += "Probe-gated steering will not work on this model: " + probe.why
+        fix = ("do not steer on harm: the model has no reading of it to gate on (this needs training data, not "
+               "steering)")
+        short = f"harm probe: not viable (AUC {probe.auc:.2f})"
+    else:
+        word = "safe" if (z0 is not None and z0 < 0) else "harmful"
+        msg += (f"This prompt reads as {word} to the model itself (logit {z0:+.2f}), and {sum(reads)}/{len(reads)} "
+                f"failing variants read as {'safe' if over else 'harmful'}: "
+                + ("a gate on that reading would change them" if reads and reads[0] else
+                   "the model's own reading agrees with its reply here, so a gate on it would not change this prompt"))
+        fix = ("`wsr repair` tries probe-gated steering (the model's refusal tied to its own harm reading) when no "
+               "weight edit passes; `wsr program` judges it on held-out data")
+        short = (f"harm probe: viable (AUC {probe.auc:.2f}); the model reads this prompt as {word}")
+    rep.findings.append(_f("DEEP_HARM_PROBE", Severity.INFO, msg, fix=fix, harm_probe=probe.as_dict(),
+                           prompt_logits=[round(z, 3) for z in logits]))
+    return {**probe.as_dict(), "prompt_logit": None if z0 is None else round(z0, 4),
+            "gate_applies": bool(reads and reads[0]), "failing_read": sum(reads), "failing": len(reads),
+            "summary": short}
 
 
 def _copy_probe(lm: LM, c: Contrast, ts: list, expect_lang: Optional[str], max_new: int,

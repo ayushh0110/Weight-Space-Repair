@@ -78,6 +78,7 @@ class Workbench:
     pairsets: dict[str, list] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     requests: list[dict] = field(default_factory=list)          # request_capability
+    gates: dict[str, Any] = field(default_factory=dict)         # harm_probe: gate id -> harmprobe.Gate
     proposals: dict[str, E.Patch] = field(default_factory=dict)  # unverified, saved for the user only
     lab: Optional[Lab] = None
 
@@ -254,7 +255,11 @@ class Workbench:
         if spec.get("add"):
             a = spec["add"]
             kw["add"] = (self._vector(a["vector"]), float(a.get("alpha", 1.0)), [int(i) for i in a["layers"]])
-        unknown = set(spec) - {"zero_neurons", "zero_heads", "ablate", "add"}
+        if spec.get("gate"):
+            if spec["gate"] not in self.gates:
+                raise ValueError(f"unknown gate {spec['gate']!r}: make one with harm_probe")
+            kw["gated"] = self.gates[spec["gate"]]
+        unknown = set(spec) - {"zero_neurons", "zero_heads", "ablate", "add", "gate"}
         if unknown:
             raise ValueError(f"unknown interventions {sorted(unknown)}")
         return kw
@@ -447,6 +452,46 @@ class Workbench:
                 **({"proposal_id": req["proposal"]["id"]} if "proposal" in req else {}),
                 "note": "keep working on what you can do, or give_up citing this request; the report lists it "
                         "for the user"}
+
+    def harm_probe(self, depth: Optional[int] = None, up_sd: float = 2.0, margin_up: float = 0.5,
+                   margin_down: float = 0.0, direction: str = "both", read: Optional[list] = None) -> dict[str, Any]:
+        """The model's own reading of harm (deep/harmprobe.py, calibrated once per model and cached) and a gate built
+        on it: a gate id usable as intervene {"gate": id} in generate / read, and (in wsr program) as steer_eval
+        vector with mode "gated". read: up to 8 prompts whose probe logit to report (> 0 reads harmful)."""
+        from ..deep import harmprobe as HP
+
+        try:
+            probe = HP.calibrate(self.lm, template_kwargs=self.ctx.template_kwargs,
+                                 extra=getattr(self.ctx, "harm_extra", None) or None)
+        except ValueError as e:
+            return {"error": str(e)}
+        if not 0 <= float(up_sd) <= 6 or not 0 <= float(margin_up) <= 10 or not 0 <= float(margin_down) <= 10:
+            return {"error": "up_sd must be in [0, 6], margin_up and margin_down in [0, 10]"}
+        info = {k: v for k, v in probe.as_dict().items() if k not in ("levels",)}
+        info["summary"] = probe.summary()
+        out: dict[str, Any] = {"probe": info}
+        if not probe.viable:
+            out["warning"] = ("the diagnosis found this reading unusable: " + probe.why + ". A gate built on it is "
+                              "not expected to help")
+        try:
+            g = probe.gate(up_sd=float(up_sd), margin_up=float(margin_up), margin_down=float(margin_down),
+                           direction=direction, depth=depth)
+        except ValueError as e:
+            return {**out, "error": str(e)}
+        gid = f"h{len(self.gates) + 1}"
+        self.gates[gid] = g
+        out["gate_id"] = gid
+        out["gate"] = g.as_dict()
+        if read:
+            if not isinstance(read, list) or len(read) > 8:
+                return {**out, "error": "read: up to 8 prompts"}
+            out["logits"] = []
+            for p in read:
+                ids, _ = self._text_ids(p)
+                z = probe.logit(self.lm.run(ids, capture=("resid",)).resid, g.depth)
+                out["logits"].append({"prompt": p if isinstance(p, str) else str(p)[:120], "logit": round(z, 3),
+                                      "reads": "harmful" if z > 0 else "safe"})
+        return out
 
     def note(self, text: str) -> dict[str, Any]:
         """Keep a finding in the run's notebook (saved with the transcript and shown in the report)."""
@@ -1055,7 +1100,8 @@ MAX_RESULT = 20_000                # characters of one tool result
 
 
 NO_WEIGHT_EDITS = ("weight edits are off for this run (--no-weight-edits: the weights must not change): fix it with "
-                   "steer_eval (add or clamp) or settings_eval, then final_choice with its steering_id or settings_id")
+                   "steer_eval (add, clamp, or gated with a harm_probe gate) or settings_eval, then final_choice with "
+                   "its steering_id or settings_id")
 
 TOOLS: dict[str, Callable[..., dict]] = {
     "list_examples": Workbench.list_examples, "generate": Workbench.generate,
@@ -1066,7 +1112,7 @@ TOOLS: dict[str, Callable[..., dict]] = {
     "compute": Workbench.compute, "read": Workbench.read, "make_pairs": Workbench.make_pairs,
     "screen_layers": Workbench.screen_layers, "note": Workbench.note,
     "attribute_heads": Workbench.attribute_heads, "fit_edit": Workbench.fit_edit,
-    "request_capability": Workbench.request_capability,
+    "request_capability": Workbench.request_capability, "harm_probe": Workbench.harm_probe,
 }
 
 EDIT_KINDS = ("orthogonalise", "project", "scale_neurons", "scale_heads", "gate", "combine", "delta", "set_columns",
@@ -1150,8 +1196,9 @@ _SOURCE = {"type": "object", "description": "where the failing / working states 
 
 _INTERVENE = {"type": "object", "description": "activation interventions during the pass (no weight change): "
               "zero_neurons [[layer, neuron]], zero_heads [[layer, head]], ablate <vector ref> (removed from every "
-              "residual write), add {vector, alpha, layers} (added after those layers). A vector ref is a direction id "
-              "('d1', or 'd1@12' for its version after depth 12) or a workspace variable holding a d_model vector."}
+              "residual write), add {vector, alpha, layers} (added after those layers), gate <gate id from harm_probe> "
+              "(probe-gated refusal). A vector ref is a direction id ('d1', or 'd1@12' for its version after depth 12) "
+              "or a workspace variable holding a d_model vector."}
 _ITEMS = {"type": "array", "description": "texts: an example name, a prompt text (chat template applied), or {prompt | "
           "messages | raw, continuation?} (raw = no template; continuation is teacher-forced after it)",
           "items": {}}
@@ -1209,6 +1256,27 @@ SCHEMAS: list[dict[str, Any]] = [
          "evidence": {"type": "string", "description": "the tool results that show it"},
          "proposal": {"type": "object"}},
          "required": ["capability", "category", "what_it_would_do", "why_needed"]}},
+    {"name": "harm_probe", "description": "For refusal failures (over- or under-refusal): the model's OWN reading of "
+     "harm. A linear probe on the residual stream at the last prompt token, calibrated once per model on wsr's contrast "
+     "pools (and the goal's practice set in wsr program), scored on prompt families it never saw: its held-out AUC by "
+     "depth, how the model's refusals compare (false refusals, harmful compliance) and how many of those mistakes the "
+     "probe reads correctly, with a verdict (viable or not, and why). Builds a GATE on it: after one layer, where the "
+     "reply starts, the probe is read once; where it reads harmful (logit > margin_up) the refusal component is raised "
+     "to the refused level + up_sd standard deviations, where it reads safe (logit < -margin_down) it is lowered to the "
+     "answered level. Returns a gate_id: use it as intervene {\"gate\": id} in generate / read, and in wsr program as "
+     "steer_eval {vector: id, mode: gated}. No weights change. When the verdict is not viable the model has no reading "
+     "to gate on: do not spend budget on gates. Free: the probe is cached.",
+     "input_schema": {"type": "object", "properties": {
+         "depth": {"type": "integer", "description": "residual depth to gate at (k = after layer k - 1); default the "
+                                                     "probe's chosen depth; earlier depths leave more layers to act"},
+         "up_sd": {"type": "number", "minimum": 0, "maximum": 6},
+         "margin_up": {"type": "number", "minimum": 0, "maximum": 10},
+         "margin_down": {"type": "number", "minimum": 0, "maximum": 10},
+         "direction": {"type": "string", "enum": ["both", "up", "down"],
+                       "description": "up: only raise refusals where it reads harmful; down: only lower them where "
+                                      "it reads safe"},
+         "read": {"type": "array", "maxItems": 8, "description": "prompts whose probe logit to report"}},
+         "required": []}},
     {"name": "note", "description": "Write a finding into the run's notebook (kept in the transcript and report).",
      "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
     {"name": "list_examples", "description": "The failing and working prompts with their replies, the regression "

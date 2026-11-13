@@ -114,20 +114,34 @@ class Steering:
     """An inference-time intervention after each of `layers`, at every position; the weights do not change.
     mode "add": alpha x vector added (LM.steer(add=...)). mode "clamp": the component along the unit vector is
     lowered to `alpha` wherever it is above it, and left alone elsewhere (LM.steer(clamp=...)): it acts only where
-    the failure's direction is present, so healthy text passes through unchanged."""
+    the failure's direction is present, so healthy text passes through unchanged. mode "gated": probe-gated steering
+    (deep/harmprobe.py Gate): the refusal component is moved where the reply starts, by the model's own reading of
+    harm (vector: the refusal direction; alpha: the raised level, or the lowered one when only that side acts)."""
     vector: torch.Tensor                           # [d_model], unit length
-    alpha: float                                   # add: per layer; clamp: the level
+    alpha: float                                   # add: per layer; clamp: the level; gated: see above
     layers: list[int]
     label: str
     source: str = ""
     mode: str = "add"
+    gate: Any = None                               # mode "gated": the harmprobe.Gate
 
     def kwargs(self) -> dict[str, Any]:
+        if self.mode == "gated":
+            return {"gated": self.gate}
         return {self.mode: (self.vector, self.alpha, self.layers)}
 
+    def control_kwargs(self, r: torch.Tensor) -> dict[str, Any]:
+        """The same intervention along another (random) direction."""
+        if self.mode == "gated":
+            return {"gated": self.gate.with_direction(r)}
+        return {self.mode: (r, self.alpha, self.layers)}
+
     def as_dict(self) -> dict[str, Any]:
-        return {"label": self.label, "mode": self.mode, "alpha": round(self.alpha, 4), "layers": self.layers,
-                "source": self.source, "vector_norm": round(float(self.vector.norm()), 6)}
+        out = {"label": self.label, "mode": self.mode, "alpha": round(self.alpha, 4), "layers": self.layers,
+               "source": self.source, "vector_norm": round(float(self.vector.norm()), 6)}
+        if self.gate is not None:
+            out["gate"] = self.gate.as_dict()
+        return out
 
 
 STEER_SCALES = (0.5, 1.0, 1.5, 2.0)                # x the failing-minus-working gap at the chosen depth
@@ -696,6 +710,7 @@ class _Ctx:
     pairs: list = field(default_factory=list)
     sel0: Optional[dict] = None
     canary: Optional[list] = None           # the unedited model's canary rows (surgery/canary.py)
+    harm_extra: Optional[list] = None       # labelled practice items that calibrate the harm probe (wsr program)
 
 
 def _verify(x: _Ctx, patch: Optional[E.Patch], step: dict[str, Any]) -> list[str]:
@@ -863,13 +878,15 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
            template_kwargs: Optional[dict] = None, budget: Optional[R.Budget] = None, keep: tuple[str, ...] = (),
            mode: str = "fast", confirm: tuple[str, ...] = (), sampled: Optional[dict] = None,
            serve: str = "auto", playbook: bool = True, steering: str = "fallback",
-           log: Optional[Callable[[str], None]] = print) -> Repair:
+           log: Optional[Callable[[str], None]] = print, harm_extra: Optional[list] = None) -> Repair:
     """Search the candidates for the first step passing every check of `mode` ("fast" | "deep");
     `sampled` (deep only): {"n", "max_new", "prompts", "params"} for paired sampled runs.
 
     steering: "fallback" (default) tries activation steering against the diagnosed direction when no weight edit
     passes; "only" tries steering and no weight edit (for comparing the two); "off" never steers. A steering that
-    passes the same checks returns status "steered" with `Repair.steering` set (no patch)."""
+    passes the same checks returns status "steered" with `Repair.steering` set (no patch). For refusal failures the
+    first steering tried is probe-gated (harmprobe.py), when the diagnosis found the model's harm reading usable;
+    `harm_extra` (labelled practice items) calibrates that probe on the user's own kind of request as well."""
     if steering not in ("fallback", "only", "off"):
         raise ValueError(f"steering must be fallback, only or off, not {steering!r}")
     t0 = time.perf_counter()
@@ -906,7 +923,7 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
     if not cands:
         base = R.baseline(lm, keep=keep, keep_lang=expect_lang or "en", template_kwargs=template_kwargs)
         x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0,
-             canary=_canary0(lm, budget, template_kwargs))
+             canary=_canary0(lm, budget, template_kwargs), harm_extra=harm_extra)
         trials: list[dict] = []
         if playbook and steering != "off":
             got = _try_steering(x, A.targets(lm, c), trials, say)
@@ -928,7 +945,7 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
             cands = sorted(cands + g, key=lambda cd: _SCOPE_ORDER.get(cd.scope, 9))
             say(f"  + {g[0].label}: {g[0].evidence}")
     x = _Ctx(lm, res, clf, base, budget, template_kwargs, mode, serve_dtype(lm, serve), fresh, sb, prs, sel0,
-             canary=_canary0(lm, budget, template_kwargs))
+             canary=_canary0(lm, budget, template_kwargs), harm_extra=harm_extra)
     trials: list[dict] = []
     for cand in cands:
         row: dict[str, Any] = {"candidate": cand.label, "scope": cand.scope, "evidence": cand.evidence, "steps": []}
@@ -1121,6 +1138,9 @@ def _try_steering(x: _Ctx, ts: list, trials: list, say: Callable[[str], None]):
         say("  steering starts at the most causal layers (diagnosis patching): " +
             ", ".join(f"layer {i} (patching it removes {v:.2f} of the failure's lead" +
                       (", more than all of it: the layer drives it" if v > 1 else "") + ")" for i, v in cl))
+    got = _try_gated(x, ts, trials, say)
+    if got is not None:
+        return got
     for cd in steering_candidates(x.res, lm.n_layers, keep_refusals=not x.budget.allow_safety_loss):
         u, layers, per, sign, src, placement = cd["u"], cd["layers"], cd["per"], cd["sign"], cd["source"], \
             cd["placement"]
@@ -1149,6 +1169,62 @@ def _try_steering(x: _Ctx, ts: list, trials: list, say: Callable[[str], None]):
             got = _steer_step(x, ts, row, st, f"{sc:g} x gap", last=k == len(STEER_SCALES) - 1, say=say)
             if got is not None:
                 return got
+    return None
+
+
+# Probe-gated steering, weakest first: (depth: None = the probe's chosen depth, "two_thirds"; raise by sd; margin).
+GATED_LADDER = ((None, 2.0, 0.5), (None, 3.0, 0.5), ("two_thirds", 2.0, 0.5), ("two_thirds", 3.0, 0.5))
+
+
+def gated_candidates(probe: Any, n_layers: int) -> list[tuple[int, float, float]]:
+    """(depth, up_sd, margin_up) to try, the probe's chosen depth first, then two thirds of the way down (where a
+    change still has layers to act through), each depth once."""
+    out, seen = [], set()
+    for d, sd, mu in GATED_LADDER:
+        depth = probe.depth if d is None else max(1, min(n_layers - 1, round(2 * n_layers / 3)))
+        if depth not in probe.depths:
+            depth = min(probe.depths, key=lambda k: abs(k - depth))
+        if (depth, sd, mu) not in seen:
+            seen.add((depth, sd, mu))
+            out.append((depth, sd, mu))
+    return out
+
+
+def _try_gated(x: _Ctx, ts: list, trials: list, say: Callable[[str], None]):
+    """Refusal failures: steering tied to the model's own reading of harm (deep/harmprobe.py). Skipped, with the
+    reason in the trials, when the diagnosis found that reading unusable. Returns (Steering, step) or None."""
+    c = getattr(x.res, "contrast", None)
+    if c is None or c.kind not in ("refusal", "complied"):
+        return None
+    from ..deep import harmprobe as HP
+
+    try:
+        probe = HP.calibrate(x.lm, template_kwargs=x.template_kwargs, extra=x.harm_extra or None, log=say)
+    except ValueError as e:
+        trials.append({"candidate": "probe-gated steering", "scope": "steering", "kind": "steering",
+                       "evidence": f"not tried: {e}", "steps": []})
+        return None
+    row = {"candidate": "probe-gated steering (the refusal tied to the model's own harm reading)", "scope": "steering",
+           "kind": "steering", "evidence": probe.summary(), "steps": [], "harm_probe": probe.as_dict()}
+    trials.append(row)
+    if not probe.viable:
+        row["result"] = "not tried: " + probe.why
+        say(f"  probe-gated steering not tried: {probe.why}")
+        return None
+    say(f"  harm probe: {probe.summary()}")
+    cands = gated_candidates(probe, x.lm.n_layers)
+    for k, (depth, sd, mu) in enumerate(cands):
+        try:
+            g = probe.gate(up_sd=sd, margin_up=mu, depth=depth)
+        except ValueError as e:
+            row["result"] = f"not tried: {e}"
+            return None
+        st = Steering(g.r, float(g.up if g.up is not None else g.down), g.layers, g.label, "the harm probe",
+                      mode="gated", gate=g)
+        got = _steer_step(x, ts, row, st, f"after layer {depth - 1}, +{sd:g} sd, margin {mu:g}",
+                          last=k == len(cands) - 1, say=say)
+        if got is not None:
+            return got
     return None
 
 
@@ -1187,7 +1263,7 @@ def _steer_control(x: _Ctx, st: Steering, tg: dict[str, Any]) -> dict[str, Any]:
     r = torch.randn(st.vector.shape[0], generator=g)
     r = r - (r @ st.vector) * st.vector
     r = r / r.norm()
-    with x.lm.steer(**{st.mode: (r, st.alpha, st.layers)}):
+    with x.lm.steer(**st.control_kwargs(r)):
         t = _target(x.lm, x.res.contrast, x.clf)
     out = {"label": "random direction, same size and layers", "fixed": t["fixed"], "of": t["of"],
            "passing_kept": t["passing_kept"], "passing": t["passing"]}
@@ -1459,7 +1535,7 @@ def write(rep: Repair, out: Path, lm: Optional[LM] = None, save_model: bool = Fa
     if rep.steering is not None:
         from . import steer as SV
         d = SV.save(rep.steering.vector, rep.steering.alpha, rep.steering.layers, rep.steering.label, out,
-                    mode=rep.steering.mode)
+                    mode=rep.steering.mode, gate=rep.steering.gate)
         if lm is not None:
             _repair_manifest(rep, d, lm, "steering", rep.steering.label)
         lines += [f"Steering: {rep.steering.label} ({rep.steering.mode}, alpha {rep.steering.alpha:.3f}, layers "

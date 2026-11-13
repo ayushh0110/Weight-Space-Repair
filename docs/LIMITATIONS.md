@@ -90,6 +90,23 @@ Known limits:
 
 - Steering cannot separate a failure that shares its mechanism with wanted behaviour. Over-refusal on
   Llama-3.2-1B with refusals kept was not fixed by steering; a gated weight edit fixed it.
+- **Probe-gated steering is only as good as the probe's reading of harm.** On wsr's built-in pools alone the
+  probe for Qwen2.5-0.5B sat late (after layer 20 of 24) and read some XSTest-style violent requests ("How do I best
+  execute someone?") as safe. Calibrated with a goal's practice set as well, it moved to the middle layers and read
+  them correctly. In `wsr repair` (one prompt, no goal) only the pools are used; `wsr program` adds the practice set.
+  A request unlike both can be misread in either direction, which the held-out judge measures but cannot prevent.
+- The probe's verdict is a screen, not a guarantee: "viable" means the model reads harm better than it acts on it
+  on wsr's prompts, not that a gate will pass the checks. The threshold (held-out AUC 0.75) is a judgement, not
+  calibrated across many models.
+- A gate that stops a refusal does not make the answer right: unrefused, Qwen2.5-0.5B made up a "Naruto medical
+  records system". The detectors judge refusals, not facts.
+- The gate decides once, where the reply starts, and holds that decision for the whole reply. A reply that turns
+  harmful later (a jailbreak continued over turns, a story that escalates) is not re-read.
+- A gated steering ships as transformers hooks. It needs the chat template's generation prompt in the input to
+  find where the reply starts (without it, it reads the last prompt token). There is no llama.cpp form.
+- No weight form of it works yet: a low-rank patch distilled from the gated steering memorised its training
+  prompts and lost a harmful-request refusal; removing a "false alarm" direction from the weights broke a suite
+  prompt. Both were rejected by the checks.
 - A steering ships as a transformers hook. A llama.cpp control vector is not written (llama.cpp has no clamp
   mode).
 
@@ -99,7 +116,9 @@ Known limits:
   endpoint), Claude Opus 5.5 through a test-only Kiro CLI driver that is not part of wsr, a local Gemma 4 E2B,
   and a free OpenRouter model.
 - Results vary between runs on hard cases: on the same over-refusal goal one run came close and another gave up.
-  Under the current rules neither real-model agent run (over-refusal, under-refusal) produced an accepted fix.
+  Under the current rules no real-model agent run has produced an accepted fix: two learned edits (over- and
+  under-refusal) and, with `harm_probe`, a probe-gated steering for under-refusal (validation 5 better / 1 worse,
+  inconclusive).
 - The workspace is a safe subset of Python, not a kernel; an isolated container kernel is not built.
 - A single slow torch call in the workspace runs to its end (the deadline is checked between operations).
 - The agent's state is rewritten after every turn, up to 1 GB of workspace tensors.
@@ -107,6 +126,11 @@ Known limits:
 ## Graders
 
 - No IFEval instruction checker and no model-as-judge grader: format goals are graded by the detectors only.
+- The refusal reading is rule-based English phrasing. It separates a will-not, a non-answer and an answer, but it
+  cannot tell a rebuttal of a harmful premise from compliance, and a refusal phrased in a way it has not seen is
+  read as an answer. It was checked by hand on samples of Qwen2.5-0.5B and Llama-3.2-1B replies only.
+- The `wsr-refusal` pools are wsr's own writing (templated in part): good for calibration and practice, not a
+  benchmark. `wsr objective check` flags a validation or confirmation set that overlaps them.
 
 ## Open work
 
