@@ -1,0 +1,10 @@
+{
+  "model": "local",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 17 * 23?"
+    }
+  ],
+  "max_tokens": 256
+}

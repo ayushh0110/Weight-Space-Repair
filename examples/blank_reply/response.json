@@ -1,0 +1,24 @@
+{
+  "id": "chatcmpl-example",
+  "object": "chat.completion",
+  "model": "local",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "The user asks for 17 * 23. I can split 23 into 20 and 3. 17 * 20 = 340. 17 * 3 = 51. So the product is 340 + 51. Let me check that another way before I answer. 23 * 17 = 23 * 10 + 23 * 7 = 230 + 161. Now 230 + 161, adding the hundreds first, then the tens. Both routes should agree, so I will compare them digit by digit. Starting again from 17 * 20"
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 18,
+    "completion_tokens": 256,
+    "total_tokens": 274,
+    "completion_tokens_details": {
+      "reasoning_tokens": 256
+    }
+  }
+}

@@ -67,6 +67,10 @@ or `unexplained`; `no_failure_observed` when nothing failed. Only a failure that
 called `weight_level`. `--handoff DIR` writes the failing request, the response and the report for the
 weight-level stages; `--json` prints the report as JSON.
 
+A sample saved request and response are in `examples/blank_reply/` (a reply that came back empty):
+`wsr triage --response examples/blank_reply/response.json --request examples/blank_reply/request.json` ends in
+a `request` verdict, because the token budget went to reasoning.
+
 Output presets for the detectors: `chat` (default), `strictJson`, `longForm`, `lenient`. Expected language:
 `--expect-lang` (ISO code) or `--expect-script`.
 

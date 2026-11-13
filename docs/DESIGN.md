@@ -7,7 +7,8 @@ for what is not tested or not built, [LIMITATIONS.md](LIMITATIONS.md).
 How to read this: sections 1-3 design the triage layer from the tools it draws on; 4 is deep diagnosis;
 5 surgery; 6 the surgery agent; 7 scope; 8-9 goal files, profiles, the judge, `wsr program` and GGUF
 export; 10-17 later rounds (speed, protecting the machine, settings fixes, the full agent toolkit,
-caching, steering); 18 the pre-release audit. Later sections supersede earlier ones where they differ, and
+caching, steering); 18 the pre-release audit; 19 the second review round and the stricter acceptance rule;
+20 over- and under-refusal and the harm probe. Later sections supersede earlier ones where they differ, and
 results are reported as measured at the time, including the runs that failed.
 
 Scope at the start (v1): a triage CLI for small open-weight models (Qwen, Gemma, Llama under ~4B),
@@ -144,7 +145,7 @@ Every failure cause any of the above detects, plus the report's additions
 | Decoding-caused loops (greedy vs sampled) | Raschka | `probes.differential` |
 | Backend / quant / grammar-caused failure | report (novel) | `probes.differential` (next) |
 | Known upstream bug | report | `known_issues` |
-| Weight-level | report | verdict only; deep diagnosis is Milestone 3 |
+| Weight-level | report | verdict only; deep diagnosis is Milestone 3 (built: section 4) |
 
 Added after live testing against llama-server (Gemma 4 E2B Q4_0, thinking on):
 
@@ -255,7 +256,7 @@ it needs the full-precision weights the deep layer already requires:
 | Abliteration tools (heretic, FailSpy, DECCP, ErisForge) | refusal-direction removal | refusal entry of the known-direction library (step 6); removal itself is surgery, not triage |
 | Known directions: refusal, end-of-turn, language, repetition | named behaviours | step 6 library, computed on the model itself (no downloads): harmful vs harmless pairs, gradient of the end-of-turn logit, English vs 8 languages, second vs first copy of a repeated sentence |
 | Sparse autoencoders / transcoders (SAELens, Gemma Scope 2) and circuit-tracer attribution graphs | feature-level explanations | not yet (to do): only for models with published SAEs / transcoders (Gemma 2/3, Llama 3.x) |
-| MIT Weight-Space Programming `weightspace` harness (Apache-2.0) | agent tools: list / describe / read tensor slices, SVD, forward budget | step 7 dossier is the deterministic half; the agent loop is Milestone 4 |
+| MIT Weight-Space Programming `weightspace` harness (Apache-2.0) | agent tools: list / describe / read tensor slices, SVD, forward budget | step 7 dossier is the deterministic half; the agent loop is Milestone 4 (built: section 6) |
 | WeightWatcher (spectral analysis) | data-free layer quality (power-law alpha) | `alpha` in the weight dossier (Hill estimate of the eigenvalue tail) |
 | Super weights (Yu et al. 2024) | single scalars whose loss breaks a model | `quant` reports the largest down_proj entries and their quantised values |
 | SecAI-Hub/gguf-guard | GGUF per-tensor stats, block checks, robust baselines | `quant`: kurtosis, outliers, sparsity, NaN/Inf, block-scale entropy, zero / repeated blocks, bin saturation, per-role median/MAD |
@@ -971,6 +972,13 @@ local edits; the agent can build it with any sources.
 
 What can be claimed today, and what is still missing before "full weight-space programming" in
 the sense of Takehi et al. 2026 is a fair description.
+
+*Written before sections 8-20, and kept as it stood. Since then: `wsr program` puts the agent on an
+objective (section 9); patches are exported to GGUF and judged on llama-server, where they survive Q8_0 and
+Q4_K_M (sections 9 and 19); the agent has run live on real failures, with no fix accepted under the current
+rules (sections 14, 19 and 20). Still open: sets remain small, nothing above 1.5B is tested, and the
+container kernel is not built. [RESULTS.md](RESULTS.md) and [LIMITATIONS.md](LIMITATIONS.md) have the
+current state.*
 
 **Built and shown on real models** (Qwen2.5-0.5B / 1.5B, Qwen3.5-0.8B, Llama-3.2-1B):
 - triage of a live server (request, template, sampling, quantisation, runtime);

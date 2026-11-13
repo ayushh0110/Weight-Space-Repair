@@ -2,19 +2,78 @@
 
 > No model fails silently.
 
-Give it a failing prompt and an open-weight model. It finds out what failed and why. Causes
-outside the weights (file, config, request, sampling, runtime) get an exact fix. A failure
-that survives all of those is diagnosed inside the network at full precision, and wsr looks
-for the smallest fix that passes its checks: a weight patch, an activation steering, or
-serving settings. A rule-based playbook goes first; a frontier model with weight-editing
-tools can take over when it fails. Nothing ships without a paired judge on data the fix never saw (an exact
-sign test and a minimum gain), a regression suite and a semantic canary; refusals of harmful requests are kept
-by default. Every judged fix carries a `MANIFEST.json` that says what it was made for, how it was judged and
-why it shipped or not, and a patch refuses any weights other than the exact ones it was made on.
+When an open-weight model gives a bad reply (blank, looping, the wrong language, a refusal of a harmless
+request), wsr finds out why. Most failures are not the model: they are a chat template, a sampler setting, a
+truncated context or one quantised tensor, and wsr names the cause and the exact fix. A failure that survives
+all of those is traced inside the network at full precision, and wsr looks for the smallest change that repairs
+it: a weight patch, an activation steering, or serving settings. A fix ships only when a judge accepts it on
+data the fix never saw.
 
-The triage layer combines the techniques of llm-output-guard, llm-stopcheck, LLMDoctor,
-ModelVet and Raschka's repetition checklist into one layered pipeline, with a verdict engine
-that links symptoms to causes.
+| Question | Command | What you get | Needs |
+|---|---|---|---|
+| Is it my setup or the model? | `wsr triage` | one cause and its fix | nothing: no GPU, no dependencies |
+| Did quantisation break it? | `wsr quant`, `wsr qbisect` | the tensor responsible | the GGUF and the original weights |
+| Where in the weights? | `wsr deep` | the layer, head or neuron, tested against random controls | the `deep` extra (torch) |
+| Can it be fixed? | `wsr repair`, `wsr fix`, `wsr program` | a patch, a steering or settings, or the reason there is none | the `deep` extra (torch) |
+
+**Status: beta, small models only.** Deep diagnosis is tested on models up to 1.5B parameters, repair and
+`wsr program` up to 1B (Qwen2.5-0.5B and 1.5B, Llama-3.2-1B, Qwen3.5-0.8B). Every number here was measured on
+one 4 GB GTX 1650. [docs/LIMITATIONS.md](docs/LIMITATIONS.md) lists what is not tested.
+
+## Try it in a minute
+
+No GPU and no dependencies:
+
+```bash
+git clone https://github.com/ayushh0110/Weight-Space-Repair.git
+cd Weight-Space-Repair
+pip install -e .
+wsr triage --response examples/blank_reply/response.json --request examples/blank_reply/request.json
+```
+
+The example is a saved reply that came back empty (a sample file, written for this page). What wsr prints:
+
+```text
+3. Response
+  [FAIL] REASONING_EXHAUSTED: cap reached before any answer: the budget went to reasoning
+         fix: raise max_tokens (currently 256) or lower the reasoning effort / thinking budget
+
+4. Output signals
+  [FAIL] EMPTY 1.00: no usable content
+         fix: see verdict: blank output has several possible causes
+
+========================================================================
+VERDICT: REQUEST
+  blank output explained by REASONING_EXHAUSTED: cap reached before any answer: the budget went to reasoning
+  cause: REASONING_EXHAUSTED (request)
+  next:
+    - raise max_tokens (currently 256) or lower the reasoning effort / thinking budget
+    - apply the fix and rerun `wsr triage` with the same prompt to confirm the flip
+========================================================================
+```
+
+Against your own server, with one-factor reruns that show which setting flips the failure:
+
+```bash
+wsr triage --endpoint http://localhost:8080 --model local --prompt "your failing prompt" --differential
+```
+
+## How a fix is judged
+
+A rule-based playbook goes first; a model with weight-editing tools (a frontier model, or a local one behind any
+OpenAI-compatible server) can take over when it fails. Nothing ships without a paired judge on data the fix
+never saw (an exact sign test and a minimum gain), a regression suite and a semantic canary; refusals of harmful
+requests are kept by default. Every judged fix carries a `MANIFEST.json` that says what it was made for, how it
+was judged and why it shipped or not, and a patch refuses any weights other than the exact ones it was made on.
+
+The fixes the judge rejected are reported next to the ones it accepted.
+
+## Where it comes from
+
+The triage layer combines the techniques of llm-output-guard, llm-stopcheck, LLMDoctor, ModelVet and Raschka's
+repetition checklist into one layered pipeline, with a verdict engine that links symptoms to causes. The repair
+agent follows the weight-space programming of Takehi et al. (2026), with the playbook and the judge in front of
+it. Ported code is listed in `NOTICE`.
 
 **Documentation:** [docs/GUIDE.md](docs/GUIDE.md) covers every command, check, output file and option;
 [docs/RESULTS.md](docs/RESULTS.md) every result measured so far, with its control;
@@ -22,6 +81,19 @@ that links symptoms to causes.
 how each part was built.
 
 ## Results so far
+
+Three findings, each with its setup and control in [docs/RESULTS.md](docs/RESULTS.md):
+
+- **A quantised file that refuses, traced to one tensor.** Qwen2.5-0.5B's official Q4_0 refuses "Give me 40
+  different names for a cat"; the full-precision model answers. `wsr qbisect` names `blk.16.attn_v`: quantising
+  that tensor alone makes the full-precision model refuse, and three random tensors do not.
+- **Removing the refusal direction against gating it.** On 167 safe prompts that sound alarming and 124 harmful
+  ones (Qwen2.5-0.5B), the model refuses 48 of the safe ones and answers 28 of the harmful ones. Removing the
+  refusal direction gives 9 and 108. Probe-gated steering, which ties the refusal to the model's own reading of
+  harm, gives 11 and 5.
+- **A judge that rejects.** An agent's edit took under-refusal from 88% to 96% and was rejected because the model
+  lost three easy answers it had right before. Two fixes shipped under an earlier, looser rule did not reproduce
+  and are withdrawn.
 
 Results from `wsr program` under the current rules: the original and the fix answer the same validation items
 with the same seeds; a fix is accepted only when the exact one-sided sign test is below 0.05 (divided by the
@@ -56,9 +128,6 @@ answer. All of it, with the setups and the failures, is in [docs/RESULTS.md](doc
 | **Verification and provenance** | three data sets (practice, validation, a confirmation set evaluated once and recorded as used), a 32-item semantic canary, guardrails on the served GGUF, exact SHA-256 hashes of every tensor of the base model, and a `MANIFEST.json` per fix with its evidence and decision (`wsr patch show`, `wsr patch check`) |
 | **Shipping** | apply, revert, or export a patch to GGUF through llama.cpp; a patch refuses weights it was not made for, and a revert is checked to restore them exactly |
 | **Around it** | llama-server or batched PyTorch backends, results cached per model, questions before any download or server start |
-
-**Status: beta.** Deep diagnosis is tested on models up to 1.5B parameters, repair and `wsr program`
-up to 1B (Qwen2.5-0.5B and 1.5B, Llama-3.2-1B, Qwen3.5-0.8B), all on a 4 GB GPU. Triage needs no GPU.
 
 ## Install
 

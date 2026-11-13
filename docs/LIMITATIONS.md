@@ -65,7 +65,8 @@ Known limits:
   prompt; data guardrails in a goal file add more.
 - **Sets in the tested runs were small** (validation 12 to 121 items, 6 to 18 failing; confirmation 5 to 15
   failing). The exact sign test is honest about that: with k failing items the best possible p is 0.5^k, so a
-  set with 5 failing items cannot confirm anything at 0.05 (the power check says so before the run). The
+  set with 4 failing items cannot confirm anything at 0.05 (the power check says so before the run), and one
+  with 5 confirms only when all five are fixed and none is lost. The
   correction counts the candidate slots of one run (1 or 2), not every run you make on the same validation set;
   looks are logged, not corrected for.
 - **The confirmation registry is local.** A used confirmation set is recorded by its content hash under the
