@@ -56,6 +56,48 @@ def test_symbol_soup():
     assert "SYMBOL_SOUP" not in failing("------------------------------\nA table header line follows.")
 
 
+def test_glued_word_chains_from_corrupted_weights_are_garbage():
+    # replies of Qwen2.5-0.5B with one MLP layer's columns scaled 100x: every character is a normal letter
+    damaged = ("ThisApp's questionPIntack:12...\n\n22?\n\nNowlyLookingUpJntChecking (The Questioning-Notch)\n\n"
+               "22YesThisIsGnomeInventedTheFirstEver (ThisMOvering(")
+    assert "GLUED_WORDS" in failing(damaged)
+    # healthy: brands, product names and one identifier in prose; code is not read
+    healthy = ("Check websites like Slickdeals, RetailMeNot, and Coupons.com on your iPhone. JavaScript and "
+               "PowerPoint skills help, and YouTube has tutorials. Call `getElementById` or "
+               "```js\nconst el = document.getElementById('x'); el.addEventListener('click', onClickHandler);\n```")
+    assert "GLUED_WORDS" not in failing(healthy)
+    assert "GLUED_WORDS" not in failing("Use YourStoredProcedureName in the EXEC statement shown above.")
+    # healthy replies earlier versions flagged: a coined name repeated, hashtags, and a code block left open when
+    # the reply was cut
+    assert "GLUED_WORDS" not in failing("**Introducing CareAtHome** At CareAtHome, we help patients at home. "
+                                        "Choose CareAtHome for daily support and follow-up visits.")
+    assert "GLUED_WORDS" not in failing("Join us today! #PhysicsSimulation #RealWorldPhysics #TechStartups "
+                                        "#BombsInTech #VirtualReality and follow @RealWorldPhysics")
+    assert "GLUED_WORDS" not in failing("This program shows a fake error.\n\n**PrankJokeVirus.py**\n```python\n"
+                                        "import random\n\nclass PrankJokeVirus:\n    def showFakeError(self):")
+
+
+def test_scripts_glued_over_several_pairs_are_garbage():
+    damaged = "#aboCon同斯坦ani причulton干ontaayer:：:::制nt.ACTIONnt雀 зависитaker loaded妙:ake:Tokenizernt선"
+    assert "SCRIPT_GLUE" in failing(damaged)
+    for healthy in (
+            "我们可以使用Python编写程序，然后用GitHub管理代码。",                 # Latin terms in Chinese
+            "日本語のテキストはひらがなとカタカナと漢字を混ぜて書きます。",          # han + kana
+            "ใช้Pythonเขียนโปรแกรมได้ง่าย และใช้Excelคำนวณ",                     # Latin terms in Thai
+            "Hello in other languages: 你好 (Chinese), Привет (Russian), 안녕하세요 (Korean), مرحبا (Arabic).",
+            "27. V锐角星群 S\n28. X角星群 T\n29. Y角星群 U\n30. Z角星群 V",           # one pair, by habit
+            "সবচেয়ে অधিক ভিতরের মোট আয়তন = 15 + 1 = 16 ইঞ্চি"):                   # one stray Devanagari letter
+        assert "SCRIPT_GLUE" not in failing(healthy), healthy
+
+
+def test_two_broken_characters_mid_reply_are_garbage_one_is_not():
+    assert "BROKEN_UTF8" in failing("The answer is � clear, and the � rest follows from the first step.")
+    # a healthy Qwen2.5-0.5B Thai reply with one stray character (the share rule, 1% of the text, still applies)
+    thai = ("ยในการล้างรถในหนึ่งปีได้ว�ดังนี้:\n\n1. 4 ครั้งต่อเดือน: 4 × $15 = $60\n\n2. 1 ปี: $60 × 12 = $720\n\n"
+            "จากนั้น, ค่าน้ำหนักของการล้างรถทั้งหมดในหนึ่งปีคือ $720 ซึ่งเป็นคำตอบสุดท้าย")
+    assert "BROKEN_UTF8" not in failing(thai)
+
+
 def test_control_token_leak_and_invented_turn():
     assert {"CONTROL_TOKEN_LEAK", "INVENTED_TURN"} <= failing(
         "Hello! How can I help?<|im_end|>\nuser: tell me a joke please.")
@@ -147,3 +189,38 @@ def test_a_character_cut_at_the_token_limit_is_not_broken_utf8():
     middle = "abc \ufffd\ufffd\ufffd def ghi"
     assert broken_utf8_score(middle)[0] == 1.0                 # inside the text: still broken
     assert cut_tail("ok \ufffd\ufffd\ufffd\ufffd") == 0                # 4 in a row is not one cut character
+
+
+def test_dry_penalises_only_a_token_that_extends_a_repeat_and_stops_at_breakers():
+    from wsr.deep.dry import penalties
+
+    brk = {9}.__contains__                       # token 9 plays the newline
+    # ... A B C ... A B -> C would extend a 2-token repeat: penalised (allowed length 2: base ** 0)
+    assert penalties([1, 2, 3, 5, 1, 2], brk, 0.8, 1.75, 2) == {3: 0.8}
+    # a longer repeat gets more: A B C D ... A B C -> D, length 3
+    assert abs(penalties([1, 2, 3, 4, 6, 1, 2, 3], brk, 0.8, 1.75, 2)[4] - 0.8 * 1.75) < 1e-9
+    # a single repeated token is under the allowed length
+    assert penalties([1, 3, 5, 1], brk, 0.8, 1.75, 2) == {}
+    # a breaker ends the match: "1 2 \n 1 2" -> the match is cut at the newline, and right after a breaker nothing
+    assert penalties([1, 2, 9, 1, 2, 9], brk, 0.8, 1.75, 2) == {}
+    assert penalties([7, 1, 2, 3, 9, 7, 1, 2], brk, 0.8, 1.75, 2)[3] == 0.8 * 1.75
+    # the exponent is bounded
+    long = list(range(100)) * 2
+    assert max(penalties(long[:-1], brk, 1.0, 1.75, 2).values()) < float("inf")
+
+
+def test_dry_settings_are_checked_and_reach_generation_and_llama_server():
+    from wsr.program.backends import _sampling_body
+    from wsr.program.objective import Protocol
+    from wsr.program.program import settings_problem, settings_howto, with_settings
+
+    assert settings_problem({"dry_multiplier": 0.8}) == ""
+    assert "dry_multiplier" in settings_problem({"dry_base": 2.0})
+    assert "whole number" in settings_problem({"dry_multiplier": 0.8, "dry_allowed_length": 2.5})
+    assert "[0.0, 5.0]" in settings_problem({"dry_multiplier": 9})
+    p = with_settings(Protocol(max_new_tokens=32), {"dry_multiplier": 0.8, "dry_allowed_length": 3})
+    assert p.gen_kwargs()["dry"] == {"multiplier": 0.8, "base": 1.75, "allowed_length": 3}
+    assert "dry_multiplier 0.8" in p.describe() and "greedy" in p.describe()
+    body = _sampling_body(p, None)
+    assert body["dry_multiplier"] == 0.8 and body["dry_penalty_last_n"] == -1 and body["top_k"] == 1
+    assert any("--dry-multiplier 0.8" in x for x in settings_howto(Protocol(), {"dry_multiplier": 0.8}))

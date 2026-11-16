@@ -44,7 +44,10 @@ import torch
 from .lm import LM, _first, _replace_first
 
 CACHE_KIND = "harm-probe"
-VERSION = 2
+VERSION = 4            # 4: cross-fitted readings kept (HarmProbe.estimate), the goal's extra kind recorded
+# Calibration prompt kinds, as bit flags in HarmProbe.KIND
+K_HARM, K_ANSWER, K_DECLINE, K_REFUSE, K_GOAL, K_PLAIN = 1, 2, 4, 8, 16, 32
+BASE_KIND = "harm-probe-pools"   # the built-in pools' replies and residuals, shared by every goal's calibration
 MIN_AUC = 0.75                # below this the model has no usable linear reading of harm
 MIN_READS_ERRORS = 0.5        # the probe must read at least this share of the model's refusal mistakes correctly
 PER_SET = {"safe": 260, "harmful": 200, "plain": 40}
@@ -219,6 +222,9 @@ class HarmProbe:
     n_layers: int = 0
     held_out: str = "random half"          # how the held-out AUC was measured
     extra: int = 0                         # labelled items from the goal added to the pools
+    extra_kind: str = ""                   # the goal's items: "" (none), "both" kinds, "safe" or "harm" only
+    ZC: Optional[torch.Tensor] = None      # [L+1, N] cross-fitted logit of every calibration prompt (0: not fitted)
+    KIND: Optional[torch.Tensor] = None    # [N] bit flags K_* of every calibration prompt
 
     @property
     def depths(self) -> list[int]:
@@ -258,25 +264,55 @@ class HarmProbe:
              depth: Optional[int] = None) -> float:
         return self.logit(lm.run(lm.encode(messages, **(template_kwargs or {})), capture=("resid",)).resid, depth)
 
-    def gate(self, up_sd: float = 2.0, margin_up: float = 0.5, margin_down: float = 0.0, direction: str = "both",
+    def gate(self, up_sd: float = 2.0, margin_up: float = 0.5, margin_down: float = 0.0,
              depth: Optional[int] = None) -> Gate:
-        """The gate built on this probe at a depth (default: the chosen one). direction: both, up (only raise
-        refusals where it reads harmful) or down (only lower them where it reads safe)."""
+        """The gate built on this probe at a depth (default: the chosen one). It always acts both ways: it lowers the
+        refusal where the probe reads the request as safe and raises it where it reads harmful. A one-sided gate is
+        not offered: lowering only cannot protect a harmful request the probe misreads as safe (on Qwen2.5-0.5B an
+        agent's lower-only gate fixed over-refusal on validation and lost 3 of 75 harmful refusals, gaining none),
+        and raising only leaves the model's own false refusals of prompts it reads as safe. Two-way can still lower a
+        misread harmful request; margin_down sets how sure the probe must be before it lowers, the raising side is
+        what keeps the harmful set refused overall, `estimate` says how often each side would act, and the judge's
+        guardrails measure both."""
         d = self._check(depth)
-        if direction not in ("both", "up", "down"):
-            raise ValueError("direction must be both, up or down")
         r = self.R[d]
         if float(r.norm()) == 0 or not self.LV[d]:
             raise ValueError("no refusal direction: on the calibration prompts the model refuses almost nothing or "
                              "almost everything")
         lv = self.LV[d]
-        up = lv["refused"] + float(up_sd) * lv["sd_refused"] if direction in ("both", "up") else None
-        down = lv["answered"] if direction in ("both", "down") else None
-        label = (f"probe-gated refusal after layer {d - 1} ({direction}"
-                 + (f"; raised to the refused level + {up_sd:g} sd where the probe reads harmful by > {margin_up:g}"
-                    if up is not None else "")
-                 + ("; lowered to the answered level where it reads safe" if down is not None else "") + ")")
+        up = lv["refused"] + float(up_sd) * lv["sd_refused"]
+        down = lv["answered"]
+        label = (f"probe-gated refusal after layer {d - 1} (raised to the refused level + {up_sd:g} sd where the probe "
+                 f"reads harmful by > {margin_up:g}; lowered to the answered level where it reads safe)")
         return Gate(d, self.W[d], self.B[d], r, up, down, float(margin_up), float(margin_down), self.head, label)
+
+    def estimate(self, g: Gate) -> Optional[dict[str, Any]]:
+        """How often gate `g` would act, on calibration prompts each read by a probe fold that did not see it: how many
+        harmful requests the model answers it would raise (the ones it is for), how many it refuses it would lower (a
+        risk), how many safe look-alikes and goal prompts it would raise (false refusals). Acting is not always
+        changing the reply. None when the probe keeps no readings (an older cache)."""
+        if self.ZC is None or self.KIND is None or g.depth >= self.ZC.shape[0]:
+            return None
+        z, k = self.ZC[g.depth], self.KIND.long()
+        raised = (z > g.margin_up) if g.up is not None else torch.zeros_like(z, dtype=torch.bool)
+        lowered = (z < -g.margin_down) if g.down is not None else torch.zeros_like(z, dtype=torch.bool)
+
+        def has(flag: int) -> torch.Tensor:
+            return (k & flag) > 0
+
+        def count(sel: torch.Tensor, act: torch.Tensor) -> dict[str, int]:
+            return {"acts_on": int((sel & act).sum()), "of": int(sel.sum())}
+        harm, goal, plain = has(K_HARM), has(K_GOAL), has(K_PLAIN)
+        safe = ~harm & ~plain & ~goal
+        out = {"harmful_the_model_answers_raised": count(harm & has(K_ANSWER), raised),
+               "harmful_the_model_refuses_lowered": count(harm & has(K_DECLINE), lowered),
+               "safe_lookalikes_raised": count(safe, raised),
+               "safe_the_model_refuses_lowered": count(safe & has(K_REFUSE), lowered)}
+        if bool((goal & ~harm).any()):
+            out["goal_prompts_raised"] = count(goal & ~harm, raised)
+        out["note"] = ("on the calibration prompts, each read by a probe fold that did not see it; acting is not always "
+                       "changing the reply")
+        return out
 
     def summary(self) -> str:
         be, re_ = self.behaviour, self.reads_errors
@@ -298,12 +334,16 @@ class HarmProbe:
                 "why": self.why, "counts": self.counts, "extra_items": self.extra,
                 "levels": {k: round(v, 4) for k, v in self.levels.items()},
                 "has_refusal_direction": self.r is not None, "min_auc": MIN_AUC, "held_out": self.held_out,
-                "version": VERSION}
+                "extra_kind": self.extra_kind, "version": VERSION}
 
     def to_cache(self) -> tuple[dict, dict[str, torch.Tensor]]:
         meta = {**self.as_dict(), "B": self.B, "LV": self.LV, "head": self.head, "n_layers": self.n_layers,
                 "auc_raw": self.auc, "lookalike_raw": self.lookalike_auc, "auc_by_depth_raw": self.auc_by_depth}
-        return meta, {"W": self.W.detach().float().cpu().contiguous(), "R": self.R.detach().float().cpu().contiguous()}
+        t = {"W": self.W.detach().float().cpu().contiguous(), "R": self.R.detach().float().cpu().contiguous()}
+        if self.ZC is not None and self.KIND is not None:
+            t["ZC"] = self.ZC.detach().float().cpu().contiguous()
+            t["KIND"] = self.KIND.detach().to(torch.int32).cpu().contiguous()
+        return meta, t
 
     @classmethod
     def from_cache(cls, m: dict, t: dict[str, torch.Tensor]) -> "HarmProbe":
@@ -311,7 +351,8 @@ class HarmProbe:
                    list(m["auc_by_depth_raw"]), float(m["auc_raw"]), float(m["lookalike_raw"]), dict(m["behaviour"]),
                    dict(m["reads_errors"]), bool(m["viable"]), str(m["why"]), dict(m["counts"]),
                    [int(x) for x in m.get("head", [])], int(m.get("n_layers", 0)),
-                   str(m.get("held_out", "random half")), int(m.get("extra_items", 0)))
+                   str(m.get("held_out", "random half")), int(m.get("extra_items", 0)), str(m.get("extra_kind", "")),
+                   t.get("ZC"), t.get("KIND"))
 
 
 def _classify(lm: LM, items: list[dict], max_new: int, template_kwargs: Optional[dict]) -> list[str]:
@@ -324,6 +365,44 @@ def _classify(lm: LM, items: list[dict], max_new: int, template_kwargs: Optional
         body = [t for t in g if t not in lm.eot_ids]
         out.append(refusal_class(lm.tok.decode(body, skip_special_tokens=True)))
     return out
+
+
+def _answers(lm: LM, items: list[dict], max_new: int, template_kwargs: Optional[dict]) -> tuple[list[str], torch.Tensor]:
+    """Each prompt's reply class and its residual stream at the last prompt token, [N, L+1, d]."""
+    cls = _classify(lm, items, max_new, template_kwargs)
+    X = lm.last_resid_batch([lm.encode(it["messages"], **(template_kwargs or {})) for it in items])
+    return cls, X
+
+
+def _pool_dep(per_set: dict, max_new: int, template_kwargs: Optional[dict]) -> dict:
+    from . import refusal_pools as RP
+    return {"version": VERSION, "pools": RP.VERSION, "per_set": per_set, "max_new": max_new,
+            "template_kwargs": template_kwargs or {}}
+
+
+def _pool_answers(lm: LM, base: list[dict], per_set: dict, max_new: int,
+                  template_kwargs: Optional[dict]) -> Optional[tuple[list[str], torch.Tensor]]:
+    from .. import cache as C
+    dep = _pool_dep(per_set, max_new, template_kwargs)
+    mk = (getattr(lm, "_wver", 0), json.dumps(dep, sort_keys=True, default=str))
+    memo = getattr(lm, "_harm_pools", None) or {}
+    hit = memo.get(mk) or C.load(lm, BASE_KIND, dep)
+    if hit is None:
+        return None
+    meta, t = hit
+    if meta.get("ids") != [it["id"] for it in base] or "X" not in t or len(meta.get("classes", [])) != len(base):
+        return None                                   # another sample: computed again
+    return list(meta["classes"]), t["X"].float()
+
+
+def _save_pool_answers(lm: LM, base: list[dict], per_set: dict, max_new: int, template_kwargs: Optional[dict],
+                       cls: list[str], X: torch.Tensor) -> None:
+    from .. import cache as C
+    dep = _pool_dep(per_set, max_new, template_kwargs)
+    meta, t = {"ids": [it["id"] for it in base], "classes": cls}, {"X": X}
+    mk = (getattr(lm, "_wver", 0), json.dumps(dep, sort_keys=True, default=str))
+    lm._harm_pools = {**(getattr(lm, "_harm_pools", None) or {}), mk: (meta, t)}
+    C.save(lm, BASE_KIND, dep, meta, t)
 
 
 def calibrate(lm: LM, *, cache: bool = True, per_set: Optional[dict[str, int]] = None, max_new: int = MAX_NEW,
@@ -354,22 +433,31 @@ def calibrate(lm: LM, *, cache: bool = True, per_set: Optional[dict[str, int]] =
         if probe is not None:
             lm._harmprobe = {**memo, memo_key: probe}
             return probe
-    items = list(pool) if pool is not None else RP.sample(per_set)
-    items += [{**it, "category": "extra"} for it in (extra or [])]
+    base = list(pool) if pool is not None else RP.sample(per_set)
+    more = [{**it, "category": "extra"} for it in (extra or [])]
+    items = base + more
     harm = torch.tensor([it.get("expect") == "refuse" for it in items])
     plain = torch.tensor([it.get("category") == "general" for it in items])
     if int(harm.sum()) < 4 or int((~harm).sum()) < 4:
         raise ValueError("the harm probe needs at least 4 harmful and 4 other calibration prompts")
+    # The built-in pools are the same for every goal: their replies and residuals are cached apart from the goal's
+    # own prompts, so a new goal (its practice and contrast sets) only answers and reads its own prompts.
+    got = _pool_answers(lm, base, per_set, max_new, template_kwargs) if pool is None and cache else None
     if log:
-        log(f"  harm probe: answering {len(items)} calibration prompts ({int(harm.sum())} harmful"
-            + (f", {len(extra)} from the goal" if extra else "") + ")")
-    cls = _classify(lm, items, max_new, template_kwargs)
+        log(f"  harm probe: answering {len(items) if got is None else len(more)} calibration prompts "
+            f"({int(harm.sum())} harmful of {len(items)}" + (f", {len(extra)} from the goal" if extra else "")
+            + ("; the built-in pools' answers are cached" if got is not None else "") + ")")
+    if got is None:
+        got = _answers(lm, base, max_new, template_kwargs)
+        if pool is None and cache:
+            _save_pool_answers(lm, base, per_set, max_new, template_kwargs, *got)
+    cls, X = got
+    if more:
+        c2, X2 = _answers(lm, more, max_new, template_kwargs)
+        cls, X = cls + c2, torch.cat([X, X2])
     refuse = torch.tensor([c == "refuse" for c in cls])
     declined = torch.tensor([c in ("refuse", "noanswer") for c in cls])
     answer = torch.tensor([c in ("answer", "caveat") for c in cls])
-    with torch.no_grad():
-        X = torch.stack([lm.run(lm.encode(it["messages"], **(template_kwargs or {})), capture=("resid",)).resid
-                         for it in items])                                      # [N, L+1, d]
     N, D, dm = X.shape
     L = D - 1
     rnd = random.Random(0)
@@ -448,11 +536,19 @@ def calibrate(lm: LM, *, cache: bool = True, per_set: Optional[dict[str, int]] =
                (f"; the probe reads {frs + chs}/{errors} of its mistakes on the calibration prompts correctly" if errors
                 else "; it made no refusal mistakes on the calibration prompts") +
                ": probe-gated steering can tie its refusals to that reading")
+    ZC = torch.zeros(D, N)
+    for d, z in zc_by.items():
+        ZC[d] = z
+    goal = torch.tensor([it.get("category") == "extra" for it in items])
+    KIND = (harm.int() * K_HARM + answer.int() * K_ANSWER + declined.int() * K_DECLINE + refuse.int() * K_REFUSE
+            + goal.int() * K_GOAL + plain.int() * K_PLAIN)
+    eh = sum(1 for it in (extra or []) if it.get("expect") == "refuse")
+    extra_kind = "" if not extra else "both" if 0 < eh < len(extra) else "harm" if eh else "safe"
     probe = HarmProbe(depth, W, B, R, LV, auc_by, held, float(look), behaviour, reads, viable, why,
                       {"prompts": N, "harmful": int(harm.sum()), "safe": int(safe.sum()), "plain": int(plain.sum())},
                       generation_head(lm, template_kwargs), L,
                       "across prompt families: fitted on two, read on the other two" if by_family else "random half",
-                      len(extra or []))
+                      len(extra or []), extra_kind, ZC, KIND)
     if cache:
         C.save(lm, CACHE_KIND, dep, *probe.to_cache())
         lm._harmprobe = {**memo, memo_key: probe}

@@ -6,9 +6,10 @@ in [DESIGN.md](DESIGN.md).
 
 ## Scale and models
 
-- **Deep diagnosis is tested on models up to 1.5B parameters, repair and `wsr program` up to 1B:**
-  Qwen2.5-0.5B-Instruct, Qwen2.5-1.5B-Instruct (diagnosis only), Llama-3.2-1B-Instruct, Qwen3.5-0.8B, and a tiny
-  random Qwen3.5 for the hybrid linear-attention path. Nothing larger has been verified. On a 4 GB GPU, models
+- **Deep diagnosis and `wsr program` with the agent are tested on models up to 1.5B parameters, weight repair
+  up to 1B:** Qwen2.5-0.5B-Instruct, Qwen2.5-1.5B-Instruct (diagnosis, and probe-gated steering found by the agent),
+  Llama-3.2-1B-Instruct, Qwen3.5-0.8B, and a tiny random Qwen3.5 for the hybrid linear-attention path. Qwen3.5-0.8B
+  was too slow on this GPU for a refusal test (its hybrid layers generate one prompt at a time). Nothing larger has been verified. On a 4 GB GPU, models
   above about 1.5B do not fit for editing.
 - **Gemma and Mistral are untested** at the weight level. Writer shares assume a plain pre-norm residual;
   Gemma's extra norms rescale each write, so they are approximate there.
@@ -63,8 +64,10 @@ Known limits:
   grader for what matters to you.
 - **The regression suite is small:** 17 prompts of 48 tokens. Deep mode adds fresh variants of the failing
   prompt; data guardrails in a goal file add more.
-- **Sets in the tested runs were small** (validation 12 to 121 items, 6 to 18 failing; confirmation 5 to 15
-  failing). The exact sign test is honest about that: with k failing items the best possible p is 0.5^k, so a
+- **Sets are moderate.** The powered refusal tests have 19 to 37 failing items in validation and 16 to 32 in
+  confirmation; the planted-bug goals have 6 to 18 and 5 to 15, the failure-type tests 22 to 61 and 18 to 47,
+  and the runs that could not show a result are kept
+  as a record in RESULTS.md. The exact sign test is honest about that: with k failing items the best possible p is 0.5^k, so a
   set with 4 failing items cannot confirm anything at 0.05 (the power check says so before the run), and one
   with 5 confirms only when all five are fixed and none is lost. The
   correction counts the candidate slots of one run (1 or 2), not every run you make on the same validation set;
@@ -76,6 +79,28 @@ Known limits:
 - **Exact identity fails closed.** A model re-saved in another precision, re-sharded, or converted by a tool that
   rounds differently gets different tensor hashes and is refused, though it may be the same model in practice;
   `--allow-base-mismatch` is the deliberate way past it.
+- **The damaged-weights recipe finds one kind of damage.** It flags rows or columns whose norm is far above
+  their matrix's median. Damage that keeps norms (noise at the same scale, flipped signs, swapped rows) is not
+  found. Biases, norm gains, the embedding and the output head are not scanned. Its thresholds rest on three
+  healthy models (Qwen2.5-0.5B and 1.5B, Llama-3.2-1B, largest ratio 13.4x), and it was tested on one planted
+  pattern (16 columns x200).
+- **A repair that restores the original inherits the original's safety.** The harm check compares the candidate
+  with the damaged model, and garbage counts as refused for a harmful request. On the planted garbage goal the
+  exact restore was not shipped, because the original Qwen2.5-0.5B answers 2 of the 20 held-back harmful
+  requests. Accepting that is `allow_safety_loss`, your decision. The agent can now commit the restore and build
+  a second fix (a refusal gate, for example) on the restored model (`commit_edit`); the playbook cannot, and stops at
+  the restore. With a contrast file for the harm probe the agent shipped the restore + a gate: the strict check passed
+  on its 20 held-back requests, but on 511 independent harmful requests the shipped fix still answers 8% (the
+  undamaged model: 17%). Twenty requests is a sample, not a guarantee.
+- **A gate's estimate is only as good as the calibration prompts.** It counts what a gate would do on wsr's pools and
+  the goal's own prompts; on independent harmful requests, margins it showed lowering none still lowered 7 to 10.
+- **Guardrails can measure few items on a badly broken model.** Items whose original reply was broken are left
+  out, so on the garbage goal the item guardrails measured 5 of 66 items. The report gives the count; the harm
+  check and the regression suite are unaffected.
+- **Early exit is a practice-side shortcut.** A measuring call stops after its first 30 items when the candidate
+  is significantly worse there or newly broke at least 3 replies, more than it mended. A candidate that would
+  have recovered on the rest is reported as stopped; `stop_early: false` measures everything. The judge never
+  stops early.
 - Matched continuations exist for loops only; blank, refusal and language edits use the contrast direction.
 - `--sampled` checks a patch under sampling; it does not search for failures that appear only under sampling.
 - No dedicated recipes for endless reasoning, excessive length, formatting habits or persona; those go
@@ -117,9 +142,36 @@ Known limits:
   endpoint), Claude Opus 5.5 through a test-only Kiro CLI driver that is not part of wsr, a local Gemma 4 E2B,
   and a free OpenRouter model.
 - Results vary between runs on hard cases: on the same over-refusal goal one run came close and another gave up.
-  Under the current rules no real-model agent run has produced an accepted fix: two learned edits (over- and
-  under-refusal) and, with `harm_probe`, a probe-gated steering for under-refusal (validation 5 better / 1 worse,
-  inconclusive).
+  Under the current rules seven real-model agent runs produced confirmed fixes, all powered: the five refusal
+  tests with `harm_probe` (Qwen2.5-0.5B over- and under-refusal, Llama-3.2-1B under-refusal, Qwen2.5-1.5B over-
+  and under-refusal), planted blank replies, and list loops (the DRY sampler). The earlier ones that could not
+  show a result are kept as a record in RESULTS.md. The feedback loop over judged attempts is tested with scripted agents
+  only; no live run has needed a second attempt yet.
+- The judged attempts leak a little about the validation set: a few coarse symptoms per attempt (the gain
+  rounded to 5 points, buckets of counts, which guardrail failed). With 3 attempts that cannot reconstruct a set of
+  dozens of items, and the correction counts every attempt, but it is not zero; the confirmation set, evaluated once
+  after an accepted attempt, is what protects against fitting to validation.
+- The safety mirror (`harmful_kept`) uses half of wsr's own held-back harmful requests, not the goal's guardrail
+  data: a practice-side signal. The judge checks the other half, which the agent never sees. Twenty requests a
+  side is enough to catch a repair that answers several, not to measure a small change.
+- **`wsr program` cannot resume an agent run.** Its practice budget and held-out looks are not in the agent's
+  state, so a run stopped by a limit or an outage starts again. `wsr repair --agent --resume` can continue.
+- **Multi-stage surgery is stricter for settings.** Settings measured on a committed stack are checked by
+  generating the regression suite under them on the patched model, so the stack's own change to a suite reply
+  counts. Judged alone, a patch's suite check reads drift and agreement instead. A stack plus settings can therefore
+  fail where the patch alone would pass. At most 4 edits can be committed at once, and an edit built on one stack
+  is never reused on another (it is rebuilt).
+- Transient provider errors are retried for about 7.5 minutes (waits of 30, 120 and 300 seconds). A longer
+  outage still ends the run.
+- **The harm probe reads style when its data is one-sided.** On a benchmark whose harmful and safe prompts are
+  written alike (OR-Bench), a probe calibrated with one kind only learned the style, and its gate answered 61
+  toxic requests in one run and refused 175 safe prompts in another (both stopped by the guardrails). wsr now
+  calibrates on a goal's prompts only when practice plus `contrast` hold both kinds; otherwise it falls back to the
+  built-in pools, which may read such a benchmark poorly.
+- **A data guardrail is judged on its net change.** A refusal guardrail lets newly refused requests offset
+  harmful requests that are newly answered: on Qwen2.5-1.5B over-refusal the harmful guardrail held at 83% → 93%
+  while 10 requests the model used to refuse were answered. Only the regression suite's safety check is per item.
+  A per-item limit for refusal guardrails is not built yet.
 - The workspace is a safe subset of Python, not a kernel; an isolated container kernel is not built.
 - A single slow torch call in the workspace runs to its end (the deadline is checked between operations).
 - The agent's state is rewritten after every turn, up to 1 GB of workspace tensors.
@@ -140,6 +192,9 @@ Known limits:
 - Prefilled matched pairs for single-token failures (blank, refusal, language).
 - An IFEval checker.
 - A known-good reference checkpoint, for models damaged everywhere.
-- Float32 compute on float16 weights for GPUs whose half precision is slow.
+- Float32 compute on float16 weights for GPUs whose half precision is slow. On a GTX 1650, fp16 decoding runs at
+  21 GB/s against 182 in fp32, and Llama-3.2-1B, which does not fit in fp32, takes about 5 s per reply.
+- Multi-stage surgery in the playbook (the agent has it: `commit_edit`).
+- Resuming an agent run inside `wsr program`.
 - A llama.cpp control-vector export for `add` steerings.
 - Continuous integration and a changelog.

@@ -12,6 +12,8 @@ protocol:
 practice: data/math_practice.jsonl    # the agent may read these
 heldout:  data/math_heldout.jsonl     # validation: judges the candidates; every look is logged ("validation" works too)
 confirmation: data/math_confirm.jsonl # optional: one evaluation of one frozen candidate, then it is used up
+contrast: data/contrast.jsonl         # optional, refusal goals: labelled prompts of BOTH kinds (expect: refuse or
+                                      # not) that only calibrate the harm probe; never judged
 grader: math                     # exact | contains | regex:<p> | math | detector:<group>
 judge: {alpha: 0.05, min_gain: 0.05}  # exact sign test below alpha, and at least this gain (5 points)
 guardrails:
@@ -36,7 +38,8 @@ from typing import Any, Optional
 from . import graders as G
 
 PROMPT_KEYS = ("prompt", "problem", "question", "input", "instruction")
-SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty")
+SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty",
+                 "dry_multiplier", "dry_base", "dry_allowed_length")
 KINDS = ("repair", "capability")
 SUITES = ("wsr_regression", "semantic_regression_canary")
 
@@ -62,6 +65,10 @@ class Protocol:
                                         if k in self.sampling}}
         if "repetition_penalty" in self.sampling:
             kw["repetition_penalty"] = self.sampling["repetition_penalty"]
+        if float(self.sampling.get("dry_multiplier", 0) or 0) > 0:      # deep/dry.py: llama.cpp's DRY sampler
+            kw["dry"] = {"multiplier": float(self.sampling["dry_multiplier"]),
+                         "base": float(self.sampling.get("dry_base", 1.75)),
+                         "allowed_length": int(self.sampling.get("dry_allowed_length", 2))}
         return kw
 
     def describe(self) -> str:
@@ -70,6 +77,10 @@ class Protocol:
             bits.append(", ".join(f"{k}={v}" for k, v in self.template_kwargs.items()))
         bits.append("greedy" if not self.sampled else
                     "sampled " + " ".join(f"{k} {v}" for k, v in self.sampling.items()))
+        if not self.sampled:                     # penalties apply to greedy decoding too
+            pen = [f"{k} {v}" for k, v in self.sampling.items() if "penalty" in k or k.startswith("dry_")]
+            if pen:
+                bits.append(" ".join(pen))
         bits.append(f"max {self.max_new_tokens}")
         return ", ".join(bits)
 
@@ -103,6 +114,7 @@ class Objective:
     guardrails: list[Guardrail] = field(default_factory=list)
     budget: dict[str, Any] = field(default_factory=dict)
     confirmation: Optional[str] = None        # used once, for one frozen candidate (program/confirm.py)
+    contrast: Optional[str] = None            # refusal goals: both kinds of prompt, only to calibrate the harm probe
     judge: dict[str, Any] = field(default_factory=dict)
     path: Optional[Path] = None           # where it was loaded from (paths resolve against its folder)
 
@@ -119,12 +131,13 @@ class Objective:
         return d
 
 
-BUDGET_KEYS = ("practice_evals", "verifications", "usd")
+BUDGET_KEYS = ("practice_evals", "verifications", "usd", "attempts")
 
 
 def _budget(raw: Any) -> dict[str, Any]:
-    """The agent's limits from the goal file: practice_eval calls, full verifications, API spend in USD.
-    `passes` is the older name of practice_evals."""
+    """The agent's limits from the goal file: practice_eval calls, full verifications, API spend in USD, judged
+    attempts (final_choice calls the validation set answers; program/attempts.py). `passes` is the older name of
+    practice_evals."""
     b = dict(raw or {})
     if "passes" in b:
         b.setdefault("practice_evals", b["passes"])
@@ -176,7 +189,7 @@ def from_dict(d: dict[str, Any], path: Optional[Path] = None) -> Objective:
         if d.get("heldout") and d["heldout"] != d["validation"]:
             raise ValueError("give the held-out set once: heldout or validation (they are the same set)")
         d["heldout"] = d.pop("validation")
-    unknown = set(d) - {"name", "model", "kind", "protocol", "practice", "heldout", "confirmation", "grader",
+    unknown = set(d) - {"name", "model", "kind", "protocol", "practice", "heldout", "confirmation", "contrast", "grader",
                         "guardrails", "budget", "judge"}
     if unknown:
         raise ValueError(f"unknown field(s) in the goal file: {', '.join(sorted(unknown))}")
@@ -213,7 +226,8 @@ def from_dict(d: dict[str, Any], path: Optional[Path] = None) -> Objective:
         rails.append(Guardrail(**g))
     return Objective(name=str(d["name"]), model=d.get("model"), kind=kind, protocol=proto, practice=d.get("practice"),
                      heldout=d.get("heldout"), grader=d.get("grader"), guardrails=rails,
-                     budget=_budget(d.get("budget")), confirmation=d.get("confirmation"), judge=_judge(d.get("judge")),
+                     budget=_budget(d.get("budget")), confirmation=d.get("confirmation"), contrast=d.get("contrast"),
+                     judge=_judge(d.get("judge")),
                      path=path)
 
 
@@ -277,11 +291,29 @@ def _control_char(t: str) -> str:
     return next((ch for ch in t if ord(ch) < 32 and ch not in "\n\t\r"), "")
 
 
+MIN_CONTRAST_SIDE = 10
+
+
+def harm_extra_problem(items: list[dict]) -> str:
+    """Why the goal's practice + contrast prompts cannot calibrate the harm probe, or ''. The probe needs both kinds
+    from the goal's own distribution: a one-sided set (only safe, or only must-refuse prompts) teaches it that this
+    distribution's style is safe (or harmful), and a gate built on it then refuses or answers by style. On OR-Bench,
+    whose toxic and safe prompts are written alike, that lost 61 toxic refusals in one run and refused 175 safe
+    prompts in another (both stopped by the guardrails)."""
+    harm = sum(1 for it in items if it.get("expect") == "refuse")
+    safe = len(items) - harm
+    if harm >= MIN_CONTRAST_SIDE and safe >= MIN_CONTRAST_SIDE:
+        return ""
+    return (f"the practice and contrast prompts hold {safe} safe and {harm} must-refuse prompt(s): the harm probe needs "
+            f"at least {MIN_CONTRAST_SIDE} of each from this goal's distribution, so it is calibrated on wsr's built-in "
+            "pools only. Add a `contrast` file with prompts of the other kind (never data that is judged)")
+
+
 def check(obj: Objective) -> dict[str, Any]:
     """What `wsr objective check` reports: files, row counts, gradable rows, practice/held-out overlap."""
     problems, info = [], {}
     sets = {}
-    for split in ("practice", "heldout", "confirmation"):
+    for split in ("practice", "heldout", "confirmation", "contrast"):
         p = obj.resolve(getattr(obj, split))
         if p is None:
             info[split] = None
@@ -325,6 +357,24 @@ def check(obj: Objective) -> dict[str, Any]:
     if not obj.heldout:
         problems.append("no held-out file: wsr evaluate can only score the practice set, which an agent may "
                         "have fitted")
+    # The contrast set calibrates the harm probe: it must not overlap anything that is judged.
+    if "contrast" in sets:
+        judged = [("heldout", sets.get("heldout")), ("confirmation", sets.get("confirmation"))]
+        for g in obj.guardrails:
+            if g.data and obj.resolve(g.data) is not None and obj.resolve(g.data).exists():
+                judged.append((f"guardrail {g.name}", load_items(obj.resolve(g.data), system=obj.protocol.system)))
+        ck = {_key(i) for i in sets["contrast"]}
+        for name, items in judged:
+            if items:
+                n = len(ck & {_key(i) for i in items})
+                if n:
+                    problems.append(f"{n} contrast prompt(s) are also in {name}: the harm probe would be calibrated "
+                                    "on data that is judged")
+    if (obj.grader or "").startswith("detector:refusal"):
+        pool = (sets.get("practice") or []) + (sets.get("contrast") or [])
+        k = harm_extra_problem(pool)
+        if k:
+            info["harm_probe"] = k
     # wsr's harm probe is calibrated on its built-in refusal pools: a validation or confirmation set drawn from them
     # would judge probe-gated steering on prompts it was fitted on.
     from ..deep import refusal_pools as RP

@@ -93,8 +93,10 @@ def _diagnose(lm: LM, messages: list[dict], *, kind: str = "auto", failing: tupl
              passing: tuple[str, ...] = (), expect_lang: Optional[str] = None, max_new: int = 48,
              template_kwargs: Optional[dict] = None, base: Optional[LM] = None, gguf: Optional[str] = None,
              reference_dir: Optional[str] = None, known: bool = True, out_dir: Optional[Path] = None,
-             probes: bool = True) -> DeepResult:
-    """probes: run the calibrated probe for the failure kind (language probe, copy-head probe)."""
+             probes: bool = True, harm_extra: Optional[list] = None) -> DeepResult:
+    """probes: run the calibrated probe for the failure kind (language probe, copy-head probe). harm_extra: a goal's
+    labelled prompts (practice + contrast, both kinds) that calibrate the harm probe with wsr's pools, as the
+    playbook's gated steering and the agent's harm_probe are calibrated (wsr program)."""
     rep = Report()
     res = DeepResult(rep)
     res.lm = lm
@@ -206,7 +208,7 @@ def _diagnose(lm: LM, messages: list[dict], *, kind: str = "auto", failing: tupl
         # Does the model itself read harm, and do its refusals follow? Decides whether probe-gated steering can work
         # before the playbook spends verifications on it (the probe is cached per model).
         lm.stage("harm_probe")
-        res.harm = _harm_probe(lm, c, template_kwargs, rep)
+        res.harm = _harm_probe(lm, c, template_kwargs, rep, harm_extra)
 
     if not c.passing:
         res.summary = f"{c.kind} reproduces on full precision; no passing variant to localise against"
@@ -442,13 +444,14 @@ def _language_probe(lm: LM, c: Contrast, expect: str, max_new: int, template_kwa
     return dict(ev, steer=st, summary=summ, fixed=fixed, specific=specific)
 
 
-def _harm_probe(lm: LM, c: Contrast, template_kwargs: Optional[dict], rep: Report) -> dict[str, Any]:
+def _harm_probe(lm: LM, c: Contrast, template_kwargs: Optional[dict], rep: Report,
+                extra: Optional[list] = None) -> dict[str, Any]:
     """The harm probe (deep/harmprobe.py) on this model, and what it says about the failing prompts: would a gate
-    built on the model's own reading of harm change them?"""
+    built on the model's own reading of harm change them? `extra`: a goal's labelled prompts, calibrated on too."""
     from . import harmprobe as HP
 
     try:
-        probe = HP.calibrate(lm, template_kwargs=template_kwargs)
+        probe = HP.calibrate(lm, template_kwargs=template_kwargs, extra=extra or None)
     except ValueError as e:
         rep.findings.append(_f("DEEP_HARM_PROBE", Severity.INFO, f"harm probe skipped: {e}"))
         return {}

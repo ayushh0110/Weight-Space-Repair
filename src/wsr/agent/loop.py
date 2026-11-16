@@ -45,6 +45,10 @@ continuation) and a held-out layer screen on them.
 neuron) and free-form low-rank edits you computed (delta, set_columns, set_rows) on any weight except the input \
 embedding, the output layer and the final norm.
 - screen_edit (cheap), verify_edit (the full checks, few), submit_patch, give_up, note.
+- commit_edit / revert_edit: multi-stage surgery for a model with more than one fault. A committed edit becomes \
+part of the model every later tool reads, so the next fault is diagnosed and calibrated on the repaired weights \
+(probes, directions, gates and fits included). verify_edit, submit_patch and every measuring tool take the whole \
+stack plus the candidate as one patch and compare it with the original model, exactly as it would ship.
 
 How to work:
 - Characterise the failure first, then form a hypothesis about the mechanism, then test it with an \
@@ -168,8 +172,7 @@ def _try_proposals(wb: Workbench, say: Callable[[str], None]) -> str:
         if why:
             lines.append(f"- {pid} ({patch.label}): still not allowed: {why}")
             continue
-        eid = f"e{len(wb.edits) + 1}"
-        wb.edits[eid] = E.Patch(patch.label, patch.kind, dict(patch.spec), list(patch.deltas), patch.untie)
+        eid = wb._add_edit(E.Patch(patch.label, patch.kind, dict(patch.spec), list(patch.deltas), patch.untie))
         v = wb.verify_edit(eid)
         say(f"  resumed proposal {pid} as {eid}: " + ("passed verify_edit" if v.get("passed") else
                                                        f"failed: {v.get('problems') or v.get('error')}"))
@@ -204,6 +207,31 @@ class AgentLimits:
     max_cost_usd: float = 5.0
     max_tokens: int = 6_000_000       # input + output over the run: the cap that holds without prices
     context_chars: int = 400_000      # older tool results are shortened beyond this
+    # Waits (seconds) before each retry of a provider error that looks transient; after the last, the run ends.
+    retry_waits: tuple[float, ...] = (30.0, 120.0, 300.0)
+
+
+# Provider errors worth waiting out: an outage, an overload, a rate limit, a timeout or a dropped connection.
+# Anything else (a bad key, a malformed request, a bug) ends the run at once.
+TRANSIENT_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+TRANSIENT_WORDS = ("unavailable", "overloaded", "rate limit", "ratelimit", "rate_limit", "too many requests",
+                   "timed out", "timeout", "connection", "try again", "internal server error", "internalserver",
+                   "bad gateway")
+
+
+NEVER_TRANSIENT = (ValueError, TypeError, KeyError, AttributeError, NotImplementedError, AssertionError)
+
+
+def transient(e: BaseException) -> bool:
+    """Whether a provider error looks like it would pass if the same turn were sent again a little later. A timeout or
+    a dropped connection (by type), a retryable status, or an error that says so in words; never a programming or
+    configuration error (ValueError, TypeError ...), whatever its message says ("timeout must be positive")."""
+    if isinstance(e, (TimeoutError, ConnectionError)) or getattr(e, "status_code", None) in TRANSIENT_CODES:
+        return True
+    if isinstance(e, NEVER_TRANSIENT):
+        return False
+    s = f"{type(e).__name__}: {e}".lower()
+    return any(w in s for w in TRANSIENT_WORDS)
 
 
 def _trim(messages: list[dict], limit: int, keep_last: int = 12, short: int = 1500) -> None:
@@ -260,8 +288,15 @@ def run(lm: Any, res: Any, rep: P.Repair, provider: Provider, *, budget: Optiona
         granted = sorted({u for r in wb.requests for u in (ST_UNLOCKS.get(r["category"], ((), ""))[0])
                           if u in wb.budget.allow})
         first += "\n" + ST.report(wb, st, granted) + "\n" + _try_proposals(wb, say)
+        # The earlier run's committed stack, committed again (after the proposals: a proposal made on a stack was
+        # saved as one patch on the original weights, so it is verified on them)
+        restack = [e for e in (st.get("stack") or []) if e in wb.edits]
+        if restack and not wb.done:
+            for e in restack:
+                wb._commit(e)
+            first += f"\n- committed again, as in the earlier run: {' then '.join(restack)}"
         say(f"resumed from {resume}: {len(wb.edits)} edits, {len(wb.lab.vars)} workspace variables, "
-            f"{len(wb.notes)} notes")
+            f"{len(wb.notes)} notes" + (f", committed {'+'.join(wb.stack)}" if wb.stack else ""))
     first += "\n\n" + _budget_line(wb, limits, -1)
     messages: list[dict] = [{"role": "user", "content": first}]
     transcript: list[dict] = [{"role": "user", "content": first}]
@@ -276,72 +311,91 @@ def run(lm: Any, res: Any, rep: P.Repair, provider: Provider, *, budget: Optiona
                                                        "cost_usd": round(cost, 3), "tokens": tokens,
                                                        "stopped": stopped}])
     nudges = 0
-    for turn_no in range(0 if wb.done else limits.max_turns):
-        _trim(messages, limits.context_chars)
-        try:
-            t = provider.turn(system, messages, schemas)
-        except Exception as e:                            # noqa: BLE001 - any provider failure ends the run cleanly
-            stop_why = f"provider error: {type(e).__name__}: {str(e)[:300]}"
-            say(f"  agent stopped: {stop_why} (state saved; continue with --resume)")
-            break
-        cost += t.cost_usd
-        tokens += t.input_tokens + t.output_tokens
-        messages.append({"role": "assistant", "content": t.content})
-        transcript.append({"role": "assistant", "text": t.text, "calls": [c.__dict__ for c in t.calls],
-                           "stop": t.stop, "cost_usd": round(t.cost_usd, 4)})
-        if t.text.strip():
-            say(f"  agent: {_clip(t.text, 300)}")
-        if t.stop == "refusal":
-            stop_why = "the model declined the request"
-            break
-        if not t.calls and t.stop == "max_tokens" and nudges < 2:
-            # Ran out of output (often in its reasoning) before acting: ask once more for a tool call.
-            nudges += 1
-            messages.append({"role": "user", "content": "Your turn ran out of output tokens before any tool call. "
-                             "Keep your reasoning short and call one tool now."})
-            transcript.append({"role": "user", "content": "(nudge: output limit reached without a tool call)"})
-            continue
-        if not t.calls:
-            stop_why = ("the model ran out of output tokens without acting" if t.stop == "max_tokens" else
-                        "the model stopped without submitting or giving up")
-            break
-        nudges = 0
-        results = []
-        for call in t.calls:
-            say(f"  agent -> {call.name}({_clip(json.dumps(call.input, ensure_ascii=False), 200)})")
-            out_s, err = wb.call(call.name, call.input)
-            results.append({"type": "tool_result", "tool_use_id": call.id, "content": out_s,
-                            **({"is_error": True} if err else {})})
-            try:
-                shown = json.loads(out_s)
-            except json.JSONDecodeError:                  # a tool added by a program that returned plain text
-                shown = out_s
-            transcript.append({"role": "tool", "name": call.name, "input": call.input, "result": shown,
-                               "is_error": err})
-        if results:
-            # The budget rides on the last result: the agent sees what is left and when to wrap up.
-            line = _budget_line(wb, limits, turn_no)
-            try:
-                body = json.loads(results[-1]["content"])
-            except json.JSONDecodeError:                  # a result cut at its size cap
-                body = None
-            results[-1]["content"] = (json.dumps({**body, "budget": line}, default=str, ensure_ascii=False)
-                                      if isinstance(body, dict) else results[-1]["content"] + "\n\n" + line)
-        messages.append({"role": "user", "content": results})
-        checkpoint("running")
-        if wb.done:
-            stop_why = ("submitted" if "submit" in wb.done else "final choice" if "final" in wb.done
-                        else "final choice (settings)" if "final_settings" in wb.done
-                        else "final choice (steering)" if "final_steering" in wb.done else "gave up")
-            break
-        if cost >= limits.max_cost_usd:
-            stop_why = f"spend cap ${limits.max_cost_usd:.2f} reached"
-            break
-        if tokens >= limits.max_tokens:
-            stop_why = f"token cap {limits.max_tokens:,} reached"
-            break
-    else:
-        turn_no = limits.max_turns - 1 if limits.max_turns and not wb.done else turn_no
+    try:
+        for turn_no in range(0 if wb.done else limits.max_turns):
+            _trim(messages, limits.context_chars)
+            t, err, tries = None, None, 0
+            while True:
+                try:
+                    t = provider.turn(system, messages, schemas)
+                    break
+                except Exception as e:                        # noqa: BLE001 - any provider failure ends the run cleanly
+                    err = e
+                    if tries >= len(limits.retry_waits) or not transient(e):
+                        break
+                    wait = limits.retry_waits[tries]
+                    tries += 1
+                    say(f"  provider error ({type(e).__name__}: {_clip(str(e), 200)}); it looks transient: retry "
+                        f"{tries} of {len(limits.retry_waits)} in {wait:.0f} s")
+                    time.sleep(wait)
+            if t is None:
+                stop_why = (f"provider error: {type(err).__name__}: {str(err)[:300]}"
+                            + (f" (still failing after {tries} " + ("retry)" if tries == 1 else "retries)") if tries else ""))
+                # `wsr program` has no resume (its practice budget and held-out looks are not in the agent's state).
+                say(f"  agent stopped: {stop_why} (state saved"
+                    + ("; continue with --resume)" if program is None else ")"))
+                break
+            cost += t.cost_usd
+            tokens += t.input_tokens + t.output_tokens
+            messages.append({"role": "assistant", "content": t.content})
+            transcript.append({"role": "assistant", "text": t.text, "calls": [c.__dict__ for c in t.calls],
+                               "stop": t.stop, "cost_usd": round(t.cost_usd, 4)})
+            if t.text.strip():
+                say(f"  agent: {_clip(t.text, 300)}")
+            if t.stop == "refusal":
+                stop_why = "the model declined the request"
+                break
+            if not t.calls and t.stop == "max_tokens" and nudges < 2:
+                # Ran out of output (often in its reasoning) before acting: ask once more for a tool call.
+                nudges += 1
+                messages.append({"role": "user", "content": "Your turn ran out of output tokens before any tool call. "
+                                 "Keep your reasoning short and call one tool now."})
+                transcript.append({"role": "user", "content": "(nudge: output limit reached without a tool call)"})
+                continue
+            if not t.calls:
+                stop_why = ("the model ran out of output tokens without acting" if t.stop == "max_tokens" else
+                            "the model stopped without submitting or giving up")
+                break
+            nudges = 0
+            results = []
+            for call in t.calls:
+                say(f"  agent -> {call.name}({_clip(json.dumps(call.input, ensure_ascii=False), 200)})")
+                out_s, err = wb.call(call.name, call.input)
+                results.append({"type": "tool_result", "tool_use_id": call.id, "content": out_s,
+                                **({"is_error": True} if err else {})})
+                try:
+                    shown = json.loads(out_s)
+                except json.JSONDecodeError:                  # a tool added by a program that returned plain text
+                    shown = out_s
+                transcript.append({"role": "tool", "name": call.name, "input": call.input, "result": shown,
+                                   "is_error": err})
+            if results:
+                # The budget rides on the last result: the agent sees what is left and when to wrap up.
+                line = _budget_line(wb, limits, turn_no)
+                try:
+                    body = json.loads(results[-1]["content"])
+                except json.JSONDecodeError:                  # a result cut at its size cap
+                    body = None
+                results[-1]["content"] = (json.dumps({**body, "budget": line}, default=str, ensure_ascii=False)
+                                          if isinstance(body, dict) else results[-1]["content"] + "\n\n" + line)
+            messages.append({"role": "user", "content": results})
+            checkpoint("running")
+            if wb.done:
+                stop_why = ("submitted" if "submit" in wb.done else "final choice" if "final" in wb.done
+                            else "final choice (settings)" if "final_settings" in wb.done
+                            else "final choice (steering)" if "final_steering" in wb.done
+                            else "every attempt rejected on validation" if wb.done.get("rejected") else "gave up")
+                break
+            if cost >= limits.max_cost_usd:
+                stop_why = f"spend cap ${limits.max_cost_usd:.2f} reached"
+                break
+            if tokens >= limits.max_tokens:
+                stop_why = f"token cap {limits.max_tokens:,} reached"
+                break
+        else:
+            turn_no = limits.max_turns - 1 if limits.max_turns and not wb.done else turn_no
+    finally:
+        wb.release()                                  # the original weights back in the model (commit_edit)
     if wb.done and turn_no < 0:
         stop_why = "a resumed proposal passed verify_edit"
     seconds = time.perf_counter() - t0
@@ -352,7 +406,8 @@ def run(lm: Any, res: Any, rep: P.Repair, provider: Provider, *, budget: Optiona
                     "capability_requests": wb.requests, "unlocked": list(wb.budget.allow),
                     "denied": dict(sorted(wb.lab.denied.items(), key=lambda kv: -kv[1])),
                     "fingerprint": fp, "resumed_from": str(resume) if resume else None,
-                    "earlier_runs": history}
+                    "earlier_runs": history,
+                    **({"committed": [{"id": e, "label": wb.edits[e].label} for e in wb.stack]} if wb.stack else {})}
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
         checkpoint(stop_why)

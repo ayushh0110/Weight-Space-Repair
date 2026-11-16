@@ -515,12 +515,63 @@ def test_a_provider_failure_ends_the_run_cleanly_and_keeps_the_state(setup, tmp_
 
     class Broken:
         name = "broken"
+        calls = 0
 
         def turn(self, *a, **k):
+            Broken.calls += 1
             raise TimeoutError("Request timed out.")
-    out = run(lm, res, rep, Broken(), out=tmp_path, log=None)
-    assert out.status == "could_not_fix" and "provider error: TimeoutError" in out.checks["agent"]["stopped"]
+    out = run(lm, res, rep, Broken(), out=tmp_path, log=None, limits=AgentLimits(retry_waits=(0, 0)))
+    stopped = out.checks["agent"]["stopped"]
+    assert out.status == "could_not_fix" and "provider error: TimeoutError" in stopped
+    assert Broken.calls == 3 and "still failing after 2 retries" in stopped      # a timeout is waited out first
     assert (tmp_path / "agent_state" / "state.json").exists()
+
+
+def test_a_transient_provider_error_is_retried_and_the_run_goes_on(setup):
+    """A Kiro run ended 70 minutes in on 'The model you've selected is temporarily unavailable': one outage
+    should not end a run. The turn is sent again after a wait, and the run carries on from there."""
+    from wsr.agent.loop import transient
+
+    lm, res, rep = setup
+    inner = ScriptedProvider([[("list_examples", {})], "done"])
+    logs = []
+
+    class Flaky:
+        name = "flaky"
+        failed = 0
+
+        def turn(self, *a, **k):
+            if Flaky.failed < 1:
+                Flaky.failed += 1
+                raise RuntimeError("kiro-cli exited 1: Error: Internal error (code -32603): The model you've "
+                                   "selected is temporarily unavailable.")
+            return inner.turn(*a, **k)
+    out = run(lm, res, rep, Flaky(), log=logs.append, limits=AgentLimits(retry_waits=(0,)))
+    ag = out.checks["agent"]
+    assert Flaky.failed == 1 and ag["turns"] == 2 and "provider error" not in ag["stopped"]
+    assert any("looks transient: retry 1 of 1" in s for s in logs)
+    assert transient(TimeoutError()) and transient(ConnectionError())
+
+    class Status(Exception):
+        status_code = 529
+    assert transient(Status("overloaded")) and transient(RuntimeError("429 Too Many Requests"))
+    assert not transient(ValueError("invalid x-api-key")) and not transient(KeyError("tool"))
+
+
+def test_a_permanent_provider_error_ends_the_run_without_waiting(setup):
+    """A bad key or a malformed request will fail the same way again: no retry, no wait."""
+    lm, res, rep = setup
+
+    class Bad:
+        name = "bad"
+        calls = 0
+
+        def turn(self, *a, **k):
+            Bad.calls += 1
+            raise ValueError("authentication failed: invalid x-api-key")
+    out = run(lm, res, rep, Bad(), log=None, limits=AgentLimits(retry_waits=(3600.0,)))
+    assert Bad.calls == 1 and out.checks["agent"]["stopped"] == ("provider error: ValueError: authentication "
+                                                                 "failed: invalid x-api-key")
 
 
 def test_a_turn_that_runs_out_of_output_is_nudged_to_act(setup):
@@ -655,6 +706,31 @@ def test_overwrite_edits_on_the_same_entries_are_not_combined(setup):
     assert "cannot combine" in E.overwrite_clash([patch("gate", 1, 2), patch("projection", 1, 2)])
     assert E.overwrite_clash([patch("gate", 1, 2), patch("gate", 3, 2)]) == ""      # other rows
     assert E.overwrite_clash([patch("projection", 1, 2), patch("scale_neurons", 1, 2)]) == ""
+
+
+def test_gate_sweep_reports_every_layer_and_builds_the_ladder_at_the_viable_ones(setup):
+    """The playbook's gated-neuron search as an agent tool: a plan per layer, and at the best layers one edit
+    per ladder strength, sized from the failure's gap (no layer or strength to guess)."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    wb.make_direction({"kind": "contrast"})
+    out = wb.gate_sweep("d1")
+    assert [r["layer"] for r in out["layers"]] == list(range(1, lm.n_layers - 1))
+    assert wb.used["screens"] == 1
+    # the toy's gates would fire on 2.5-3% of the positions that must stay unchanged: over the default 2%
+    assert not out["viable"] and not out["edit_ids"] and "not readable" in out["says"]
+    loose = Workbench(lm, res, rep.ctx, rep.sitemap, Budget(gate_max_off=0.05))
+    loose.make_direction({"kind": "contrast"})
+    out = loose.gate_sweep("d1", keep=2)
+    assert out["viable"] and len({k.split()[2] for k in out["edit_ids"]}) <= 2
+    assert all(int(k.split()[2].split(".")[0]) in out["viable"] for k in out["edit_ids"])
+    assert {k.rsplit("x", 1)[1] for k in out["edit_ids"]} <= {"0.5", "1", "2", "4"}
+    built = [v for v in out["edit_ids"].values() if v.startswith("e")]
+    assert built and all(loose._edit(e).kind == "gate" for e in built)
+    assert "decision_flips" in loose.screen_edit(built[0])
+    one = loose.gate_sweep("d1", layers=[1], keep=1)
+    assert [r["layer"] for r in one["layers"]] == [1]
+    assert "error" in loose.gate_sweep("d1", read_source={"kind": "prompts", "failing": [], "working": []})
 
 
 def test_scale_strength_bounds_and_budget_not_spent_on_a_bad_id(setup):
@@ -838,3 +914,266 @@ def test_harm_probe_tool_reports_the_reading_and_gates_are_checked(setup, monkey
     assert bad and "no refusal direction" in got["error"] and got["probe"]["viable"] is False
     out, bad = wb.call("generate", {"prompt": "original", "intervene": {"gate": "h1"}})
     assert bad and "unknown gate" in json.loads(out)["error"]
+
+
+
+def test_generate_compare_with_only_a_gate_shows_the_untouched_model_next_to_the_gated_one(setup):
+    """Found in a live run: compare with an intervention and no edit ran one pass, gated, and called it "original"."""
+    import torch
+    from wsr.deep.harmprobe import Gate
+
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    r = torch.randn(lm.d_model, generator=torch.Generator().manual_seed(0))
+    wb.gates["h1"] = Gate(2, torch.zeros(lm.d_model), 5.0, r / r.norm(), 60.0, None, 0.5, 0.0, [], "test")
+    out = json.loads(wb.call("generate", {"prompt": "original", "intervene": {"gate": "h1"}, "compare": True})[0])
+    assert "original" in out and "edited" in out
+    plain = json.loads(wb.call("generate", {"prompt": "original"})[0])
+    assert out["original"]["reply"] == plain["original"]["reply"]          # the untouched model, really untouched
+    many = json.loads(wb.call("generate", {"prompts": ["original"], "intervene": {"gate": "h1"}, "compare": True})[0])
+    assert {"original", "edited"} <= set(many["results"][0])
+
+
+def test_weight_scan_tool_reports_findings_and_builds_the_three_repairs(setup):
+    """The agent's weight_scan: the same scan and repairs as the playbook, built not applied, no budget spent; with
+    weight edits off it reports findings only. gate_sweep (which builds weight edits too) is refused then."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    used = dict(wb.used)
+    out = wb.weight_scan()
+    assert wb.used == used and out["threshold"] == 50.0
+    f = out["findings"][0]                           # the toy's planted gate row is an oversized row
+    assert f["layer"] == PLANT_LAYER and f["axis"] == "row" and f["index"] == [PLANT_NEURON]
+    ids = list(f["edit_ids"].values())
+    assert len(ids) == 3 and all(wb._edit(e).kind == "rescale" for e in ids)
+    assert "decision_flips" in wb.screen_edit(ids[0])
+    off = Workbench(lm, res, rep.ctx, rep.sitemap, Budget(weight_edits=False))
+    o2 = off.weight_scan()
+    assert o2["findings"] and not o2["findings"][0]["edit_ids"] and "note" in o2 and not off.edits
+    assert "error" in off.gate_sweep("d1")
+
+
+# -- multi-stage surgery: commit_edit / revert_edit ------------------------------------------------------------------
+
+FIX = {"kind": "scale_neurons", "neurons": [[PLANT_LAYER, PLANT_NEURON]], "scale": 0}
+NOOP = {"kind": "scale_neurons", "neurons": [[1, 3]], "scale": 1.0}       # a valid edit that changes nothing
+
+
+def _weights(lm):
+    return {n: p.detach().clone() for n, p in lm.model.named_parameters()}
+
+
+def _same(lm, ref):
+    return all(torch.equal(p, ref[n]) for n, p in lm.model.named_parameters())
+
+
+def _build(wb, spec):
+    return json.loads(wb.call("build_edit", {"spec": spec})[0])["edit_id"]
+
+
+def test_a_committed_edit_is_the_model_every_tool_reads_and_comes_out_bit_for_bit(setup):
+    """After commit_edit the diagnostic tools read the repaired model: generate's untouched pass is exactly what the
+    edit gave before it was committed. revert_edit and release() give back the original weights bit for bit, with the
+    original's weight version, so caches keyed on it stay valid."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    orig = _weights(lm)
+    e1 = _build(wb, FIX)
+    before = json.loads(wb.call("generate", {"prompt": "tell me about the cat please", "edit_id": e1,
+                                             "compare": True})[0])
+    assert before["original"] != before["edited"]                         # the planted failure, and its fix
+    v0 = lm._wver                                                         # the original weights' version now
+    out = json.loads(wb.call("commit_edit", {"edit_id": e1, "why": "the planted neuron"})[0])
+    assert out["committed"] == [e1] and "warning" in out                  # not verified yet: said, not refused
+    assert not _same(lm, orig)
+    now = json.loads(wb.call("generate", {"prompt": "tell me about the cat please"})[0])
+    assert now["committed"] == before["edited"] and e1 in now["model"]
+    back = json.loads(wb.call("revert_edit", {})[0])
+    assert back["reverted"] == [e1] and back["committed"] == []
+    assert _same(lm, orig) and lm._wver == v0
+    again = json.loads(wb.call("generate", {"prompt": "tell me about the cat please"})[0])
+    assert again["original"] == before["original"]
+    wb.call("commit_edit", {"edit_id": e1})
+    with wb.original():                                                   # what the measuring tools run inside
+        assert _same(lm, orig) and lm._wver == v0
+    assert not _same(lm, orig)
+    wb.release()
+    assert _same(lm, orig) and lm._wver == v0
+
+
+def test_edits_from_another_stack_are_refused_and_a_committed_edit_is_never_added_twice(setup):
+    """An edit's change was computed from the weights it was built on: on any other committed stack it is refused
+    by every tool, and a committed edit cannot be applied again on top of itself."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap, Budget(max_commits=1))
+    e1, e2 = _build(wb, FIX), _build(wb, NOOP)
+    json.loads(wb.call("commit_edit", {"edit_id": e1})[0])
+    for tool, args in (("generate", {"prompt": "what is the sun", "edit_id": e2}), ("screen_edit", {"edit_id": e2}),
+                       ("verify_edit", {"edit_id": e2})):
+        out, err = wb.call(tool, args)
+        assert err and "built on the original weights" in out, (tool, out)
+    out, err = wb.call("generate", {"prompt": "what is the sun", "edit_id": e1})
+    assert err and "is committed" in out
+    e3 = _build(wb, NOOP)                                                 # built on the stack: usable on it
+    assert wb.built_on[e3] == (e1,)
+    assert "error" not in json.loads(wb.call("generate", {"prompt": "what is the sun", "edit_id": e3})[0])
+    assert "at most 1" in json.loads(wb.call("commit_edit", {"edit_id": e3})[0])["error"]
+    wb.call("revert_edit", {"edit_id": e1})
+    out, err = wb.call("generate", {"prompt": "what is the sun", "edit_id": e3})
+    assert err and f"with {e1} committed" in out
+    wb.call("commit_edit", {"edit_id": e1})                               # back to the state e3 was built on
+    assert "error" not in json.loads(wb.call("generate", {"prompt": "what is the sun", "edit_id": e3})[0])
+    wb.release()
+    off = Workbench(lm, res, rep.ctx, rep.sitemap, Budget(weight_edits=False))
+    off.edits["e1"] = wb.edits[e1]
+    assert "weight edits are off" in json.loads(off.call("commit_edit", {"edit_id": "e1"})[0])["error"]
+
+
+def test_verify_and_submit_on_a_stack_check_the_stack_plus_the_edit_against_the_original(setup):
+    """verify_edit on a stack checks the committed stack plus the edit as one patch, against the ORIGINAL model's
+    replies (so the stack's own fix counts), then puts the stack back; submit_patch submits that one patch."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    e1 = _build(wb, FIX)
+    alone = json.loads(wb.call("verify_edit", {"edit_id": e1})[0])
+    assert alone["passed"]
+    wb.call("commit_edit", {"edit_id": e1})
+    committed = _weights(lm)
+    e2 = _build(wb, NOOP)
+    v = json.loads(wb.call("verify_edit", {"edit_id": e2})[0])
+    assert v["candidate"] == f"{e1}+{e2}" and v["passed"] and v["target"] == alone["target"]
+    assert _same(lm, committed)                                           # the stack is back after the check
+    assert f"{e1}+{e2}" in wb.results and e2 not in wb.results
+    s = json.loads(wb.call("submit_patch", {"edit_id": e2, "rationale": "the stack"})[0])
+    assert s["submitted"] == f"{e1}+{e2}" and wb.done["submit"] == f"{e1}+{e2}"
+    pkg = wb.edits[f"{e1}+{e2}"]
+    assert pkg.kind == "stack" and pkg.spec["parts"] == [e1, e2]
+    assert [d.name for d in pkg.deltas] == [d.name for d in wb.edits[e1].deltas + wb.edits[e2].deltas]
+    # the top committed edit stands for the stack itself (the same candidate as e1 measured before the commit)
+    assert wb.candidate(e1) == (e1, wb.edits[e1])
+    wb.release()
+
+
+def test_the_agent_ships_its_committed_stack_and_gives_the_original_weights_back(setup, tmp_path):
+    """End to end (wsr repair --agent): the agent commits a fix, builds the next edit on the repaired model, verifies
+    and submits; the shipped patch is the stack plus the edit on the original weights, the model is the original
+    again after the run, and the saved state keeps the stack and what each edit was built on."""
+    lm, res, rep = setup
+    orig = _weights(lm)
+    script = [
+        [("build_edit", {"spec": FIX})],
+        [("commit_edit", {"edit_id": "e1", "why": "the planted neuron"})],
+        [("build_edit", {"spec": NOOP})],
+        [("verify_edit", {"edit_id": "e2"})],
+        [("submit_patch", {"edit_id": "e2", "rationale": "the stack"})],
+    ]
+    out = run(lm, res, rep, ScriptedProvider(script), out=tmp_path, log=None)
+    assert out.status == "fixed" and out.patch.kind == "stack" and out.patch.spec["parts"] == ["e1", "e2"]
+    assert out.checks["agent"]["committed"][0]["id"] == "e1"
+    assert _same(lm, orig)
+    st = json.loads((tmp_path / "agent_state" / "state.json").read_text(encoding="utf-8"))
+    assert st["stack"] == ["e1"] and st["built_on"]["e2"] == ["e1"] and st["built_on"]["e1"] == []
+
+
+def test_a_run_that_stops_with_edits_committed_gives_them_back_and_resumes_with_them(setup, tmp_path):
+    """A run ended by a provider error with an edit committed leaves the original weights in the model; resumed, the
+    stack is committed again, so the tools read the same repaired model as before."""
+    lm, res, rep = setup
+    orig = _weights(lm)
+    inner = ScriptedProvider([[("build_edit", {"spec": FIX})], [("commit_edit", {"edit_id": "e1"})]])
+
+    class Stops:
+        name = "stops"
+
+        def turn(self, *a, **k):
+            if inner._i < len(inner.script):
+                return inner.turn(*a, **k)
+            raise ValueError("authentication failed: invalid x-api-key")
+    first = run(lm, res, rep, Stops(), out=tmp_path, log=None)
+    assert "provider error" in first.checks["agent"]["stopped"] and _same(lm, orig)
+    sp = ScriptedProvider([[("generate", {"prompt": "tell me about the cat please"})], "done"])
+    run(lm, res, rep, sp, out=tmp_path, resume=tmp_path, log=None)
+    assert any('"committed"' in r for r in sp.results)                     # the tools read the committed model
+    tr = json.loads((tmp_path / "agent_transcript.json").read_text(encoding="utf-8"))
+    assert "committed again" in tr["transcript"][0]["content"]
+    assert _same(lm, orig)
+
+
+def _half_apply(monkeypatch):
+    """E.apply that changes the first tensor, then fails (an out-of-memory error part way through a big edit)."""
+    real = E_.apply
+
+    def flaky(lm_, patch, sign=1.0):
+        first = E_.Patch(patch.label, patch.kind, patch.spec, patch.deltas[:1], patch.untie)
+        real(lm_, first, sign)
+        raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+    monkeypatch.setattr(E_, "apply", flaky)
+
+
+def test_a_commit_that_fails_part_way_leaves_the_model_and_the_stack_as_they_were(setup, monkeypatch):
+    """Review fix: applying an edit in place can fail after some tensors changed; the commit is all or nothing, and
+    release() restores the originals even when nothing ended up committed."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    orig, v0 = _weights(lm), lm._wver
+    e1 = _build(wb, {"kind": "scale_neurons", "neurons": [[1, 3], [PLANT_LAYER, PLANT_NEURON]], "scale": 0})
+    assert len(wb.edits[e1].deltas) == 2
+    _half_apply(monkeypatch)
+    out, err = wb.call("commit_edit", {"edit_id": e1})
+    assert err and "out of memory" in out
+    assert wb.stack == [] and _same(lm, orig) and lm._wver == v0
+    wb.release()
+    assert _same(lm, orig)
+
+
+def test_a_revert_that_fails_part_way_leaves_the_model_and_the_stack_as_they_were(setup, monkeypatch):
+    """Review fix: revert_edit re-commits the edits it keeps; a failure there puts back the state before the call."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    orig = _weights(lm)
+    e1 = _build(wb, {"kind": "scale_neurons", "neurons": [[1, 3], [PLANT_LAYER, PLANT_NEURON]], "scale": 0})
+    wb.call("commit_edit", {"edit_id": e1})
+    e2 = _build(wb, {"kind": "scale_neurons", "neurons": [[0, 7]], "scale": 0.5})
+    wb.call("commit_edit", {"edit_id": e2})
+    committed, ver = _weights(lm), lm._wver
+    _half_apply(monkeypatch)
+    out, err = wb.call("revert_edit", {"edit_id": e2})
+    assert err and "out of memory" in out
+    assert wb.stack == [e1, e2] and _same(lm, committed) and lm._wver == ver
+    monkeypatch.undo()
+    wb.release()
+    assert _same(lm, orig)
+
+
+def test_original_reuses_its_snapshot_until_the_weights_move(setup, monkeypatch):
+    """Review fix: the committed values are copied once per weight state, not on every measuring call; after a trial
+    edit (applied and restored, so the version moved) a new copy is taken, and the committed weights always return."""
+    lm, res, rep = setup
+    wb = Workbench(lm, res, rep.ctx, rep.sitemap)
+    orig = _weights(lm)
+    e1 = _build(wb, FIX)
+    wb.call("commit_edit", {"edit_id": e1})
+    committed = _weights(lm)
+    calls = []
+    real = wb._snapshot
+    monkeypatch.setattr(wb, "_snapshot", lambda names: (calls.append(1), real(names))[1])
+    for _ in range(2):
+        with wb.original():
+            assert _same(lm, orig)
+        assert _same(lm, committed)
+    assert len(calls) == 1
+    e2 = _build(wb, NOOP)
+    wb.call("generate", {"prompt": "what is the sun", "edit_id": e2})     # a trial: applied, restored, version moved
+    with wb.original():
+        assert _same(lm, orig)
+    assert len(calls) == 2 and _same(lm, committed)
+    wb.release()
+
+
+def test_a_configuration_error_is_never_retried_whatever_its_message_says():
+    """Review fix: 'timeout' in a ValueError's message is a bad setting, not an outage."""
+    from wsr.agent.loop import transient
+
+    assert not transient(ValueError("timeout must be positive"))
+    assert not transient(TypeError("unexpected keyword 'connection'"))
+    assert transient(RuntimeError("Request timed out")) and transient(TimeoutError())

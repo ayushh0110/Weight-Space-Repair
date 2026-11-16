@@ -117,6 +117,8 @@ def save(wb: Any, out: Path, *, fp: str, history: list[dict], wsr_version: str =
              "results": _enc({k: {kk: vv for kk, vv in r.items() if kk != "_rows"} for k, r in wb.results.items()},
                              tens, skipped, "results"),
              "verified": sorted(wb.verified), "edits": sorted(wb.edits), "proposals": sorted(wb.proposals),
+             "stack": list(getattr(wb, "stack", [])),
+             "built_on": {k: list(v) for k, v in getattr(wb, "built_on", {}).items()},
              "directions": dirs, "pairsets": pairs, "lab": lab_vars, "lab_denied": wb.lab.denied,
              "skipped": skipped, "history": history}
     if tens:
@@ -157,6 +159,8 @@ def load(wb: Any, src: Path, *, fp: str) -> dict[str, Any]:
                             for p in ps]
     for eid in st["edits"]:
         wb.edits[eid] = E.Patch.load(d / "edits" / eid)
+    # what each edit was built on (multi-stage surgery); the stack itself is committed again by the caller
+    wb.built_on.update({k: tuple(v) for k, v in (st.get("built_on") or {}).items()})
     for pid in st["proposals"]:
         wb.proposals[pid] = E.Patch.load(d / "proposals" / pid)
     results = _dec(st["results"], tens)

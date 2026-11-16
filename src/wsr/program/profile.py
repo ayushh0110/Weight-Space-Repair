@@ -112,6 +112,12 @@ class Runner:
     def _reply(self, item: dict, g, seed: int) -> Reply:
         self.generations += 1
         self.tokens += g.n_tokens
+        return self.grade(item, g, seed)
+
+    def grade(self, item: dict, g, seed: int) -> Reply:
+        """The reply record for generation `g` of `item`, graded with this runner's grader. Reads only the generation
+        and the item, so a generation can be graded again by another runner (another grader) without generating it
+        again (evaluate.py: data guardrails on the very same prompts)."""
         request = next((m.get("content") for m in reversed(item["messages"]) if m.get("role") == "user"), None)
         groups = groups_of(g.text, empty=g.empty, lang=item.get("lang"), request=request)
         correct = G.grade(self.grader, g.answer, item, groups)
@@ -122,37 +128,48 @@ class Runner:
                                                                                    "TRUNCATED_WORKING") else label
         return Reply(item["id"], text, g.n_tokens, g.ended, g.cut, groups, correct, label, seed)
 
-    def run_many(self, jobs: list[dict], progress=None) -> list[Reply]:
+    def run_many(self, jobs: list[dict], progress=None, keep: Optional[list] = None) -> list[Reply]:
         """jobs: {item, seed, max_new?, gen_kwargs?}. In parallel on a server, in order on PyTorch; the
-        results come back in the order of `jobs`."""
-        def one(j: dict) -> Reply:
-            return self.run(j["item"], seed=j.get("seed", 0), max_new=j.get("max_new"),
-                            gen_kwargs=j.get("gen_kwargs"))
+        results come back in the order of `jobs`. `keep`: a list that receives each job's raw generation, in the
+        order of `jobs` (for grading the same replies again with another grader)."""
+        mx = self.protocol.max_new_tokens
+        gens: list = [None] * len(jobs)
+
+        def one(k: int, j: dict) -> Reply:
+            g = self.backend.generate(j["item"]["messages"], self.protocol, seed=j.get("seed", 0),
+                                      max_new=j.get("max_new") or mx, gen_kwargs=j.get("gen_kwargs"))
+            gens[k] = g
+            return self._reply(j["item"], g, j.get("seed", 0))
         if hasattr(self.backend, "generate_many"):          # PyTorch: batched to the free memory
-            mx = self.protocol.max_new_tokens
             gens = self.backend.generate_many([{"messages": j["item"]["messages"], "seed": j.get("seed", 0),
                                                 "max_new": j.get("max_new") or mx, "gen_kwargs": j.get("gen_kwargs")}
                                                for j in jobs], self.protocol)
             res = [self._reply(j["item"], g, j.get("seed", 0)) for j, g in zip(jobs, gens)]
             if progress:
                 progress(len(jobs), len(jobs))
+            if keep is not None:
+                keep.extend(gens)
             return res
         if self.backend.parallel <= 1:
             out = []
             for k, j in enumerate(jobs):
-                out.append(one(j))
+                out.append(one(k, j))
                 if progress:
                     progress(k + 1, len(jobs))
+            if keep is not None:
+                keep.extend(gens)
             return out
         out: list[Optional[Reply]] = [None] * len(jobs)
         with ThreadPoolExecutor(self.backend.parallel) as ex:
-            futs = {ex.submit(one, j): k for k, j in enumerate(jobs)}
+            futs = {ex.submit(one, k, j): k for k, j in enumerate(jobs)}
             done = 0
             for f in futs:
                 out[futs[f]] = f.result()
                 done += 1
                 if progress:
                     progress(done, len(jobs))
+        if keep is not None:
+            keep.extend(gens)
         return out  # type: ignore[return-value]
 
 

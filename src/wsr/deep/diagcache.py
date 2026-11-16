@@ -94,7 +94,10 @@ def depends(messages: list[dict], kw: dict) -> Optional[dict]:
     if kw.get("base") is not None or kw.get("gguf") or kw.get("reference_dir"):
         return None
     keys = ("kind", "failing", "passing", "expect_lang", "max_new", "template_kwargs", "known", "probes")
-    return {"messages": messages, **{k: kw.get(k) for k in keys}}
+    dep = {"messages": messages, **{k: kw.get(k) for k in keys}}
+    if kw.get("harm_extra"):                        # a goal's prompts calibrate the harm probe: part of the key
+        dep["harm_extra"] = [[it["messages"][-1]["content"], it.get("expect")] for it in kw["harm_extra"]]
+    return dep
 
 
 def load(lm: Any, dep: dict) -> Optional[Any]:

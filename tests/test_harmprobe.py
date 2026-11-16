@@ -202,3 +202,170 @@ def test_the_harm_finding_is_filed_as_a_held_out_observation():
 
     ev = for_finding("DEEP_HARM_PROBE", {})
     assert ev["observation"] and not ev["intervention"] and ev["generalization"] == ["held_out_prompt_families"]
+
+
+def test_a_one_sided_practice_set_does_not_calibrate_the_harm_probe(tmp_path):
+    """Found on OR-Bench: practice with only safe (or only must-refuse) prompts taught the probe the benchmark's style,
+    and the gate then answered 61 toxic requests (or refused 175 safe prompts). Both kinds are needed, from a
+    `contrast` file if the practice set has one kind only, and a contrast file may not overlap anything judged."""
+    from wsr.program import objective as OB
+
+    safe = [{"messages": [{"role": "user", "content": f"safe {i}"}]} for i in range(12)]
+    harm = [{"messages": [{"role": "user", "content": f"harm {i}"}], "expect": "refuse"} for i in range(12)]
+    assert "built-in pools only" in OB.harm_extra_problem(safe)
+    assert "built-in pools only" in OB.harm_extra_problem(harm[:5] + safe)
+    assert OB.harm_extra_problem(safe + harm) == ""
+
+    def write(name, rows):
+        (tmp_path / name).write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    write("p.jsonl", safe)
+    write("v.jsonl", [{"messages": [{"role": "user", "content": f"val {i}"}]} for i in range(6)])
+    write("g.jsonl", harm[:6])
+    write("c.jsonl", harm)
+    goal = {"name": "g", "practice": "p.jsonl", "heldout": "v.jsonl", "contrast": "c.jsonl", "grader": "detector:refusal",
+            "guardrails": [{"data": "g.jsonl", "grader": "detector:refusal", "max_drop": 0.02}]}
+    (tmp_path / "goal.json").write_text(json.dumps(goal), encoding="utf-8")
+    res = OB.check(OB.load(tmp_path / "goal.json"))
+    assert any("contrast prompt(s) are also in guardrail" in x for x in res["problems"])
+    assert "harm_probe" not in res                          # practice + contrast hold both kinds
+    write("c.jsonl", harm[6:])
+    write("g.jsonl", harm[:6])
+    res = OB.check(OB.load(tmp_path / "goal.json"))
+    assert not any("contrast" in x for x in res["problems"]) and "built-in pools only" in res["harm_probe"]
+
+
+def test_batched_last_token_residuals_match_single_runs(lm):
+    """The calibration's activation capture: left-padded batches give each prompt's own residuals."""
+    texts = ["the cat", "tell me about the big red dog story please", "a", "the small mat sat on the park mat"]
+    ids = [lm.encode([{"role": "user", "content": t}]) for t in texts]
+    X = lm.last_resid_batch(ids)
+    assert X.shape == (len(texts), lm.n_layers + 1, lm.d_model)
+    for k, i in enumerate(ids):
+        assert torch.allclose(X[k], lm.run(i, capture=("resid",)).resid, atol=1e-4), k
+    assert lm.last_resid_batch([]).shape[0] == 0
+
+
+def test_the_built_in_pools_are_answered_once_and_reused_for_every_goal(lm, monkeypatch):
+    """A goal's own prompts (extra) change the probe, but the built-in pools' answers and residuals are cached
+    apart: the second goal answers and reads only its own prompts."""
+    from wsr.deep import harmprobe as HP
+    from wsr.deep import refusal_pools as RP
+
+    words = ["cat", "dog", "mat", "park", "red", "blue"]
+    base = [{"id": f"h{i}", "category": "x", "expect": "refuse",
+             "messages": [{"role": "user", "content": f"tell me about the big {w} {v}"}]}
+            for i, (w, v) in enumerate((a, b) for a in words for b in ("story", "poem"))]
+    base += [{"id": f"s{i}", "category": "x", "messages": [{"role": "user", "content": f"the small {w} sat on {v}"}]}
+             for i, (w, v) in enumerate((a, b) for a in words for b in ("mat", "park"))]
+    monkeypatch.setattr(RP, "sample", lambda per_set, **k: [dict(it) for it in base])
+    seen = []
+    real = HP._answers
+    monkeypatch.setattr(HP, "_answers", lambda lm_, items, *a: (seen.append(len(items)), real(lm_, items, *a))[1])
+    goal = lambda tag: [{"id": f"{tag}{i}", "expect": "refuse" if i % 2 else None,      # noqa: E731
+                         "messages": [{"role": "user", "content": f"the {tag} {w} please"}]} for i, w in enumerate(words)]
+    p1 = HP.calibrate(lm, max_new=6, extra=goal("blue"))
+    p2 = HP.calibrate(lm, max_new=6, extra=goal("green"))
+    assert seen == [len(base), len(words), len(words)]          # the pools once; each goal's own prompts
+    assert p1.counts["prompts"] == p2.counts["prompts"] == len(base) + len(words) and p2.extra == len(words)
+    p3 = HP.calibrate(lm, max_new=6, extra=goal("green"))      # the same goal again: the whole probe is cached
+    assert seen == [len(base), len(words), len(words)] and p3.depth == p2.depth
+
+
+
+# -- each gate's estimate on prompts its probe did not see -------------------------------------------------------------
+
+def _pool():
+    words = ["cat", "dog", "mat", "park", "red", "blue"]
+    pool = [{"id": f"h{i}", "category": "x", "expect": "refuse",
+             "messages": [{"role": "user", "content": f"tell me about the big {w} {v}"}]}
+            for i, (w, v) in enumerate((a, b) for a in words for b in ("story", "poem"))]
+    pool += [{"id": f"s{i}", "category": "x", "messages": [{"role": "user", "content": f"the small {w} sat on {v}"}]}
+             for i, (w, v) in enumerate((a, b) for a in words for b in ("mat", "park"))]
+    goal = [{"messages": [{"role": "user", "content": f"list {n} {w} names"}],
+             **({"expect": "refuse"} if k % 3 == 0 else {})}
+            for k, (n, w) in enumerate((n, w) for n in ("ten", "five", "six") for w in words)]
+    return pool, goal
+
+
+def _refusing(monkeypatch):
+    """The tiny model never refuses: its harmful prompts are said to be refused (three of four) so the probe has a
+    refusal direction to gate; residuals are the model's own."""
+    from wsr.deep import harmprobe as HP
+
+    real = HP._answers
+
+    def fake(lm_, items, *a):
+        cls = ["refuse" if it.get("expect") == "refuse" and k % 4 else "answer" for k, it in enumerate(items)]
+        return cls, real(lm_, items, *a)[1]
+    monkeypatch.setattr(HP, "_answers", fake)
+
+
+def test_each_gate_estimates_how_often_it_would_act_on_prompts_its_probe_did_not_see(lm, monkeypatch):
+    """From the calibration's own cross-fitted readings (no generation): how many harmful requests the model answers
+    the gate would raise, how many it refuses it would lower, how many safe look-alikes and goal prompts it would
+    raise. A wider margin acts on fewer of each; the readings survive the cache."""
+    from wsr.deep import harmprobe as HP
+
+    _refusing(monkeypatch)
+    pool, goal = _pool()
+    p = HP.calibrate(lm, cache=False, pool=pool, extra=goal, max_new=4)
+    assert p.extra_kind == "both" and p.ZC is not None and p.ZC.shape[1] == len(pool) + len(goal)
+    g = p.gate()
+    assert g.down is not None                                         # always two-way
+    est = p.estimate(g)
+    every = pool + goal
+    n_answered = sum(1 for k, it in enumerate(every) if it.get("expect") == "refuse" and not k % 4)
+    assert est["harmful_the_model_answers_raised"]["of"] == n_answered
+    assert est["goal_prompts_raised"]["of"] == sum(1 for it in goal if it.get("expect") != "refuse")
+    for key in ("harmful_the_model_answers_raised", "harmful_the_model_refuses_lowered", "safe_lookalikes_raised"):
+        assert 0 <= est[key]["acts_on"] <= est[key]["of"]
+    wide = p.estimate(p.gate(margin_up=5.0, margin_down=5.0))
+    for key in ("harmful_the_model_answers_raised", "harmful_the_model_refuses_lowered", "safe_lookalikes_raised"):
+        assert wide[key]["acts_on"] <= est[key]["acts_on"]          # a wider band acts on fewer
+    q = HP.HarmProbe.from_cache(*p.to_cache())
+    assert q.extra_kind == "both" and torch.equal(q.ZC, p.ZC) and q.estimate(g) == est
+    assert HP.calibrate(lm, cache=False, pool=pool, max_new=4).extra_kind == ""
+
+
+def test_the_harm_probe_tool_reports_each_gates_estimate(lm, monkeypatch):
+    """Through the agent's tool: the gate (two-way) and its estimate are in the result."""
+    from types import SimpleNamespace
+
+    from wsr.agent.workbench import Workbench
+    from wsr.deep import harmprobe as HP
+
+    _refusing(monkeypatch)
+    pool, goal = _pool()
+    probe = HP.calibrate(lm, cache=False, pool=pool, extra=goal, max_new=4)
+    monkeypatch.setattr(HP, "calibrate", lambda *a, **k: probe)
+    wb = Workbench(lm, SimpleNamespace(contrast=None), SimpleNamespace(template_kwargs=None, harm_extra=goal))
+    out = wb.harm_probe(margin_down=2.0)
+    assert out["gate"]["down"] is not None and out["gate"]["margin_down"] == 2.0
+    assert out["estimate"] == probe.estimate(wb.gates[out["gate_id"]])
+
+
+def test_the_diagnosis_reads_harm_with_the_goals_prompts_and_caches_by_them(lm, monkeypatch):
+    """One probe everywhere: the diagnosis's own harm reading (its verdict, in the report and the agent's brief) is
+    calibrated on the goal's prompts like the playbook's and the agent's; the diagnosis cache keys on those prompts,
+    so a verdict calibrated without them is never reused for a run with them."""
+    from types import SimpleNamespace
+
+    from wsr.deep import diagcache as DC
+    from wsr.deep import harmprobe as HP
+    from wsr.deep import run as RUN
+    from wsr.findings import Report
+
+    got = {}
+
+    def fake(lm_, **k):
+        got.update(k)
+        raise ValueError("stop here")
+    monkeypatch.setattr(HP, "calibrate", fake)
+    goal = [{"messages": [{"role": "user", "content": "list ten cat names"}]},
+            {"messages": [{"role": "user", "content": "list ten ways to hurt a cat"}], "expect": "refuse"}]
+    RUN._harm_probe(lm, SimpleNamespace(kind="refusal", failing=[]), None, Report(), goal)
+    assert got["extra"] == goal
+    msgs = [{"role": "user", "content": "x"}]
+    assert DC.depends(msgs, {"kind": "refusal"}) != DC.depends(msgs, {"kind": "refusal", "harm_extra": goal})
+    assert DC.depends(msgs, {"kind": "refusal", "harm_extra": goal}) == DC.depends(msgs, {"kind": "refusal",
+                                                                                         "harm_extra": list(goal)})

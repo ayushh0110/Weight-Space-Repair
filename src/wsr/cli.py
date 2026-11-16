@@ -593,6 +593,9 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--practice-evals", type=int, default=None,
                     help="practice_eval calls the agent may make (default: the goal file's budget.practice_evals, "
                          "else 10)")
+    pg.add_argument("--agent-attempts", type=int, default=None,
+                    help="final_choice calls the validation set judges (default: the goal file's budget.attempts, else "
+                         "3); a rejection returns abstract symptoms only, and every attempt is a slot of the correction")
     pg.add_argument("--no-playbook", action="store_true", help="skip the rule-based recipes")
     pg.add_argument("--no-weight-edits", action="store_true",
                     help="the weights must not change: the playbook only steers and the agent may only steer or "
@@ -655,6 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
     fx.add_argument("--profile-limit", type=int, default=40)
     fx.add_argument("--eval-limit", type=int)
     fx.add_argument("--practice-evals", type=int, default=None)
+    fx.add_argument("--agent-attempts", type=int, default=None)
     fx.add_argument("--no-playbook", action="store_true")
     fx.add_argument("--no-weight-edits", action="store_true",
                     help="the weights must not change: the playbook only steers and the agent may only steer or "
@@ -773,6 +777,7 @@ HELP = {
     "path": "model directory, or a .safetensors / .gguf file",
     "practice": "practice JSONL file (the agent may use it)",
     "practice_evals": "practice_eval calls the agent may make (default: the goal file's budget, else 10)",
+    "agent_attempts": "final_choice calls the validation set judges (default: the goal file's budget.attempts, else 3)",
     "preset": "detector thresholds: chat, strictJson, longForm or lenient",
     "profile_limit": "practice items to profile",
     "prompt": "the failing user prompt",
@@ -820,7 +825,7 @@ def cmd_objective_check(args: argparse.Namespace) -> int:
         print(json.dumps(res, indent=1, ensure_ascii=False))
     else:
         print(f"{'OK' if res['ok'] else 'PROBLEMS'}: {res['name']} ({res['protocol']}, grader {res['grader']})")
-        for split in ("practice", "heldout"):
+        for split in ("practice", "heldout", "confirmation", "contrast"):
             v = res.get(split)
             if v:
                 print(f"  {split}: {v['rows']} rows, {v['gradable']} gradable ({v['file']})")
@@ -832,6 +837,8 @@ def cmd_objective_check(args: argparse.Namespace) -> int:
             print(f"  - {p}")
         if res.get("note"):
             print(f"  note: {res['note']}")
+        if res.get("harm_probe"):
+            print(f"  harm probe: {res['harm_probe']}")
     return 0 if res["ok"] else 1
 
 
@@ -876,7 +883,8 @@ def cmd_program(args: argparse.Namespace) -> int:
                                             parallel=args.parallel, required=args.backend == "llama-server")
         if not args.json:
             print(f"  backend: {note}")
-    budget, limits, practice_evals = _agent_limits(args, obj.budget) if provider is not None else (None, None, 10)
+    budget, limits, practice_evals, attempts = (_agent_limits(args, obj.budget) if provider is not None
+                                                else (None, None, 10, 1))
     if args.allow_safety_loss:
         for g in obj.guardrails:
             if g.suite:
@@ -886,6 +894,7 @@ def cmd_program(args: argparse.Namespace) -> int:
                           weight_edits=not args.no_weight_edits, out=Path(args.out), profile_source=prof_src, provider=provider,
                           playbook=not args.no_playbook, profile_limit=args.profile_limit, agent_budget=budget,
                           agent_limits=limits, practice_evals=practice_evals, eval_limit=args.eval_limit,
+                          agent_attempts=attempts,
                           log=None if args.json else print, mode="fast" if args.fast else "deep",
                           judge=args.judge, judge_quant=args.judge_quant, consent=consent, model_dir=Path(model),
                           server_bin=args.llama_server)
@@ -938,7 +947,8 @@ def cmd_fix(args: argparse.Namespace) -> int:
         prof_src, _n, _c = _source(args, args.model_dir, obj.protocol, consent=consent)
         if isinstance(prof_src, B.TorchBackend):
             prof_src = None
-    budget, limits, practice_evals = _agent_limits(args, obj.budget) if provider is not None else (None, None, 10)
+    budget, limits, practice_evals, attempts = (_agent_limits(args, obj.budget) if provider is not None
+                                                else (None, None, 10, 1))
     if args.allow_safety_loss:
         for g in obj.guardrails:
             if g.suite:
@@ -948,6 +958,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
                           weight_edits=not args.no_weight_edits, out=out / "run", profile_source=prof_src, provider=provider,
                           playbook=not args.no_playbook, profile_limit=args.profile_limit, agent_budget=budget,
                           agent_limits=limits, practice_evals=practice_evals, eval_limit=args.eval_limit,
+                          agent_attempts=attempts,
                           log=None if args.json else print, mode="fast" if args.fast else "deep", judge=args.judge,
                           judge_quant=args.judge_quant, consent=consent, model_dir=Path(args.model_dir),
                           server_bin=args.llama_server)
@@ -1282,7 +1293,7 @@ def cmd_repair(args: argparse.Namespace) -> int:
             from .agent import run
             if not args.json:
                 print(f"\nrule-based surgery could not fix it; handing over to the agent ({provider.name})")
-            budget, limits, _ = _agent_limits(args)
+            budget, limits, _, _ = _agent_limits(args)
             rep = run(lm, res, rep, provider, budget=budget, limits=limits, out=out,
                       resume=Path(args.resume) if args.resume else None,
                       log=None if args.json else print)
@@ -1373,8 +1384,8 @@ def _agent_allow(args: argparse.Namespace) -> tuple[str, ...]:
 
 
 def _agent_limits(args: argparse.Namespace, goal_budget: Optional[dict] = None):
-    """(workbench budget, loop limits, practice evals). A flag wins over the goal file's `budget`, which wins over
-    the built-in default."""
+    """(workbench budget, loop limits, practice evals, judged attempts). A flag wins over the goal file's `budget`,
+    which wins over the built-in default."""
     from .agent import AgentLimits, Budget
 
     gb = goal_budget or {}
@@ -1382,9 +1393,11 @@ def _agent_limits(args: argparse.Namespace, goal_budget: Optional[dict] = None):
     def pick(flag: str, key: str, default: float) -> float:
         v = getattr(args, flag, None)
         return v if v is not None else gb.get(key, default)
+    from .program.attempts import ATTEMPTS
+
     return (Budget(verifications=int(pick("agent_verifications", "verifications", 6)), allow=_agent_allow(args)),
             AgentLimits(args.agent_turns, float(pick("agent_budget_usd", "usd", 5.0)), args.agent_max_tokens),
-            int(pick("practice_evals", "practice_evals", 10)))
+            int(pick("practice_evals", "practice_evals", 10)), int(pick("agent_attempts", "attempts", ATTEMPTS)))
 
 
 def _agent_provider(args: argparse.Namespace):

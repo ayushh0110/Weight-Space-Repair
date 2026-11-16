@@ -485,7 +485,7 @@ _THINK = re.compile(r"</?think>|</?thinking>|<\|channel\|?>|^thought\s*\n", re.I
 # Finish reasons that mean the model ended the reply itself (not a length cap).
 _NATURAL_STOP = {"stop", "end_turn", "stop_sequence", "eos"}
 # Bump when a detector changes: cached labels (regression baselines, original replies) are keyed on it.
-DETECTOR_VERSION = 4
+DETECTOR_VERSION = 5     # 5: garbage also from glued word chains, glued scripts, two broken characters mid-reply
 
 def control_token_leak(text: str) -> tuple[float, list[str]]:
     found = sorted(set(_CONTROL_RE.findall(text)))
@@ -625,6 +625,73 @@ def token_salad_score(text: str) -> tuple[float, dict[str, Any]]:
     return score, {"mixed_words": n_mixed, "words": len(toks), "scripts": sorted(scripts)}
 
 
+_LATIN_RUN = re.compile(r"[A-Za-z]+")
+# Text that is joined on purpose: code (a block left open when the reply was cut counts too), URLs, hashtags and
+# handles ('#RealWorldPhysics'), file names ('PrankJokeVirus.py').
+_JOINED_ON_PURPOSE = re.compile(r"```.*?(?:```|\Z)|`[^`]*`|https?://\S+|[#@]\w+|\b\w+\.[A-Za-z0-9]{1,5}\b", re.S)
+_CASE_JOIN = re.compile(r"[a-z][A-Z]")
+MIN_GLUED_WORDS = 2      # distinct chains; healthy replies (10,299 full, 13,012 tails, three models) had at most one
+MIN_GLUE_POINTS = 4      # healthy replies had at most 3, and those over one script pair only
+MIN_GLUE_PAIRS = 2
+
+
+def glued_words_score(text: str) -> tuple[float, dict[str, Any]]:
+    """Words run together into chains: 'NowlyLookingUpJntChecking', 'ThisOutItnsAreTheBestOfThem'.
+
+    Corrupted weights (a damaged layer, a bad merge) produce this while each character stays a normal letter, so
+    the symbol, entropy and mixed-script checks pass it. A chain is a Latin letter run with two or more lower-to-
+    upper joins, outside code, URLs, hashtags, handles and file names. Healthy text has single joins (brands:
+    'RetailMeNot' has two but stands alone; 'iPhone', 'JavaScript'), identifiers in prose and a coined name used
+    again and again; two or more distinct chains in one reply did not occur in the healthy replies of three models
+    once hashtags and an unclosed code block were set aside."""
+    t = _JOINED_ON_PURPOSE.sub(" ", text)
+    words = _LATIN_RUN.findall(t)
+    # distinct chains: a healthy reply can coin one name and repeat it ('CareAtHome' three times)
+    glued = sorted({w for w in words if len(_CASE_JOIN.findall(w)) >= 2})
+    score = 1.0 if len(glued) >= MIN_GLUED_WORDS else 0.0
+    return score, {"glued": glued[:5], "count": len(glued), "words": len(words)}
+
+
+def _dominant_script(text: str) -> Optional[str]:
+    c: dict[str, int] = {}
+    for ch in text:
+        s = _script_of(ch)
+        if s and s != "other":
+            s = "han" if s == "kana" else s
+            c[s] = c.get(s, 0) + 1
+    return max(c, key=c.get) if c else None
+
+
+def script_glue_score(text: str) -> tuple[float, dict[str, Any]]:
+    """Letters of different scripts glued together with no space, over several script pairs: '油漆nt', 'прич油漆',
+    '선yper' in one reply.
+
+    Some glue is normal and is not counted: han with kana (Japanese), and Latin against the reply's main script
+    (a borrowed term: '使用Python', 'ใช้Python'); in a mainly Chinese or Japanese reply, Latin, han and kana mix freely.
+    A healthy model can still glue one pair by habit (a small model writing Devanagari letters inside Bengali
+    words, or Chinese inside an English list), so the glue must cover at least two different script pairs."""
+    t = _JOINED_ON_PURPOSE.sub(" ", text)
+    dom = _dominant_script(t)
+    points: list[str] = []
+    pairs: set[frozenset] = set()
+    prev, prev_s = "", None
+    for ch in t:
+        s = _script_of(ch)
+        if s == "other":
+            s = None
+        if s and prev_s and s != prev_s:
+            pair = frozenset((s, prev_s))
+            normal = (pair <= {"han", "kana"} or pair == {"latin", dom}
+                      or (dom == "han" and pair <= {"latin", "han", "kana"}))
+            if not normal:
+                points.append(prev + ch)
+                pairs.add(pair)
+        prev, prev_s = ch, s
+    score = 1.0 if len(points) >= MIN_GLUE_POINTS and len(pairs) >= MIN_GLUE_PAIRS else 0.0
+    return score, {"points": len(points), "pairs": sorted("+".join(sorted(p)) for p in pairs), "examples": points[:5],
+                   "main_script": dom}
+
+
 # Scripts where the local-recurrence baseline was measured: function words and
 # short stems recur every few words. Inflected or unspaced scripts (Cyrillic,
 # Arabic, CJK) sit far lower even in healthy text, so the test does not apply.
@@ -707,11 +774,14 @@ def broken_utf8_score(text: str, finish_reason: Optional[str] = None) -> tuple[f
 
     A reply cut at a token limit can end in the middle of a multibyte character (Devanagari, CJK, emoji): the
     last 1-3 bytes then decode as replacement characters, though nothing is wrong with the text. Those trailing
-    ones are not counted unless the reply is known to have ended on its own (a stop finish reason)."""
+    ones are not counted unless the reply is known to have ended on its own (a stop finish reason).
+
+    Two or more before the end fail: a healthy model's reply decodes cleanly (one stray character was seen in
+    15,600 healthy replies, never two), while corrupted weights emit broken byte sequences mid-text."""
     n = sum(1 for c in text if _bad(c))
     if finish_reason is None or finish_reason not in _NATURAL_STOP:
         n -= cut_tail(text)
-    return (1.0 if n >= 3 or (text and n / len(text) > 0.01) else (0.5 if n else 0.0)), n
+    return (1.0 if n >= 2 or (text and n / len(text) > 0.01) else (0.5 if n else 0.0)), n
 
 
 def symbol_soup_score(text: str) -> tuple[float, dict[str, Any]]:
@@ -877,6 +947,14 @@ def check_output(text: str, *, preset: str = "chat", finish_reason: Optional[str
     out.append(_f("TOKEN_SALAD", ts, 0.5, f"{ts_ev.get('mixed_words')} of {ts_ev.get('words')} words glue "
                   f"several scripts together ({', '.join(ts_ev.get('scripts', []))})" if ts > 0.5 else
                   "words are single-script", evidence=ts_ev or None))
+    gw, gw_ev = glued_words_score(text)
+    out.append(_f("GLUED_WORDS", gw, 0.5, f"{gw_ev['count']} chains of words run together "
+                  f"({', '.join(gw_ev['glued'][:3])})" if gw > 0.5 else "words are separated",
+                  evidence=gw_ev if gw_ev["count"] else None))
+    sg, sg_ev = script_glue_score(text)
+    out.append(_f("SCRIPT_GLUE", sg, 0.5, f"{sg_ev['points']} places where letters of different scripts are glued "
+                  f"together ({', '.join(sg_ev['pairs'])})" if sg > 0.5 else "no glued scripts",
+                  evidence=sg_ev if sg_ev["points"] else None))
     bu, n_bad = broken_utf8_score(text, finish_reason)
     out.append(_f("BROKEN_UTF8", bu, 0.5, f"{n_bad} invalid UTF-8 sequence(s) (replacement chars / lone "
                   "surrogates)" if n_bad else "valid UTF-8", evidence={"count": n_bad} if n_bad else None))

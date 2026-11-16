@@ -89,7 +89,7 @@ class QuantModel:
                 p = params[n]
                 p.data.copy_((s.q if want else s.f).to(p.device, p.dtype))
         self.state = set(quantised) & set(self.swaps)
-        self.lm._wver += 1                  # weights changed: cached clean passes no longer apply
+        self.lm.bump_weights()              # weights changed: cached clean passes no longer apply
 
     def all_quantised(self) -> None:
         self.set(set(self.swaps))

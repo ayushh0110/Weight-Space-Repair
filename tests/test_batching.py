@@ -48,6 +48,32 @@ def test_plan_follows_free_memory_and_respects_caps(monkeypatch):
     assert BT.plan(lm, 20, 100, 50) == 1
 
 
+def test_each_chunk_is_sized_for_its_own_longest_prompt(monkeypatch):
+    """Prompts sorted by length: short ones share a chunk that a plan for the longest prompt would have split, a long
+    one gets a smaller chunk, every chunk fits the same budget, and generation is unchanged."""
+    m, t = planted_model()
+    lm = LM(m, t, name="toy")
+    lengths = [10] * 6 + [400] * 3
+    budget_seqs = 4                                          # the long prompts fit 4 at a time at most
+    monkeypatch.setattr(BT, "free_bytes",
+                        lambda dev: int(BT.per_sequence_bytes(lm, 400, 50) * budget_seqs / BT.SHARE) + 1)
+    sz = BT.sizes(lm, lengths, 50)
+    assert sum(sz) == len(lengths) and sz[0] == 6 and max(sz[1:]) <= budget_seqs
+    assert BT.plan(lm, 400, 50, len(lengths)) == budget_seqs        # one plan for all would split the short ones
+    budget = int(BT.free_bytes(lm.device) * BT.SHARE)
+    i = 0
+    for s_ in sz:
+        assert s_ * BT.per_sequence_bytes(lm, lengths[i + s_ - 1], 50) <= budget or s_ == 1
+        i += s_
+    u = BT.sizes(lm, [20] * 7, 100)                        # equal lengths: the same chunks as one plan
+    assert u[0] == BT.plan(lm, 20, 100, 7) and sum(u) == 7 and all(x == u[0] for x in u[:-1])
+    monkeypatch.setattr(BT, "free_bytes", lambda dev: -5)
+    assert BT.sizes(lm, lengths, 50) == [1] * len(lengths)        # nothing free: one at a time
+    monkeypatch.undo()
+    ids = [lm.encode([{"role": "user", "content": p}]) for p in PROMPTS]
+    assert lm.generate_batch(ids, 16) == [lm.generate(i, 16) for i in ids]
+
+
 def test_recurrent_layers_are_not_batched():
     m, t = tiny_qwen35()
     assert not BT.batchable(LM(m, t, name="q35"))
@@ -58,7 +84,8 @@ def test_out_of_memory_halves_the_batch_instead_of_crashing(monkeypatch):
     lm = LM(m, t, name="toy")
     ids = [lm.encode([{"role": "user", "content": p}]) for p in PROMPTS]
     want = [lm.generate(i, 8) for i in ids]
-    monkeypatch.setattr(BT, "plan", lambda *a: 6)
+    # one chunk of all 6, whatever memory this machine has free (generation plans with sizes(), not plan())
+    monkeypatch.setattr(BT, "sizes", lambda lm_, lengths, max_new: [len(lengths)])
     real = lm._generate_padded
     sizes = []
 

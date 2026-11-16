@@ -13,8 +13,14 @@ The agent has what Takehi et al.'s editor had, in a form that is safe on the use
   `set_rows`) to any weight except the ones the paper's harness also refused (input embedding,
   output layer, final norm) and except a whole tensor times a constant.
 
+Multi-stage surgery: `commit_edit` makes an edit part of the model every later tool reads (directions, probes,
+gates, fits and scans calibrate on the repaired weights), and `revert_edit` takes it out again, bit for bit. What the
+measuring tools, `verify_edit` and the judge see is always the committed stack plus the candidate as ONE patch on the
+ORIGINAL weights (`candidate`), measured against the original: the same thing that would ship. An edit records the
+stack it was built on (its change was computed from those weights) and is refused on any other.
+
 What stays fixed: every trial edit is applied for one call and the weights restored bit for bit
-(`edits.applied`); the workspace only ever holds copies; budgets (reads, computes, generations,
+(`edits.applied`); the original weights are back when the run ends (`release`); the workspace only ever holds copies; budgets (reads, computes, generations,
 screens, verifications, weights changed, rank, relative size of a change) are enforced here, not
 by the model; the judge is the playbook's own `_verify` with the mode's checks (target,
 regression, safety, serving precision, fresh variants, sampled runs), and `submit_patch` accepts
@@ -57,6 +63,7 @@ class Budget:
     max_fit_steps: int = 300
     max_fit_rank: int = 32
     weight_edits: bool = True       # False (--no-weight-edits): only steering and settings may fix it
+    max_commits: int = 4            # commit_edit: edits in the committed stack at once
     allow: tuple = ()               # opt-in unlocks from the user (UNLOCKS): embed, unembed, final_norm, rescale, large
 
 
@@ -81,6 +88,19 @@ class Workbench:
     gates: dict[str, Any] = field(default_factory=dict)         # harm_probe: gate id -> harmprobe.Gate
     proposals: dict[str, E.Patch] = field(default_factory=dict)  # unverified, saved for the user only
     lab: Optional[Lab] = None
+    # Multi-stage surgery (commit_edit / revert_edit). `stack`: the committed edit ids, in order; their sum is applied
+    # to the model in place, so every tool reads the repaired model. `built_on`: edit id -> the stack it was built on
+    # (its change was computed from those weights; an edit with no entry was built on the original).
+    stack: list = field(default_factory=list)
+    built_on: dict = field(default_factory=dict)
+    gate_built_on: dict = field(default_factory=dict)            # harm_probe gate id -> the stack it was calibrated on
+    _orig: dict = field(default_factory=dict)                    # parameter name -> its original values (CPU copy)
+    _orig_ver: int = 0                                           # the original weights' version number (LM._wver)
+    _held: Optional[dict] = None                                 # the committed values of _orig's tensors (original())
+    _held_ver: int = -1                                          # ... at this weight version
+    _in_original: bool = False
+    _released: bool = False
+    _next_edit: int = 1
 
     def __post_init__(self) -> None:
         h = {"param": self._h_param, "params": self._h_params, "embed_rows": self._h_embed_rows,
@@ -90,6 +110,156 @@ class Workbench:
         self.lab = Lab(h, seconds=self.budget.compute_seconds)
 
     # -- plumbing ------------------------------------------------------------------------------------
+    def _add_edit(self, patch: E.Patch) -> str:
+        """Register an edit built on the current model; returns its id."""
+        while f"e{self._next_edit}" in self.edits:
+            self._next_edit += 1
+        eid = f"e{self._next_edit}"
+        self._next_edit += 1
+        self.edits[eid] = patch
+        self.built_on[eid] = tuple(self.stack)
+        return eid
+
+    def _model_is(self, stack: Any = None) -> str:
+        st = tuple(self.stack if stack is None else stack)
+        return "the original weights" if not st else "the original weights with " + " then ".join(st) + " committed"
+
+    def _stale(self, eid: str, on: tuple) -> str:
+        return (f"{eid} was built on {self._model_is(on)}, but the model is now {self._model_is()}: its change was "
+                "computed from other weights, so it is not valid here. Rebuild it on the current model, or revert_edit "
+                "back to the state it was built on")
+
+    def _package(self, ids: list) -> E.Patch:
+        """These edits, applied in this order, as one patch on the original weights. Every edit stores its change as
+        numbers computed from the weights it was built on (a delta), so applying them in order adds exactly the
+        changes that were committed: the sum is the stacked model."""
+        parts = [self.edits[i] for i in ids]
+        return E.Patch("; then ".join(f"{i} ({pt.label})" for i, pt in zip(ids, parts)), "stack",
+                       {"parts": list(ids), "labels": [pt.label for pt in parts], "kinds": [pt.kind for pt in parts]},
+                       [d for pt in parts for d in pt.deltas], untie=any(pt.untie for pt in parts))
+
+    def candidate(self, eid: str) -> tuple:
+        """(id, patch) of what the measuring tools and the judge see for edit `eid`: the committed stack plus the edit
+        as ONE patch on the original weights ("e1+e3"). A stack patch from an earlier measurement ("e1+e3") is
+        itself a candidate; a committed edit stands for the stack up to it, so only the top one can be named."""
+        if eid not in self.edits:
+            raise ValueError(f"unknown edit id {eid!r}; build one with build_edit")
+        if self.edits[eid].kind == "stack" or not self.stack and self.built_on.get(eid, ()) == ():
+            return eid, self.edits[eid]
+        if eid in self.stack:
+            if eid != self.stack[-1]:
+                raise ValueError(f"{eid} is committed below {self.stack[-1]}: the candidate is the whole stack "
+                                 f"({'+'.join(self.stack)}); name its top edit {self.stack[-1]}, or revert_edit {eid}'s "
+                                 "successors first")
+            ids = list(self.stack)
+        else:
+            on = tuple(self.built_on.get(eid, ()))
+            if on != tuple(self.stack):
+                raise ValueError(self._stale(eid, on))
+            ids = list(self.stack) + [eid]
+        key = "+".join(ids)
+        if len(ids) == 1:
+            return key, self.edits[key]
+        if key not in self.edits:
+            self.edits[key] = self._package(ids)
+            self.built_on[key] = ()
+        return key, self.edits[key]
+
+    def stack_candidate(self) -> Optional[tuple]:
+        """(id, patch) of the committed stack alone, or None when nothing is committed."""
+        return self.candidate(self.stack[-1]) if self.stack else None
+
+    @contextlib.contextmanager
+    def original(self):
+        """The original weights for the duration: the committed stack taken out, then put back bit for bit with its
+        weight version (versions are never reused, so caches stay valid). The measuring tools, verify_edit and the
+        judge run in here: they compare the stack plus a candidate with the model as it was given."""
+        if not self.stack or self._in_original or self._released:
+            yield
+            return
+        lm = self.lm
+        ver = lm._wver
+        if self._held is None or self._held_ver != ver:
+            # The committed values, copied once per weight state: consecutive measuring calls reuse them. A version
+            # that moved (a trial edit applied and restored) takes a new copy, so a stale one is never put back.
+            self._held = self._snapshot(self._orig)
+            self._held_ver = ver
+        held = self._held
+        self._in_original = True
+        try:
+            self._load(self._orig)
+            lm._wver = self._orig_ver
+            yield
+        finally:
+            self._in_original = False
+            self._load(held)
+            lm._wver = ver
+
+    def _snapshot(self, names) -> dict:
+        """CPU copies of these parameters' current values."""
+        with torch.no_grad():
+            return {n: E._param(self.lm, n).detach().to("cpu", copy=True) for n in names}
+
+    def _load(self, values: dict) -> None:
+        """Copy these values into the parameters (an exact restore)."""
+        with torch.no_grad():
+            for n, t in values.items():
+                p = E._param(self.lm, n)
+                p.copy_(t.to(p.device))
+
+    def _reset_to(self, keep: list) -> None:
+        """The original weights, then `keep` committed again in order (exactly the state they made before). All or
+        nothing: if re-committing fails, the model and the stack are put back as they were before the call."""
+        lm = self.lm
+        before, prev, ver = self._snapshot(self._orig), list(self.stack), lm._wver
+        try:
+            self._load(self._orig)
+            self.stack = []
+            if not keep:
+                lm._wver = self._orig_ver                # these are the original weights, bit for bit
+                return
+            E._bump(lm)
+            for eid in keep:
+                E.apply(lm, self.edits[eid])
+                self.stack.append(eid)
+        except BaseException:
+            self._load(before)
+            self.stack, lm._wver = prev, ver
+            raise
+        finally:
+            self._held = None
+
+    def _commit(self, eid: str) -> None:
+        """Apply one edit in place and record it. All or nothing: if applying fails partway, every tensor it touched
+        is put back and nothing is recorded."""
+        patch = self.edits[eid]
+        lm = self.lm
+        E.fits(lm, patch)
+        names = list(dict.fromkeys(d.name for d in patch.deltas))
+        before, ver = self._snapshot(names), lm._wver
+        for n in names:
+            if n not in self._orig:                      # first touched: its original values, kept for the restore
+                self._orig[n] = before[n]
+        if not self.stack:
+            self._orig_ver = ver
+        try:
+            E.apply(lm, patch)
+        except BaseException:
+            self._load(before)
+            lm._wver = ver
+            raise
+        finally:
+            self._held = None
+        self.stack.append(eid)
+
+    def release(self) -> None:
+        """The run is over: the original weights back in the model (the stack stays on record). Whenever any were
+        saved, not only while something is committed: a model is never left in a state nothing records."""
+        if self._orig and not self._released:
+            self._load(self._orig)
+            self.lm._wver = self._orig_ver
+        self._released = True
+
     def _spend(self, what: str) -> Optional[str]:
         cap = getattr(self.budget, what)
         if self.used[what] >= cap:
@@ -416,9 +586,88 @@ class Workbench:
         if cd is not None:
             out["edit_ids"] = {}
             for label, build in cd.ladder:                 # one edit per strength, none applied yet
-                eid = f"e{len(self.edits) + 1}"
-                self.edits[eid] = build()
-                out["edit_ids"][label] = eid
+                out["edit_ids"][label] = self._add_edit(build())
+        return out
+
+    def gate_sweep(self, write_direction_id: str, read_source: Optional[dict] = None,
+                   layers: Optional[list] = None, silent: Optional[list] = None, keep: int = 2) -> dict[str, Any]:
+        """The playbook's gated-neuron search: a gate plan at every layer (or the given ones), then, at the `keep`
+        layers whose gate fires on most failing positions while staying off where it must, one edit per ladder
+        strength (playbook.GATE_LADDER x the strength that cancels the failure's gap). The edits are built, not
+        applied: screen, verify and measure them like any other."""
+        if not self.budget.weight_edits:
+            return {"error": NO_WEIGHT_EDITS}
+        if (err := self._spend("screens")):
+            return {"error": err}
+        lm = self.lm
+        src = read_source or {"kind": "contrast"}
+        if isinstance(src, str):
+            src = {"kind": src}
+        sts = self._states(src)
+        bad, good = [s for s in sts if s.bad], [s for s in sts if not s.bad]
+        if not bad or not good:
+            return {"error": "the read source needs failing and working states"}
+        silent_names = silent or ["suite"]
+        quiet: list[torch.Tensor] = []
+        for nm in silent_names:
+            quiet += [P._full_texts([r])[0] for r in self.ctx.base.replies
+                      if (nm == "suite" and r.kind != "safety") or (nm == "harmful" and r.kind == "safety"
+                                                                     and r.refused) or nm == f"suite:{r.name}"]
+        ref = P._full_texts(self.ctx.base.replies)[:8]
+        todo = sorted({int(x) for x in layers} if layers else range(1, lm.n_layers - 1))
+        todo = [L for L in todo if 0 <= L < lm.n_layers - 1]
+        rows, plans = [], {}
+        for L in todo:
+            plan = S.gate_plan(lm, L, bad, good, quiet, ref, max_off=self.budget.gate_max_off)
+            rows.append({"layer": L, "ok": bool(plan["ok"]),
+                         **{k: round(plan[k], 4) for k in ("fire_bad", "fire_off", "margin") if k in plan},
+                         **({} if plan["ok"] else {"why": plan.get("why")})})
+            if plan["ok"]:
+                plans[L] = plan
+        best = sorted(plans, key=lambda L: -(plans[L]["fire_bad"] - plans[L]["fire_off"]))[:self._cap(keep, 4)]
+        out: dict[str, Any] = {"layers": rows, "viable": sorted(plans), "edit_ids": {}}
+        if not best:
+            out["says"] = ("no layer has a gate that fires on the failing positions and stays off on the silent "
+                           "texts: the failure is not readable by one neuron's input at any layer swept")
+            return out
+        for L in best:
+            plan = plans[L]
+            w = self._direction(write_direction_id, L + 1)
+            neuron = S.quiet_neurons(lm, L, ref[:6], k=1)[0]
+            s0 = P.gate_strength(lm, L, bad, good, w, plan["margin"])
+            for k in P.GATE_LADDER:
+                strength = k * s0
+                label = f"gated neuron {L}.{neuron} x{k:g}"
+                if abs(strength) > self.budget.max_alpha:
+                    out["edit_ids"][label] = f"skipped: strength {strength:.3g} is beyond the allowed {self.budget.max_alpha}"
+                    continue
+                patch = E.gate(lm, L, neuron, plan["read"], w, threshold=plan["threshold"],
+                               up_scale=plan["up_scale"], mean_dir=plan["mean_dir"], mean_proj=plan["mean_proj"],
+                               strength=strength, label=label, source=f"gated neuron {L}.{neuron}")
+                patch.spec["plan"] = {kk: v for kk, v in plan.items() if not isinstance(v, torch.Tensor)}
+                out["edit_ids"][label] = self._add_edit(patch)
+        return out
+
+    def weight_scan(self, threshold: Optional[float] = None) -> dict[str, Any]:
+        """Rows or columns of the layers' weights far larger than the rest of their matrix (surgery/weightscan.py:
+        no healthy model measured has one above 13.4x its matrix's median norm; damage leaves tens to hundreds),
+        and for each finding three restoring edits, built not applied. Reads weights only: no generation, no budget."""
+        from ..surgery import weightscan as WS
+
+        th = WS.THRESHOLD if threshold is None else max(WS.RELATIVE, float(threshold))
+        found = WS.scan(self.lm, threshold=th)
+        out: dict[str, Any] = {"threshold": th, "findings": [], "says": WS.summary(found)}
+        if found and not self.budget.weight_edits:
+            out["note"] = NO_WEIGHT_EDITS + " (findings only: no edits built)"
+        for f in found[:4]:
+            row = {**f.as_dict(), "edit_ids": {}}
+            out["findings"].append(row)
+            if not self.budget.weight_edits:
+                continue
+            # The playbook's own candidates (like gate_sweep's gates), not free-form deltas: build_edit's size
+            # limits do not apply; shrinking damaged entries always changes the matrix by less than its own norm.
+            for strength, build in WS.repairs(self.lm, f):
+                row["edit_ids"][strength] = self._add_edit(build())
         return out
 
     def request_capability(self, capability: str, category: str, what_it_would_do: str, why_needed: str,
@@ -442,6 +691,12 @@ class Workbench:
                 patch = self._free_edit(dict(proposal, kind=proposal.get("kind", "delta")), proposal=True)
             except (ValueError, KeyError, LabError) as e:
                 return {"error": f"proposal not built: {e}"}
+            if self.stack:                                # computed on the committed stack: saved with it, as one
+                _, base = self.stack_candidate()          # patch on the original weights the user has
+                patch = E.Patch(f"{base.label}; then {patch.label}", "stack",
+                                {"parts": list(self.stack) + ["proposal"], "labels": [base.label, patch.label],
+                                 "kinds": ["stack", patch.kind]}, list(base.deltas) + list(patch.deltas),
+                                untie=base.untie or patch.untie)
             patch.checks = {"verified": False, "proposed_by": "agent", "request": req["capability"]}
             pid = f"proposal{len(self.proposals) + 1}"
             self.proposals[pid] = patch
@@ -454,7 +709,7 @@ class Workbench:
                         "for the user"}
 
     def harm_probe(self, depth: Optional[int] = None, up_sd: float = 2.0, margin_up: float = 0.5,
-                   margin_down: float = 0.0, direction: str = "both", read: Optional[list] = None) -> dict[str, Any]:
+                   margin_down: float = 0.0, read: Optional[list] = None) -> dict[str, Any]:
         """The model's own reading of harm (deep/harmprobe.py, calibrated once per model and cached) and a gate built
         on it: a gate id usable as intervene {"gate": id} in generate / read, and (in wsr program) as steer_eval
         vector with mode "gated". read: up to 8 prompts whose probe logit to report (> 0 reads harmful)."""
@@ -475,12 +730,19 @@ class Workbench:
                               "not expected to help")
         try:
             g = probe.gate(up_sd=float(up_sd), margin_up=float(margin_up), margin_down=float(margin_down),
-                           direction=direction, depth=depth)
+                           depth=depth)
         except ValueError as e:
             return {**out, "error": str(e)}
         gid = f"h{len(self.gates) + 1}"
         self.gates[gid] = g
+        est = probe.estimate(g)
+        if est is not None:
+            out["estimate"] = est
+        self.gate_built_on[gid] = tuple(self.stack)
         out["gate_id"] = gid
+        if self.stack:
+            out["calibrated_on"] = (self._model_is() + ": steer_eval measures the gate on top of this stack, against "
+                                    "the original weights")
         out["gate"] = g.as_dict()
         if read:
             if not isinstance(read, list) or len(read) > 8:
@@ -611,11 +873,13 @@ class Workbench:
                  compare: bool = False, intervene: Optional[dict] = None,
                  repetition_penalty: Optional[float] = None, prompts: Optional[list] = None) -> dict[str, Any]:
         """Replies (greedy, or `samples` sampled ones seeded per sample), classified by the triage
-        detectors; with `compare`, the original model and the edit on the same seeds. `prompts` (up to 8):
+        detectors; with `compare`, the untouched model and the model with the edit and / or interventions, on the
+        same seeds (a compare with only interventions, a gate for example, is a real comparison too). `prompts` (up to 8):
         all of them in one call, batched to the free GPU memory (LM.generate_batch plans the batch and halves
         it on an out-of-memory error); the original and the edit run in the same chunks, so they stay paired."""
         n = self._cap(samples, 8)
-        runs = [None, edit_id] if (compare and edit_id) else [edit_id]
+        # (edit id, interventions on?) per pass: with compare, the untouched model first, then the changed one
+        runs = [(None, False), (edit_id, True)] if (compare and (edit_id or intervene)) else [(edit_id, True)]
         if prompts is not None:
             if not isinstance(prompts, list) or not 1 <= len(prompts) <= 8:
                 return {"error": "prompts: a list of 1-8 prompts (example names, texts or {messages})"}
@@ -637,10 +901,10 @@ class Workbench:
         clf = self.ctx.clf
         ids = self.lm.encode(msgs, **(clf.template_kwargs or {}))
         out: dict[str, Any] = {}
-        for eid in runs:
+        for eid, on in runs:
             ctx = E.applied(self.lm, self._edit(eid)) if eid else contextlib.nullcontext()
             rows = []
-            with ctx, self.lm.steer(**kw):
+            with ctx, self.lm.steer(**(kw if on else {})):
                 for k in range(n if sample else 1):
                     torch.manual_seed(int(seed) + k)
                     gen = self.lm.generate(ids, self._cap(max_new, self._max_new_cap()), **dict(gen_kw))
@@ -648,8 +912,10 @@ class Workbench:
                     text = self.lm.tok.decode(gen[:-1] if ended else gen, skip_special_tokens=True)
                     groups = clf.groups_of(text, gen, request=msgs[-1].get("content"))
                     rows.append({"reply": text[:600], "groups": sorted(groups), "tokens": len(gen), "ended": ended})
-            out["edited" if eid else "original"] = rows if len(rows) > 1 else rows[0]
+            out["edited" if (eid or (on and kw)) else self._base_name()] = rows if len(rows) > 1 else rows[0]
         out["generations_left"] = self.remaining()["generations"]
+        if self.stack:
+            out["model"] = self._model_is()
         return out
 
     def _generate_many(self, prompts: list, runs: list, k: int, seed: int, max_new: int, gen_kw: dict,
@@ -661,14 +927,20 @@ class Workbench:
         mx = self._cap(max_new, self._max_new_cap())
         hooks = (lambda: self.lm.steer(**kw)) if kw else None
         results = [{"prompt": p if isinstance(p, str) else "messages"} for p in prompts]
-        for eid in runs:
+        for eid, on in runs:
             ctx = E.applied(self.lm, self._edit(eid)) if eid else contextlib.nullcontext()
             with ctx:
-                gens = self.lm.generate_batch(ids, mx, seeds=seeds, hooks=hooks, **dict(gen_kw))
+                gens = self.lm.generate_batch(ids, mx, seeds=seeds, hooks=hooks if on else None, **dict(gen_kw))
             for i, m in enumerate(msgs):
                 rows = [self._row(g, m) for g in gens[i * k:(i + 1) * k]]
-                results[i]["edited" if eid else "original"] = rows if len(rows) > 1 else rows[0]
-        return {"results": results, "generations_left": self.remaining()["generations"]}
+                results[i]["edited" if (eid or (on and kw)) else self._base_name()] = rows if len(rows) > 1 else rows[0]
+        return {"results": results, "generations_left": self.remaining()["generations"],
+                **({"model": self._model_is()} if self.stack else {})}
+
+    def _base_name(self) -> str:
+        """What generate calls the pass without the edit: "original", or "committed" once a stack is committed (the
+        model every tool reads is then the repaired one)."""
+        return "committed" if self.stack else "original"
 
     def make_direction(self, source: dict[str, Any]) -> dict[str, Any]:
         sts = self._states(source)
@@ -857,8 +1129,7 @@ class Workbench:
         if patch.n_free_params > self.budget.max_free_params and "large" not in self.budget.allow:
             return {"error": f"the fitted change has {patch.n_free_params:,} free parameters, over the cap "
                              f"{self.budget.max_free_params:,}: lower the rank or fit fewer matrices"}
-        eid = f"e{len(self.edits) + 1}"
-        self.edits[eid] = patch
+        eid = self._add_edit(patch)
         return {"edit_id": eid, "label": patch.label, "steps": r.steps, "stopped": r.stopped, "seconds": r.seconds,
                 "loss_start": r.loss_start, "loss_end": r.loss_end, "weights_changed": patch.n_weights_changed,
                 "free_params": patch.n_free_params, "fits_left": self.remaining()["fits"],
@@ -990,8 +1261,7 @@ class Workbench:
                        "false; or edit fewer layers, or use project / scale_neurons for a local edit")
             return {"error": f"edit has {patch.n_free_params:,} free parameters (rank x (rows + columns) per "
                              f"tensor), over the cap {self.budget.max_free_params:,}{why}"}
-        eid = f"e{len(self.edits) + 1}"
-        self.edits[eid] = patch
+        eid = self._add_edit(patch)
         out = {"edit_id": eid, "label": patch.label, "weights_changed": patch.n_weights_changed,
                "free_params": patch.n_free_params}
         if patch.n_weights_changed == 0:
@@ -1001,8 +1271,15 @@ class Workbench:
         return out
 
     def _edit(self, eid: str) -> E.Patch:
+        """An edit to apply on top of the model as it is now (the committed stack, if any)."""
         if eid not in self.edits:
             raise ValueError(f"unknown edit id {eid!r}; build one with build_edit")
+        if eid in self.stack:
+            raise ValueError(f"{eid} is committed: it is already part of the model every tool reads (applying it "
+                             "again would add it twice). Leave out edit_id to see it, or revert_edit to take it out")
+        on = tuple(self.built_on.get(eid, ()))
+        if on != tuple(self.stack):
+            raise ValueError(self._stale(eid, on))
         return self.edits[eid]
 
     def screen_edit(self, edit_id: str, pairs_id: Optional[str] = None) -> dict[str, Any]:
@@ -1011,7 +1288,7 @@ class Workbench:
             return {"error": err}
         ts = A.targets(self.lm, self.res.contrast)
         prs = self._pairs(pairs_id)
-        base = self.ctx.sel0 if pairs_id is None else PR.selectivity(self.lm, prs)
+        base = self.ctx.sel0 if pairs_id is None and not self.stack else PR.selectivity(self.lm, prs)
         with E.applied(self.lm, patch):
             sc = P._screen(self.lm, ts)
             cont = PR.compare(base, PR.selectivity(self.lm, prs)) if prs else None
@@ -1022,19 +1299,23 @@ class Workbench:
         return out
 
     def verify_edit(self, edit_id: str) -> dict[str, Any]:
-        patch = self._edit(edit_id)
+        """The playbook's checks on what would ship: with a committed stack, the stack plus this edit as one patch,
+        compared with the ORIGINAL model (its failing, working and regression replies)."""
+        key, patch = self.candidate(edit_id)
         if (err := self._spend("verifications")):
             return {"error": err}
         step: dict[str, Any] = {"strength": "agent", "weights_changed": patch.n_weights_changed}
-        with E.applied(self.lm, patch):
+        with self.original(), E.applied(self.lm, patch):
             probs = P._verify(self.ctx, patch, step)
             rows = step.pop("_regression_rows", None)
         step["problems"] = probs
         step["_rows"] = rows
-        self.results[edit_id] = step
+        self.results[key] = step
         if not probs:
-            self.verified[edit_id] = step
+            self.verified[key] = step
         return {"passed": not probs, "problems": probs,
+                **({"candidate": key, "checked": f"{key}: the committed stack plus {edit_id} as one patch, against "
+                                                 "the original model"} if key != edit_id else {}),
                 "target": {k: step["target"][k] for k in ("fixed", "of", "passing_kept", "passing", "original_fixed", "original_measured")
                            if k in step.get("target", {})},
                 "target_samples": step.get("target", {}).get("samples", [])[:3],
@@ -1045,10 +1326,57 @@ class Workbench:
                 "verifications_left": self.remaining()["verifications"]}
 
     def submit_patch(self, edit_id: str, rationale: str) -> dict[str, Any]:
-        if edit_id not in self.verified:
-            return {"error": "only an edit that passed verify_edit in this session can be submitted"}
-        self.done = {"submit": edit_id, "rationale": rationale}
-        return {"accepted": True}
+        key, _ = self.candidate(edit_id)
+        if key not in self.verified:
+            return {"error": "only an edit that passed verify_edit in this session can be submitted"
+                             + (f" (with the committed stack, the candidate is {key}: verify_edit {edit_id} checks "
+                                "it)" if key != edit_id else "")}
+        self.done = {"submit": key, "rationale": rationale}
+        return {"accepted": True, **({"submitted": key} if key != edit_id else {})}
+
+    # -- multi-stage surgery ---------------------------------------------------------------------------------------
+    def commit_edit(self, edit_id: str, why: str = "") -> dict[str, Any]:
+        """Make this edit part of the model every later tool reads, so the next stage is diagnosed and calibrated on
+        the repaired weights. Nothing ships by this: the measuring tools and the judge take the whole stack plus a
+        candidate as one patch on the original weights."""
+        if not self.budget.weight_edits:
+            return {"error": NO_WEIGHT_EDITS}
+        if self._released:
+            return {"error": "the run has ended"}
+        if edit_id in self.stack:
+            return {"error": f"{edit_id} is already committed"}
+        if len(self.stack) >= self.budget.max_commits:
+            return {"error": f"the stack already has {len(self.stack)} committed edits (at most "
+                             f"{self.budget.max_commits}): revert_edit one first"}
+        self._edit(edit_id)                               # exists, built on the model as it is now
+        key, _ = self.candidate(edit_id)
+        self._commit(edit_id)
+        out: dict[str, Any] = {"committed": list(self.stack), "label": self.edits[edit_id].label,
+                               "model": self._model_is(),
+                               "note": "every tool now reads this model: generate, read, make_direction, harm_probe, "
+                                       "gate_sweep, fit_edit and weight_scan calibrate on it. Edits built before this "
+                                       "commit were made on other weights and are refused here (rebuild them). "
+                                       "practice_eval, settings_eval, steer_eval, verify_edit and final_choice measure "
+                                       "the stack plus a candidate against the ORIGINAL weights, as the judge does; "
+                                       "final_choice on the top edit submits the stack itself"}
+        if key not in self.verified:
+            out["warning"] = (f"{key} has not passed verify_edit: committing changes what the tools read, not what "
+                              "ships; check the stack before choosing it")
+        return out
+
+    def revert_edit(self, edit_id: Optional[str] = None, why: str = "") -> dict[str, Any]:
+        """Take a committed edit out (and every one committed after it, which was built on it); the weights return
+        bit for bit to the state before it was committed."""
+        if not self.stack:
+            return {"error": "nothing is committed"}
+        eid = edit_id or self.stack[-1]
+        if eid not in self.stack:
+            return {"error": f"{eid} is not committed; committed: {self.stack}"}
+        k = self.stack.index(eid)
+        removed = self.stack[k:]
+        self._reset_to(self.stack[:k])
+        return {"reverted": removed, "committed": list(self.stack), "model": self._model_is(),
+                "note": "edits built on the reverted state are refused until you commit back to it"}
 
     def give_up(self, reason: str, next_step: str) -> dict[str, Any]:
         self.done = {"give_up": reason, "next_step": next_step}
@@ -1110,9 +1438,11 @@ TOOLS: dict[str, Callable[..., dict]] = {
     "logit_lens": Workbench.logit_lens, "build_edit": Workbench.build_edit, "screen_edit": Workbench.screen_edit,
     "verify_edit": Workbench.verify_edit, "submit_patch": Workbench.submit_patch, "give_up": Workbench.give_up,
     "compute": Workbench.compute, "read": Workbench.read, "make_pairs": Workbench.make_pairs,
-    "screen_layers": Workbench.screen_layers, "note": Workbench.note,
+    "screen_layers": Workbench.screen_layers, "gate_sweep": Workbench.gate_sweep, "note": Workbench.note,
+    "weight_scan": Workbench.weight_scan,
     "attribute_heads": Workbench.attribute_heads, "fit_edit": Workbench.fit_edit,
     "request_capability": Workbench.request_capability, "harm_probe": Workbench.harm_probe,
+    "commit_edit": Workbench.commit_edit, "revert_edit": Workbench.revert_edit,
 }
 
 EDIT_KINDS = ("orthogonalise", "project", "scale_neurons", "scale_heads", "gate", "combine", "delta", "set_columns",
@@ -1240,6 +1570,35 @@ SCHEMAS: list[dict[str, Any]] = [
         "strength. Needs >= 4 pairs (default: the loop's own matched continuations). Costs one screen."),
      "input_schema": {"type": "object", "properties": {"pairs_id": {"type": "string"}, "alpha": {"type": "number"},
                                                        "keep": {"type": "integer", "minimum": 1, "maximum": 6}}}},
+    {"name": "weight_scan", "description": (
+        "Looks for DAMAGED WEIGHTS: rows or columns of the layers' weight matrices many times larger than the rest of "
+        "their matrix (a bad merge, conversion or fine-tune; garbage on most prompts is the usual symptom). No healthy "
+        "model measured has one above 13.4x its matrix's median norm; the default threshold is 50x (or 20x and 10x "
+        "the same matrix kind in every other layer). For each finding (largest first) it builds three edits, most "
+        "faithful first: every damaged entry divided by one common factor (undoes a single scale), each set to the "
+        "median norm, and zeroed. Built, not applied: screen_edit / verify_edit / practice_eval them. A restored model "
+        "can show behaviour the damaged one hid (e.g. its own refusals, or answers to harmful requests it only "
+        "garbled): check what each guardrail protects, and if the restored model needs a second fix, commit_edit the "
+        "restore and build that fix on the restored model. Reads "
+        "the weights only (no generation, no budget). threshold: at least 20."),
+     "input_schema": {"type": "object", "properties": {"threshold": {"type": "number", "minimum": 20}}}},
+    {"name": "gate_sweep", "description": (
+        "The playbook's gated-neuron search, for a failure that is CONDITIONAL (it must change only where it "
+        "happens, e.g. a loop, or refusing where the model should answer): one gate plan per layer (default: every "
+        "layer but the first and last), reporting where a single neuron's input separates the failing states from "
+        "the working ones (fire_bad: share of failing positions it fires on; fire_off: share of positions that must "
+        "stay unchanged where it would also fire). At the `keep` best layers it builds one edit per strength of the "
+        "ladder x0.5, x1, x2, x4 of the strength that exactly cancels the failure's gap along the write direction, "
+        "so you do not have to guess a layer or a strength. The readable layer is often earlier than the layer that "
+        "writes the failure. Edits are built, not applied: screen_edit / verify_edit / practice_eval them. "
+        "read_source: where the failing and working states come from ({kind: contrast}, {kind: continuations} for "
+        "loops, or {kind: prompts, failing, working}); silent: texts it must stay off on (default ['suite'], add "
+        "'harmful' to keep refusals untouched). Costs one screen."),
+     "input_schema": {"type": "object", "properties": {
+         "write_direction_id": {"type": "string"}, "read_source": {"type": "object"},
+         "layers": {"type": "array", "items": {"type": "integer"}},
+         "silent": {"type": "array", "items": {"type": "string"}},
+         "keep": {"type": "integer", "minimum": 1, "maximum": 4}}, "required": ["write_direction_id"]}},
     {"name": "request_capability", "description": (
         "Use when your evidence says the repair needs something these tools do not allow (a frozen tensor, a "
         "bigger edit, a new kind of edit or analysis, a shape change, a config / template / decoding change, or "
@@ -1256,25 +1615,33 @@ SCHEMAS: list[dict[str, Any]] = [
          "evidence": {"type": "string", "description": "the tool results that show it"},
          "proposal": {"type": "object"}},
          "required": ["capability", "category", "what_it_would_do", "why_needed"]}},
-    {"name": "harm_probe", "description": "For refusal failures (over- or under-refusal): the model's OWN reading of "
-     "harm. A linear probe on the residual stream at the last prompt token, calibrated once per model on wsr's contrast "
-     "pools (and the goal's practice set in wsr program), scored on prompt families it never saw: its held-out AUC by "
-     "depth, how the model's refusals compare (false refusals, harmful compliance) and how many of those mistakes the "
-     "probe reads correctly, with a verdict (viable or not, and why). Builds a GATE on it: after one layer, where the "
-     "reply starts, the probe is read once; where it reads harmful (logit > margin_up) the refusal component is raised "
-     "to the refused level + up_sd standard deviations, where it reads safe (logit < -margin_down) it is lowered to the "
-     "answered level. Returns a gate_id: use it as intervene {\"gate\": id} in generate / read, and in wsr program as "
-     "steer_eval {vector: id, mode: gated}. No weights change. When the verdict is not viable the model has no reading "
-     "to gate on: do not spend budget on gates. Free: the probe is cached.",
+    {"name": "harm_probe", "description": "For refusal failures (over- or under-refusal), and for keeping harmful "
+     "requests refused after another fix (a restored or repaired model can answer what it used to garble): the model's "
+     "OWN reading of "
+     "harm, and a steering built on it. The probe is linear, on the residual stream at the last prompt token, "
+     "calibrated once per model on wsr's contrast pools (and the goal's practice set in wsr program) and scored on "
+     "prompt families it never saw. It reports its held-out AUC by depth, the model's own mistakes (false refusals, "
+     "harmful compliance), how many of them the probe reads correctly, and a verdict (viable or not, and why). It "
+     "builds a GATE that ties the refusal to that reading: after one layer, where the reply starts, the probe is read "
+     "once; where it reads the request as harmful (logit > margin_up) the refusal component is raised to the refused "
+     "level + up_sd standard deviations, and where it reads it as safe (logit < -margin_down) it is lowered to the "
+     "answered level. The gate always acts both ways, on purpose: the raising side is what keeps harmful requests "
+     "refused when the probe misreads one of them as safe, so fixing over-refusal does not cost safety, and the same "
+     "gate fixes under-refusal; margin_down sets how sure the probe must be before it lowers a refusal. Every gate "
+     "comes with an estimate: on calibration prompts each read by a "
+     "probe fold that did not see it, how many harmful requests the model answers it would raise (what it is for), how "
+     "many it refuses it would lower, and how many safe look-alikes and goal prompts it would raise (false refusals): "
+     "use it to choose margins and depth before spending a measurement. Trade-offs you control: margin_up / margin_down widen the band where nothing happens "
+     "(fewer prompts touched, fewer fixed); up_sd sets how firmly harmful requests are refused; an earlier depth leaves "
+     "more layers for the change to act through. Returns a gate_id: intervene {\"gate\": id} in generate / read, and "
+     "in wsr program steer_eval {vector: id, mode: gated}. No weights change. When the verdict is not viable the model "
+     "has no reading to gate on: do not spend budget on gates. Free: the probe is cached.",
      "input_schema": {"type": "object", "properties": {
          "depth": {"type": "integer", "description": "residual depth to gate at (k = after layer k - 1); default the "
                                                      "probe's chosen depth; earlier depths leave more layers to act"},
          "up_sd": {"type": "number", "minimum": 0, "maximum": 6},
          "margin_up": {"type": "number", "minimum": 0, "maximum": 10},
          "margin_down": {"type": "number", "minimum": 0, "maximum": 10},
-         "direction": {"type": "string", "enum": ["both", "up", "down"],
-                       "description": "up: only raise refusals where it reads harmful; down: only lower them where "
-                                      "it reads safe"},
          "read": {"type": "array", "maxItems": 8, "description": "prompts whose probe logit to report"}},
          "required": []}},
     {"name": "note", "description": "Write a finding into the run's notebook (kept in the transcript and report).",
@@ -1283,7 +1650,7 @@ SCHEMAS: list[dict[str, Any]] = [
      "suite (with which harmful requests the model refuses) and the held-out fresh variants.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "generate", "description": "Replies from the model, classified with the triage detectors: greedy, or "
-     "`samples` sampled replies (temperature > 0; seeded per sample, so compare=true gives the original and the edit "
+     "`samples` sampled replies (temperature > 0; seeded per sample, so compare=true gives the untouched model and the one with the edit and / or the interventions "
      "the same random stream). Optional interventions. Costs one generation per reply.",
      "input_schema": {"type": "object", "properties": {
          "prompt": {"description": "an example name, a prompt text, or {messages: [...]}"},
@@ -1369,12 +1736,28 @@ SCHEMAS: list[dict[str, Any]] = [
                       "required": ["edit_id"]}},
     {"name": "verify_edit", "description": "The full checks the shipped patch must pass: failing and working "
      "prompts, the regression suite (new failures, drift, top-token agreement, harmful requests still refused), "
-     "serving precision, and the mode's extra checks. Expensive and limited; costs one verification.",
+     "serving precision, and the mode's extra checks. Expensive and limited; costs one verification. With committed "
+     "edits it checks the stack plus this edit, as one patch, against the original model.",
      "input_schema": {"type": "object", "properties": {"edit_id": {"type": "string"}}, "required": ["edit_id"]}},
     {"name": "submit_patch", "description": "Finish with an edit that passed verify_edit in this session.",
      "input_schema": {"type": "object", "properties": {"edit_id": {"type": "string"},
                                                        "rationale": {"type": "string"}},
                       "required": ["edit_id", "rationale"]}},
+    {"name": "commit_edit", "description": (
+        "MULTI-STAGE SURGERY: make this edit part of the model that every later tool reads, so the next problem is "
+        "diagnosed and calibrated on the repaired weights (a model with more than one fault: e.g. restore damaged "
+        "weights, then build a refusal gate on the RESTORED model's own reading of harm with harm_probe, or a second "
+        "edit with make_direction / gate_sweep / fit_edit). Nothing ships by committing. practice_eval, settings_eval, "
+        "steer_eval, verify_edit and final_choice always measure the committed stack plus the candidate as ONE patch "
+        "against the ORIGINAL weights, exactly as the judge will (their results name it, e.g. e1+e4); final_choice on "
+        "the top committed edit submits the stack itself, and a steering or settings measured on a stack are judged "
+        "and shipped together with it. Edits built before a commit were computed from other weights and are refused "
+        "after it: rebuild them. At most 4 committed at once; revert_edit takes them out."),
+     "input_schema": {"type": "object", "properties": {"edit_id": {"type": "string"}, "why": {"type": "string"}},
+                      "required": ["edit_id"]}},
+    {"name": "revert_edit", "description": "Take a committed edit out of the model (default: the last one), with every "
+     "edit committed after it; the weights return bit for bit to the state before it was committed.",
+     "input_schema": {"type": "object", "properties": {"edit_id": {"type": "string"}, "why": {"type": "string"}}}},
     {"name": "give_up", "description": "Finish without a patch: why no edit can fix it, and what to do instead.",
      "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}, "next_step": {"type": "string"}},
                       "required": ["reason", "next_step"]}},

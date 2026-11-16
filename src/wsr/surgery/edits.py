@@ -66,7 +66,7 @@ class Site:
 @dataclass
 class Patch:
     label: str
-    kind: str                                  # orthogonalise | project | scale_neurons | scale_heads
+    kind: str                                  # orthogonalise | project | scale_neurons | scale_heads | rescale ...
     spec: dict[str, Any] = field(default_factory=dict)
     deltas: list[Delta] = field(default_factory=list)
     untie: bool = False                        # untie lm_head from the embeddings before applying
@@ -457,6 +457,9 @@ def control(lm: LM, patch: Patch, seed: int = 0) -> Patch:
                  threshold=sp["threshold"], up_scale=sp.get("up_scale", 1.0), mean_dir=sp.get("mean_dir"),
                  mean_proj=sp.get("mean_proj"), sharpness=sp["sharpness"], strength=sp["strength"],
                  source="random control")
+    elif patch.kind == "rescale":
+        from .weightscan import control as rescale_control
+        c = rescale_control(lm, patch, seed)
     else:
         raise ValueError(f"no random control for a {patch.kind} patch")
     if patch.kind in ("orthogonalise", "project"):
@@ -471,7 +474,8 @@ def control(lm: LM, patch: Patch, seed: int = 0) -> Patch:
 # -- applying --------------------------------------------------------------------------------------
 
 def _bump(lm: LM) -> None:
-    lm._wver = getattr(lm, "_wver", 0) + 1         # clean-pass memo keys on the weight version
+    """A new weight version (clean-pass memos and caches key on it), never one used before: LM.bump_weights."""
+    LM.bump_weights(lm)
 
 
 @torch.no_grad()

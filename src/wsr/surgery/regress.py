@@ -164,15 +164,28 @@ def _from_cache(lm: LM, meta: dict, tensors: dict) -> Baseline:
     return b
 
 
+BROKEN_SHARE = 0.5     # more than this share of the original's suite replies failing: drift is not measurable
+
+
 def compare(lm: LM, base: Baseline, *, template_kwargs: Optional[dict] = None) -> dict[str, Any]:
-    """The patched model (applied by the caller) against the baseline."""
+    """The patched model (applied by the caller) against the baseline.
+
+    Drift and top-token agreement protect what the original does well, so they are measured on its healthy
+    replies only. When more than BROKEN_SHARE of its suite replies fail the detectors, the model is broken on
+    the suite itself (corrupted weights: garbage on 12 of 17 prompts), and the replies the detectors let
+    through are mostly broken too (short garbage passes them): drift against them would measure the repair,
+    not damage. Then drift and agreement are not measured (None, with the reason); new failures, refusals, the
+    canary and the goal's other guardrails still apply."""
     rows, new_fail, safety_lost, d_nll, agree, n_tok, same, also_fixed = [], [], [], [], 0, 0, 0, []
+    failing_before = sum(1 for r in base.replies if r.groups and r.kind != "safety")
+    scored = sum(1 for r in base.replies if r.kind != "safety")
+    broken = scored > 0 and failing_before / scored > BROKEN_SHARE
     after = _run_all(lm, [(r.name, r.prompt, r.lang, r.kind) for r in base.replies], template_kwargs)
     for r0, r1 in zip(base.replies, after):
         lp0, top0 = base.tf[r0.name]
         lp1, top1 = _teacher_forced(lm, r0)
         # Drift only over replies that were healthy: a blank or looping original is not a reply to keep.
-        healthy = not r0.groups
+        healthy = not r0.groups and not broken
         # Content tokens only: where a reply ends is judged by the reply comparison, and one
         # end-of-turn token whose probability moves (a patch that stops cutting replies short)
         # would otherwise swamp the mean.
@@ -202,7 +215,10 @@ def compare(lm: LM, base: Baseline, *, template_kwargs: Optional[dict] = None) -
             "safety_refused_before": safety_n, "safety_lost": safety_lost,
             # None: no healthy original reply to measure drift on
             "mean_delta_nll": round(sum(d_nll) / len(d_nll), 4) if d_nll else None,
-            "top1_agreement": round(agree / n_tok, 4) if n_tok else None, "rows": rows}
+            "top1_agreement": round(agree / n_tok, 4) if n_tok else None, "rows": rows,
+            **({"drift_not_measured": f"the original fails {failing_before}/{scored} of the suite's prompts: it is "
+                                      "broken on the suite itself, so drift against its replies would measure the "
+                                      "repair"} if broken else {})}
 
 
 @dataclass

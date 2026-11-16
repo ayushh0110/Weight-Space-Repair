@@ -135,6 +135,7 @@ class LM:
         self.stats: dict[str, dict[str, float]] = {}
         self._memo: Optional[dict] = None       # clean forward passes, only inside memo()
         self._wver = 0                          # bumped whenever weights change (qbisect swaps)
+        self._wmax = 0                          # the highest version used: a new version is always above it
         self._steering = 0                      # > 0 while steer() hooks are active
         self._stage, self._t0 = "load", time.perf_counter()
         self.checkpoint_dtype: Optional[str] = None   # set by load() from config.json
@@ -158,6 +159,13 @@ class LM:
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
+
+    def bump_weights(self) -> None:
+        """The weights changed: a new version number, never one used before. Caches key on the version (clean
+        passes, probes, cache.model_key), and a restored state may take back its own earlier number, so a number
+        must name one set of weights only."""
+        self._wmax = max(getattr(self, "_wmax", 0), getattr(self, "_wver", 0)) + 1
+        self._wver = self._wmax
 
     @classmethod
     def load(cls, path: str | Path, dtype: str = "auto", device: str = "auto") -> "LM":
@@ -286,6 +294,10 @@ class LM:
         repetition_penalty); stops at end-of-turn, which is kept."""
         ctx = hooks() if hooks else contextlib.nullcontext()
         ids = ids.to(self.device)
+        dry = gen_kw.pop("dry", None)
+        if dry:
+            from .dry import processor
+            gen_kw["logits_processor"] = processor(self.tok, dry)
         with ctx:
             out = self.model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=max_new_tokens,
                                       do_sample=gen_kw.pop("do_sample", False),
@@ -318,9 +330,14 @@ class LM:
         chunks = self.batch_plans.get(key)
         if chunks is None:
             order = sorted(range(n), key=lambda k: (ids_list[k].shape[1], k))
-            bs = BT.plan(self, max(t.shape[1] for t in ids_list), max_new_tokens, n)
-            self._count("batch_plan", bs)
-            chunks = [order[i:i + bs] for i in range(0, n, bs)]
+            # each chunk sized for its own longest prompt (they are sorted, so the last one); an out-of-memory
+            # error still halves a chunk below, and the chunks actually run are what is kept
+            szs = BT.sizes(self, [int(ids_list[k].shape[1]) for k in order], max_new_tokens)
+            self._count("batch_plan", max(szs))
+            chunks, i = [], 0
+            for s in szs:
+                chunks.append(order[i:i + s])
+                i += s
         out: list[Optional[list[int]]] = [None] * n
         done: list[list[int]] = []
         queue = list(chunks)
@@ -362,6 +379,10 @@ class LM:
             ids[r, L - t.shape[1]:] = t[0]
             mask[r, L - t.shape[1]:] = 1
         ids, mask = ids.to(self.device), mask.to(self.device)
+        dry = gen_kw.pop("dry", None)
+        if dry:
+            from .dry import processor
+            gen_kw["logits_processor"] = processor(self.tok, dry, pad=int(pad))
         with torch.no_grad():
             o = self.model.generate(ids, attention_mask=mask, max_new_tokens=max_new_tokens,
                                     do_sample=gen_kw.pop("do_sample", False),
@@ -597,6 +618,70 @@ class LM:
         if key is not None:
             self._memo[key] = res
         return res
+
+    @torch.no_grad()
+    def last_resid_batch(self, ids_list: Sequence[torch.Tensor]) -> torch.Tensor:
+        """The residual stream at each prompt's last token, [n, n_layers + 1, d] (embeddings, then after each
+        layer): `run(ids).resid` for many prompts, several per forward pass when memory allows (deep/batching.py
+        plans the batch from free VRAM / RAM; an out-of-memory error halves the chunk and retries). Prompts are
+        left-padded, masked, and given the position ids they have alone, so a row matches its single run up to
+        float rounding. A model that cannot be batched (a recurrent state) runs one prompt at a time."""
+        from . import batching as BT
+
+        n = len(ids_list)
+        if n == 0:
+            return torch.empty(0, self.n_layers + 1, self.d_model)
+        order = sorted(range(n), key=lambda k: (ids_list[k].shape[1], k))
+        bs = BT.plan(self, max(t.shape[1] for t in ids_list), 1, n)
+        queue = [order[i:i + bs] for i in range(0, n, bs)]
+        out: list[Optional[torch.Tensor]] = [None] * n
+        while queue:
+            chunk = queue.pop(0)
+            try:
+                if len(chunk) == 1:
+                    rows = [self.run(ids_list[chunk[0]], capture=("resid",)).resid]
+                else:
+                    rows = self._last_resid_padded([ids_list[k] for k in chunk])
+            except Exception as e:                     # noqa: BLE001 - only memory errors are retried
+                if not BT.is_oom(e) or len(chunk) == 1:
+                    raise
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                h = len(chunk) // 2
+                queue[:0] = [chunk[:h], chunk[h:]]
+                self._count("batch_oom")
+                continue
+            for k, r in zip(chunk, rows):
+                out[k] = r
+        return torch.stack(out)                            # type: ignore[arg-type]
+
+    def _last_resid_padded(self, ids_list: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+        pad = self.tok.pad_token_id if getattr(self.tok, "pad_token_id", None) is not None else \
+            next(iter(sorted(self.eot_ids)), 0)
+        L = max(t.shape[1] for t in ids_list)
+        ids = torch.full((len(ids_list), L), int(pad), dtype=torch.long)
+        mask = torch.zeros((len(ids_list), L), dtype=torch.long)
+        for r, t in enumerate(ids_list):
+            ids[r, L - t.shape[1]:] = t[0]
+            mask[r, L - t.shape[1]:] = 1
+        ids, mask = ids.to(self.device), mask.to(self.device)
+        pos_ids = (mask.cumsum(-1) - 1).clamp(min=0)
+        cap: list[Optional[torch.Tensor]] = [None] * (self.n_layers + 1)
+
+        def first_in(m, args, kwargs):
+            h = args[0] if args else kwargs.get("hidden_states")
+            cap[0] = h[:, -1].detach().float().cpu()
+        regs = [(self.layers[0], "prekw", first_in)]
+        for i in range(self.n_layers):
+            regs.append((self.layers[i], "post", lambda m, a, o, i=i: cap.__setitem__(
+                i + 1, _first(o)[:, -1].detach().float().cpu())))
+        self._count("fwd")
+        self._count("rows", len(ids_list))
+        extra = {"logits_to_keep": 1} if self._keeps_logits else {}
+        with self._hooks(regs):
+            self.model(input_ids=ids, attention_mask=mask, position_ids=pos_ids, **extra)
+        stacked = torch.stack(cap, dim=1)                  # [b, n_layers + 1, d]
+        return list(stacked)
 
     @torch.no_grad()
     def seq_capture(self, ids: torch.Tensor, depths: Sequence[int] = (), mlp_layers: Sequence[int] = (),

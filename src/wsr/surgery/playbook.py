@@ -57,6 +57,9 @@ class Candidate:
     ladder: list[tuple[str, Callable[[], E.Patch]]]      # (strength label, builder), weakest first
     check: Optional[Callable[[], tuple[float, float]]] = None   # (KL weight edit vs hook, KL hook vs clean), full strength
     scope: str = "global"                                # component | sparse | local | global (smallest first in deep)
+    # The ladder's steps are ALTERNATIVES (different repairs), not strengths of one edit: every step is judged on
+    # generation, none skipped by the decision-token screen (which only says whether a weaker strength does nothing).
+    alternatives: bool = False
 
 
 @dataclass
@@ -298,6 +301,19 @@ def _full_texts(replies: list) -> list[torch.Tensor]:
     return [torch.cat([r.ids, torch.tensor([r.gen], dtype=torch.long)], 1) if r.gen else r.ids for r in replies]
 
 
+@torch.no_grad()
+def gate_strength(lm: LM, layer: int, bad: list, good: list, w: torch.Tensor, margin: float) -> float:
+    """The gate strength (edits.gate) that cancels the failure's gap along `w` after `layer` at the gate's mean
+    firing margin: (mean failing state - mean working state) . w / margin. The ladder (GATE_LADDER) is multiples
+    of it, so a gate is tried weaker and stronger than exactly cancelling the gap."""
+    def mean(states):
+        v = [lm.seq_capture(s.ids, depths=[layer + 1], positions=s.positions)["resid"][layer + 1].mean(0)
+             for s in states]
+        return torch.stack(v).mean(0)
+    gap = float((mean(bad) - mean(good)) @ w)
+    return max(gap, 1e-3) / max(margin, 1e-6)
+
+
 def gate_candidates(lm: LM, res: Any, sm: Optional[S.SiteMap], base: R.Baseline, prs: list) -> list[Candidate]:
     """Deep mode: one gated neuron (edits.gate) in the MLP that writes most of the failure. It reads
     what separates the failing states from the ones that must not change, fires only above every
@@ -344,15 +360,8 @@ def gate_candidates(lm: LM, res: Any, sm: Optional[S.SiteMap], base: R.Baseline,
         return []
     neuron = S.quiet_neurons(lm, layer, ref[:6], k=1)[0]
     w = sm.dirs[layer + 1]
-
-    def gap() -> float:
-        def mean(states):
-            v = [lm.seq_capture(s.ids, depths=[layer + 1], positions=s.positions)["resid"][layer + 1].mean(0)
-                 for s in states]
-            return torch.stack(v).mean(0)
-        g = [st for st in (S.from_contrast(c) if c.kind != "loop" or len(prs) < 2 else PR.states(prs)) if not st.bad]
-        return float((mean(bad) - mean(g)) @ w)
-    s0 = max(gap(), 1e-3) / max(plan["margin"], 1e-6)       # cancels the gap at the mean firing margin
+    g = [st for st in (S.from_contrast(c) if c.kind != "loop" or len(prs) < 2 else PR.states(prs)) if not st.bad]
+    s0 = gate_strength(lm, layer, bad, g, w, plan["margin"])
     label = f"gated neuron {layer}.{neuron}"
     ev = (f"reads {how}; fires on {plan['fire_bad']:.0%} of the failing positions and "
           f"{plan['fire_off']:.1%} of the silent ones; writes against the failure direction after layer {layer} "
@@ -377,11 +386,24 @@ def _known_vector(res: Any, name: str) -> Optional[tuple[torch.Tensor, dict]]:
 def candidates(lm: LM, res: Any, *, mode: str = "fast", sitemap: Optional[S.SiteMap] = None) -> list[Candidate]:
     """The diagnosis's candidates (both modes); in deep mode also the local ones on `sitemap`,
     and every candidate ordered smallest edit first (components, sparse, local, global)."""
-    out = _diagnosis_candidates(lm, res)
+    out = damaged_candidates(lm) + _diagnosis_candidates(lm, res)
     if mode == "deep" and sitemap is not None:
         out += _local_candidates(lm, sitemap, res.contrast.failing[0].decision_ids)
         out.sort(key=lambda c: _SCOPE_ORDER.get(c.scope, 9))
     return out
+
+
+def damaged_candidates(lm: LM, top: int = 3) -> list[Candidate]:
+    """Weights that look damaged (weightscan.py: rows or columns tens of times larger than the rest of their matrix,
+    which no healthy model measured has), whatever the failure: brought back to the matrix's own scale, the most
+    faithful repair first. Nothing on a healthy model, so it costs one pass over the weight norms."""
+    from . import weightscan as WS
+
+    # The repairs are alternatives, each judged on generation: restoring damaged weights often leaves the first
+    # tokens alone ("1." opens the damaged and the restored list alike) and mends what follows, so the
+    # decision-token screen would skip the most faithful repair (seen on the x200 garbage model).
+    return [Candidate(f"damaged weights: {len(f.index)} {f.axis}(s) of {f.param}", WS.evidence(f), WS.repairs(lm, f),
+                      None, scope="component", alternatives=True) for f in WS.scan(lm)[:top]]
 
 
 def _diagnosis_candidates(lm: LM, res: Any) -> list[Candidate]:
@@ -974,7 +996,7 @@ def repair(lm: LM, res: Any, *, expect_lang: Optional[str] = None, max_new: int 
                 # Russian and a Ukrainian answer alike), so the screen only skips the weaker steps; the
                 # full-strength step is always judged on generation. For loops a step that does not make
                 # the repeat less likely (matched continuations) is not a reason to go on either.
-                last = k == len(cand.ladder) - 1
+                last = k == len(cand.ladder) - 1 or cand.alternatives
                 if not last and sc["flipped"] == 0 and (cont is None or not cont["selective"]):
                     step["result"] = "no failing prompt flips at the decision token" + (
                         "; the repeated continuation does not become less likely" if cont else "")

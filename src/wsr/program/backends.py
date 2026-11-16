@@ -117,6 +117,11 @@ def _sampling_body(protocol: Protocol, gen_kwargs: Optional[dict]) -> dict[str, 
         body["repeat_penalty"] = protocol.sampling["repetition_penalty"]
     if "presence_penalty" in protocol.sampling:
         body["presence_penalty"] = protocol.sampling["presence_penalty"]
+    for k in ("dry_multiplier", "dry_base", "dry_allowed_length"):
+        if k in protocol.sampling:
+            body[k] = protocol.sampling[k]
+    if "dry_multiplier" in protocol.sampling:
+        body["dry_penalty_last_n"] = -1              # the whole context, as wsr's PyTorch DRY (deep/dry.py)
     return body
 
 

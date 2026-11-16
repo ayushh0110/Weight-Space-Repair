@@ -68,9 +68,9 @@ def model_key(lm: Any) -> Optional[str]:
     """None when the model has no directory (built in memory) or caching is off."""
     if not enabled() or getattr(lm, "path", None) is None:
         return None
-    memo = getattr(lm, "_cache_key", None)
-    if memo is not None and memo[0] == getattr(lm, "_wver", 0):
-        return memo[1]
+    memo = getattr(lm, "_cache_keys", None) or {}
+    if getattr(lm, "_wver", 0) in memo:
+        return memo[getattr(lm, "_wver", 0)]
     import torch
     import transformers
 
@@ -94,7 +94,9 @@ def model_key(lm: Any) -> Optional[str]:
              f"{__version__}|batch={BT.enabled()}|detectors={DETECTOR_VERSION}\n".encode())
     h.update(_weights_checksum(lm).encode())
     key = f"{d.name}-{h.hexdigest()[:20]}"
-    lm._cache_key = (getattr(lm, "_wver", 0), key)
+    memo = dict(list(memo.items())[-7:])            # a few weight states (the original, a committed stack)
+    memo[getattr(lm, "_wver", 0)] = key
+    lm._cache_keys = memo
     return key
 
 

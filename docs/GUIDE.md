@@ -41,7 +41,8 @@ generated from the CLI itself.
 | Public datasets, remembered answers, what wsr keeps | `wsr data`, `wsr consent`, `wsr cache` | nothing |
 
 Triage needs no GPU and no dependencies. Everything that touches weights needs the `deep` extra; deep
-diagnosis is tested on models up to 1.5B parameters, repair and `wsr program` up to 1B, on a 4 GB GPU.
+diagnosis and `wsr program` with the agent (steering) are tested on models up to 1.5B parameters, weight repair up
+to 1B, on a 4 GB GPU.
 
 ## Triage: what failed, and is it the model?
 
@@ -152,6 +153,7 @@ model's other results; the diagnosis, the playbook and the agent then reuse it.
 | premature end-of-turn | the localised neurons, the contrast direction, the end-of-turn direction |
 | loops | the loop battery's MLP neurons and copy heads, the attractor direction, a layer screen on matched continuations |
 | anything else | the contrast direction from your `--failing` / `--passing` prompts |
+| every kind, tried first | damaged weights: rows or columns of a layer's weight matrix far larger than the rest of it (at least 50 times the matrix's median norm, or 20 times and 10 times the same matrix kind in every other layer; healthy models measured stay under 13.4), brought back to scale three ways: divided by one common factor, each set to the median norm, or zeroed |
 
 Edit types: direction removal (orthogonalisation of every write, or only chosen layers or neurons), neuron and
 head scaling, a gated neuron (a quiet neuron rewritten to fire only on the failure and write against it), and,
@@ -188,7 +190,11 @@ layer, where the reply starts, the harm probe is read once. Where it reads the r
 along the refusal direction (refused minus answered prompts) is raised to the refused prompts' level plus a margin;
 where it reads it as safe, the component is lowered to the answered prompts' level. The prompt itself is never
 changed, and between the two margins nothing happens. The refusal is then tied to the model's own reading of harm:
-one steering can fix over-refusal and under-refusal together. The ladder: the probe's depth and two thirds of the
+one steering can fix over-refusal and under-refusal together. The gate always acts both ways. A lower-only gate was
+tried by the agent and failed: it fixed over-refusal on validation but lost 3 of 75 harmful refusals and gained
+none, because it cannot protect a harmful request the probe misreads as safe. The raising side is what keeps the
+harmful set refused overall. Two-way can still lower a misread harmful request, or raise a safe one read as harmful;
+the margins limit both, and the guardrails measure them. The ladder: the probe's depth and two thirds of the
 way down, each at +2 and +3 standard deviations. Each goes through the same checks, with a random direction of the
 same size as the control. In `wsr program` the probe is also calibrated on the goal's practice set (labelled by
 `expect`), so it reads harm the way the goal means it; the validation set stays unseen. It ships as a steering
@@ -219,11 +225,67 @@ Together, Groq, DeepSeek, Mistral, Gemini's OpenAI endpoint, or a local llama-se
 | Group | Tools |
 |---|---|
 | Look | `list_examples`, `generate` (greedy or sampled, up to 8 prompts per call, original vs edit on the same seeds, with interventions), `read` (teacher-forced log-probs and activations of its own texts), `logit_lens`, `inspect_neuron` |
-| Analyse | `compute` (a numeric workspace over read-only copies of every weight, with torch's linear algebra), `make_direction`, `attribute_neurons`, `attribute_heads`, `make_pairs`, `screen_layers` |
-| Edit | `build_edit` (direction removal, local projection, neuron and head scaling, gated neurons, free-form `delta` / `set_columns` / `set_rows`, `combine`), `fit_edit` (a low-rank change learned by gradient descent on texts it chooses) |
-| Refusals | `harm_probe`: the model's own reading of harm (held-out AUC by depth, its mistakes and how many the probe reads correctly, the verdict) and a gate built on it, at a depth and strength it chooses; the gate id works as an intervention in `generate` and `read` |
+| Analyse | `compute` (a numeric workspace over read-only copies of every weight, with torch's linear algebra), `make_direction`, `attribute_neurons`, `attribute_heads`, `make_pairs`, `screen_layers`, `weight_scan` (damaged rows or columns, as the playbook's recipe finds them, with its three repairs built as edits) |
+| Edit | `build_edit` (direction removal, local projection, neuron and head scaling, gated neurons, free-form `delta` / `set_columns` / `set_rows`, `combine`), `fit_edit` (a low-rank change learned by gradient descent on texts it chooses), `gate_sweep` (the playbook's gated-neuron search: a gate plan at every layer, edits built at the best ones) |
+| Refusals | `harm_probe`: the model's own reading of harm (held-out AUC by depth, its mistakes and how many the probe reads correctly, the verdict) and a two-way gate built on it, at a depth, strength and margins it chooses; the gate id works as an intervention in `generate` and `read` |
 | Check and finish | `screen_edit`, `verify_edit` (the playbook's full checks), `submit_patch` (only an edit that passed `verify_edit`), `give_up`, `note`, `request_capability` |
-| In `wsr program` | `practice_eval`, `settings_eval` (serving settings: penalties, sampling, a system prompt, template arguments), `steer_eval` (add, clamp, or gated with a `harm_probe` gate id), `checkpoint`, `final_choice` |
+| Multi-stage | `commit_edit` (an edit becomes part of the model every later tool reads), `revert_edit` (takes it out, bit for bit) |
+| In `wsr program` | `practice_eval`, `settings_eval` (serving settings: penalties, the DRY sampler, sampling, a system prompt, template arguments; with a `steering_id`, the settings and that steering as one runtime bundle), `steer_eval` (add, clamp, or gated with a `harm_probe` gate id), `checkpoint`, `final_choice` |
+
+**What the measuring tools report first.** Each measuring call runs two checks before any practice item:
+
+- the judge's own regression-suite check, for the candidate as the judge will run it (a settings change is
+  generated under the settings, a steering under its hooks), so the agent never estimates drift by hand;
+- `harmful_kept`: half of wsr's held-back harmful requests, refused before vs under the candidate.
+
+A candidate that fails either is reported at once, and the call does not use the practice budget. Measured on 60
+or more items, a call runs the first 30, then the rest. It stops after the first stage when the candidate is
+significantly worse there (exact sign test, p ≤ 0.05) or newly broke at least 3 replies, more than it mended;
+`stopped_early` says which. `stop_early: false` measures every item regardless. `final_choice` refuses a candidate
+whose suite check failed, without spending an attempt.
+
+**Judged attempts** (`wsr program`). `final_choice` is judged at once: validation and every guardrail. When it is
+accepted the run ends, and the confirmation set, if the goal has one, decides once. When it is rejected and attempts
+remain (`budget.attempts`, default 3, or `--agent-attempts`), the agent gets abstract symptoms back and may choose a
+different candidate:
+
+- the task's gain rounded to 5 points, and whether it was significant;
+- for each guardrail, whether it held, and if not, what kind of thing it protects and what went wrong ("requests
+  that must stay refused were answered"), with counts in buckets (1-2, 3-5, 6-10, more than 10).
+
+It never sees validation prompts, ids, replies or per-item results. A candidate identical to one already judged is
+refused. Every attempt is a candidate slot of the run's correction, declared before anything is judged: with 3
+attempts each must reach p < 0.05 / 3, so trying again cannot pass by luck. Each rejection grants two more practice
+measurements. The brief lists what every guardrail protects (kinds and counts, not data). `harmful_kept` is the
+practice side of the judge's harm check: wsr's own harmful requests that the harm probe was not calibrated on are
+split in two, the agent measures one half, and the judge checks the other half, which the agent never sees.
+
+**Multi-stage surgery.** A model can have more than one fault, and fixing one can reveal the next. Restored
+weights, for example, can answer harmful requests the damaged model only garbled. `commit_edit` makes a fix part of the
+model, so every later tool diagnoses and calibrates on the repaired weights: `generate`, `read`, `make_direction`,
+`harm_probe`, `gate_sweep`, `fit_edit` and `weight_scan`. Nothing ships by committing:
+
+- `verify_edit`, `submit_patch`, `practice_eval` and `final_choice` take the committed stack plus the candidate as one
+  patch and compare it with the original model, as the judge does. Results name it, for example `e1+e4`.
+- A steering or settings measured on a stack is judged with the stack underneath, and ships with the weight patch in
+  its folder (`patch/`) and an APPLY.md that says to apply both.
+- An edit built before a commit was computed from other weights, so it is refused on the new stack, and a committed
+  edit cannot be applied twice. `revert_edit` takes the last edit (or a named one and everything after it) out again.
+- At most 4 edits are committed at once. When the run ends the model holds its original weights again, and
+  `wsr repair --agent --resume` commits the stack again.
+
+**The harm probe's data.** In `wsr program` the goal's practice and `contrast` prompts calibrate the harm probe,
+for any goal, when together they hold at least 10 must-refuse (`expect: "refuse"`) and 10 other prompts; the same
+probe is used by the diagnosis, the playbook and the agent. A goal whose prompts are all of one kind (a repair goal's
+answerable requests) can add a `contrast` file of must-refuse requests written in its own style, plus safe
+look-alikes; it is never judged, and `wsr objective check` refuses one that overlaps judged data. Every gate
+`harm_probe` builds comes with an estimate on calibration prompts its probe did not see: harmful requests the model
+answers that it would raise, harmful requests it refuses that it would lower, safe look-alikes and goal prompts it
+would raise.
+
+**Provider errors.** An error that looks transient (a timeout, a dropped connection, a rate limit, an overloaded or
+unavailable model, a 5xx status) is retried after 30, 120 and 300 seconds before the run ends. Anything else ends
+the run at once, with the state saved.
 
 **Limits it cannot change** (defaults; flags in the reference): 80 turns, $5 of API spend, 6M tokens; 6 full
 verifications, 40 screens, 60 generations, 80 reads, 300 workspace runs of 120 s each; 8 fits (rank at most
@@ -263,7 +325,8 @@ For a goal measured over a dataset ("stop over-refusing safe prompts", "fewer bl
 ```
 
 - `kind`: `repair` or `capability`. `sampling`: empty for greedy, else `temperature`, `top_p`, `top_k`, `min_p`,
-  `repetition_penalty`, `presence_penalty`.
+  `repetition_penalty`, `presence_penalty`, and the DRY sampler (`dry_multiplier` > 0 turns it on; `dry_base`,
+  default 1.75, and `dry_allowed_length`, default 2, shape it, as llama.cpp's `--dry-*` flags do).
 - Data rows (JSONL): `messages`, or `prompt` / `problem` / `question` / `input` / `instruction`; optional
   `answer` (else a `\boxed{}` answer in `solution`), `pattern`, `id`, `expect: "refuse"` (a request that must be
   refused) and `lang`.
@@ -276,8 +339,22 @@ For a goal measured over a dataset ("stop over-refusing safe prompts", "fewer bl
   default 0.05 = 5 points).
 - Guardrails: `wsr_regression` (the 17-prompt suite; `max_drift`, `min_agreement`, `allow_safety_loss`),
   `semantic_regression_canary` (`max_lost`, default 1) and data sets that may drop by at most `max_drop`.
-- `budget`: the agent's limits; the `--practice-evals`, `--agent-verifications` and `--agent-budget-usd` flags
-  override them.
+  - A data guardrail protects what the original did. An item whose original reply was broken (empty, a loop,
+    garbage, a template leak) is left out, since there was nothing to keep. A request that must be refused
+    (`expect: "refuse"`) is never left out: a broken original reply there counts as refused, and a candidate that
+    answers it loses the item. The report says how many items each guardrail measured.
+  - Every judge also checks `wsr_harmful_held_back`: 20 of wsr's own harmful requests, which no agent sees, must
+    stay refused. It is on unless the suite guardrail allows a safety loss. A repair that restores a damaged model
+    can fail it when the original itself answers some of them: then the choice to accept the original's own
+    safety is yours, through `allow_safety_loss`.
+  - When the original fails the suite itself, drift is not measured (it would measure the repair), and the report
+    says so.
+  - A data guardrail on exactly the validation prompts (the same messages in the same order, the same settings and
+    seeds; ids and other fields may differ) grades the judge's own replies with its grader instead of generating
+    them again. The numbers are the same, and the report notes it. A safety set never does this: wsr's harm check,
+    and any set with a request that must be refused, always generates its own replies.
+- `budget`: the agent's limits (`practice_evals`, `verifications`, `usd`, `attempts`); the `--practice-evals`,
+  `--agent-verifications`, `--agent-budget-usd` and `--agent-attempts` flags override them.
 
 **Building a goal.** `wsr objective init` writes a template; `check` reports rows, gradable rows, overlap between
 any two sets, stray control characters, and whether the confirmation set was already used; `split` shuffles a
@@ -293,8 +370,9 @@ to a goal: it confirms the failure, finds items that fail the same way (in a loc
 `budget` (it finishes at twice the cap), `weight` (a weight-level candidate), `template`, `intermittent` or
 `capability`.
 
-**Program.** `wsr program GOAL --out DIR` profiles the practice set, diagnoses the largest weight-level group,
-runs the playbook, judges its candidate on the held-out set, and, with `--agent`, hands over to the agent when
+**Program.** `wsr program GOAL --out DIR` profiles the practice set, diagnoses the largest weight-level group
+that the goal's grader counts as failing (a loop goal's refusals are not its target), with the items' expected
+language when they give one, runs the playbook, judges its candidate on the held-out set, and, with `--agent`, hands over to the agent when
 the playbook fails or its candidate is rejected (the agent hears only that it was rejected). `wsr fix` does
 `from-failure` and `program` in one process, with one model load. Outcomes:
 
@@ -800,6 +878,7 @@ Work towards a goal file: profile the practice set, diagnose the largest weight-
 | `--profile-limit` | `40` | practice items to profile (default 40) |
 | `--eval-limit` |  | held-out items the judge scores (default: all) |
 | `--practice-evals` |  | practice_eval calls the agent may make (default: the goal file's budget.practice_evals, else 10) |
+| `--agent-attempts` |  | final_choice calls the validation set judges (default: the goal file's budget.attempts, else 3); a rejection returns abstract symptoms only, and every attempt is a slot of the correction |
 | `--no-playbook` |  | skip the rule-based recipes |
 | `--no-weight-edits` |  | the weights must not change: the playbook only steers and the agent may only steer or change serving settings; a fix ships as a steering or settings, never a patch |
 | `--steering` `fallback\|only\|off` | `fallback` | activation steering against the diagnosed direction: fallback (default) when no weight edit passes, only (no weight edits), off |
@@ -880,6 +959,7 @@ One command, one model load: from a failing prompt to a judged patch (objective 
 | `--profile-limit` | `40` | practice items to profile |
 | `--eval-limit` |  | held-out items the judge scores (default: all) |
 | `--practice-evals` |  | practice_eval calls the agent may make (default: the goal file's budget, else 10) |
+| `--agent-attempts` |  | final_choice calls the validation set judges (default: the goal file's budget.attempts, else 3) |
 | `--no-playbook` |  | skip the rule-based recipes |
 | `--no-weight-edits` |  | the weights must not change: the playbook only steers and the agent may only steer or change serving settings; a fix ships as a steering or settings, never a patch |
 | `--steering` `fallback\|only\|off` | `fallback` | activation steering against the diagnosed direction: fallback (default) when no weight edit passes, only (no weight edits), off |

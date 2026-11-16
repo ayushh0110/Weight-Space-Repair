@@ -16,7 +16,8 @@ from .findings import CAUSE_PRIORITY, Cause, Finding, Layer, Severity
 GROUPS: dict[str, set[str]] = {
     "blank": {"EMPTY", "EMPTY_OUTPUT", "TRUNCATED_EMPTY", "TOO_SHORT", "REASONING_EXHAUSTED"},
     "loop": {"TAIL_LOOP", "REPETITION", "AGENT_LOOP"},
-    "garbage": {"SYMBOL_SOUP", "LOW_ENTROPY", "TOKEN_SALAD", "BROKEN_UTF8", "OUTPUT_PARSE_REJECTED",
+    "garbage": {"SYMBOL_SOUP", "LOW_ENTROPY", "TOKEN_SALAD", "GLUED_WORDS", "SCRIPT_GLUE", "BROKEN_UTF8",
+                "OUTPUT_PARSE_REJECTED",
                 "REPETITION_AVOIDANCE", "PENALTY_SHAPE_LOSS"},
     "template_leak": {"CONTROL_TOKEN_LEAK", "INVENTED_TURN", "REASONING_LEAK", "PROMPT_ECHO"},
     "language": {"LANG_MISMATCH", "SCRIPT_MISMATCH"},

@@ -8,8 +8,12 @@ How to read this: sections 1-3 design the triage layer from the tools it draws o
 5 surgery; 6 the surgery agent; 7 scope; 8-9 goal files, profiles, the judge, `wsr program` and GGUF
 export; 10-17 later rounds (speed, protecting the machine, settings fixes, the full agent toolkit,
 caching, steering); 18 the pre-release audit; 19 the second review round and the stricter acceptance rule;
-20 over- and under-refusal and the harm probe. Later sections supersede earlier ones where they differ, and
-results are reported as measured at the time, including the runs that failed.
+20 over- and under-refusal and the harm probe; 21 the agent's choices and judged attempts; 22 the harm
+probe's contrast set; 23 every failure type with the playbook and the agent, the damaged-weights recipe,
+guardrails and broken replies, and where the time went; 24 multi-stage surgery (commit_edit); 25 the
+judge's replies graded again for same-prompt guardrails; 26 the harm probe after the garbage runs: one probe
+everywhere, the goal's data with both kinds, each gate's estimate. Later sections supersede earlier ones where they
+differ, and results are reported as measured at the time, including the runs that failed.
 
 Scope at the start (v1): a triage CLI for small open-weight models (Qwen, Gemma, Llama under ~4B),
 safetensors first, GGUF read-only, focused on blank responses, loops, wrong language and over-refusal.
@@ -1926,3 +1930,345 @@ Not built, or not working:
   "false alarm" direction broke a suite prompt.
 - No llama.cpp form of the gate.
 - The gate decides once per reply.
+
+## 21. The agent's choices: two-way gates, guardrails it can see, judged attempts
+
+The first live agent run on Qwen's over-refusal with fresh prompts showed three problems in one run. Opus 5.5 chose
+a lower-only gate. That fixed the task on validation (28 better, 0 worse), but it answered 3 of the 75 harmful
+requests the guardrail keeps refused and refused none it had answered. The run then ended: one rejection was final.
+
+**One-sided gates removed** (`HarmProbe.gate`, `harm_probe`). Lowering only cannot protect a harmful request the
+probe misreads as safe; raising only cannot fix over-refusal. Two-way covers both, and its raising side is what
+holds the harmful set overall. It is not a per-prompt guarantee: it can still lower a misread harmful request or
+raise a misread safe one. The margins limit both, and the guardrails measure them. The playbook already used only
+two-way.
+
+**What the agent is told.** The agent had spot-checked the suite's three harmful prompts while the guardrail had 75
+it could not see. Three changes give it what it needs to choose well, without telling it which candidate to pick:
+
+- the brief describes every guardrail as the judge applies it (kinds and counts, never data);
+- the measuring tools report `harmful_kept` for refusal goals: wsr's own harmful requests that the harm probe was
+  not calibrated on, refused before vs under the candidate;
+- `harm_probe` and `final_choice` describe their trade-offs.
+
+**Judged attempts** (program/attempts.py). `final_choice` is judged inside the tool call. Accepted: the run ends
+and the confirmation set decides once. Rejected, with attempts left: the agent gets abstract symptoms and continues.
+
+- **No leak.** The symptoms are the gain rounded to 5 points, whether it was significant, and each guardrail's state
+  and kind of failure, with counts in buckets. Never prompts, ids, replies or per-item results.
+- **No luck.** The cap (default 3) is declared with the slots before anything is judged, and each attempt is tested
+  at alpha / slots. The playbook's slot counts only when the playbook runs.
+- **No repeats.** An identical candidate (by content) is refused.
+- **Room to measure.** Each rejection grants two practice measurements.
+- **Confirmation stays locked.** It runs once, for the accepted attempt; a judged attempt is never judged again
+  afterwards.
+
+Rerun with these changes on the same goal, Opus 5.5 read the probe, tested the gate on failing, harmful, suite and
+arithmetic prompts, read the mirror (3 harmful lost, 6 gained on practice), and chose the two-way gate on its first
+attempt. Validation was 28 better / 0 worse with every guardrail holding (harmful 3 lost, 3 gained), and
+confirmation was 15 better / 2 worse, p 0.001: confirmed. The second attempt was not needed, so the feedback loop is
+proven by the scripted tests (abstract symptoms only, no validation prompt or id in the transcript, identical
+candidates refused, the cap ends the run), not yet by a live run.
+
+**Meaningful tests only.** Several earlier refusal runs could not show a result: Llama barely over-refuses (7
+failing of 121), one under-refusal set had 10 failing items and had been judged many times, and two runs predate
+the harm probe. RESULTS.md now keeps those in a record section with the reason for each. A test counts in the main
+results only when it is powered (at least 15 failing items in validation and 12 in confirmation, fixed before the
+data was labelled), uses data never judged for that model, and gives the agent the full toolkit. New fresh
+harmful-request sets were written for under-refusal (311 requests; Llama also got XSTest's harmful half, which it
+had only seen as a guardrail).
+
+On those tests the agent chose a two-way gate on its first attempt each time, and every one was confirmed:
+
+- Qwen 0.5B under-refusal: validation 9 better / 1 worse, confirmation 12 / 0.
+- Llama under-refusal: validation 32 better / 2 worse, confirmation 23 / 0.
+- Qwen 1.5B over-refusal: validation 12 / 0, confirmation 15 / 0.
+- Qwen 1.5B under-refusal: validation 17 / 0, confirmation 12 / 1.
+
+The Qwen 1.5B over-refusal run showed that a data guardrail is judged on net: 10 harmful requests newly answered
+were hidden by 30 newly refused. The runs also found two wsr bugs, both fixed: `checkpoint` took only edit ids,
+and `generate` with `compare` and only a gate did not show the untouched model.
+
+In the Qwen run the agent used the safety mirror as intended. Its first gate answered one held-back harmful request,
+so it widened the "lower" margin to 2.0 and kept the same practice gain with none lost. The run also showed that
+`checkpoint` took only edit ids; it now takes steerings and settings too.
+
+## 22. The harm probe needs both kinds of prompt from the goal's own distribution
+
+The playbook tests on OR-Bench (a public benchmark whose toxic prompts are written to look like its hard-but-safe
+ones) failed twice on Qwen2.5-0.5B, in mirror image, and the guardrails stopped both:
+
+- **Over-refusal goal** (practice: only OR-Bench safe prompts). The gate fixed validation 33 better / 0 worse,
+  and **answered 61 toxic requests** the model used to refuse (harmful guardrail 70.6% → 48.6%).
+- **Under-refusal goal** (practice: only OR-Bench toxic prompts). The gate fixed validation 39 / 0, and **refused
+  175 safe prompts** (safe guardrail 69% → 11%).
+
+In `wsr program` the harm probe was calibrated on the goal's practice set as well as wsr's pools, and here that set
+held one kind only. With look-alike pairs, one-sided data teaches the probe the benchmark's style: everything in
+it reads safe (or harmful), and a gate built on that answers (or refuses) by style. On XSTest and wsr's fresh
+prompts the same one-sided practice had held, because their harmful and safe prompts do not share one style.
+
+The fix: a goal may name a `contrast` file, labelled prompts of both kinds that only calibrate the probe and are
+never judged. `wsr objective check` refuses a contrast file that overlaps validation, confirmation or a guardrail.
+`wsr program` uses practice + contrast for the probe only when that pool has at least 10 prompts of each kind;
+otherwise it uses wsr's built-in pools only and says why, in the report, the playbook's trial and the agent's
+brief. The OR-Bench tests were rerun with a contrast set (the other goal's practice prompts): RESULTS.md has the
+outcome.
+
+## 23. Every failure type, both ways: what the runs changed
+
+Each failure type was tested on fresh, powered data twice: by the playbook alone and by the agent alone
+(RESULTS.md has the table). Every change below came from one of those runs, and each has a test.
+
+### What the runs found, and what changed
+
+| Found by | Problem | Change |
+|---|---|---|
+| wrong language, playbook | the diagnosis did not know which language the items expect, so a Russian reply to a Ukrainian question counted as passing; it reported "surgery not indicated" | `wsr program` passes the group's expected language (the items' `lang`) to the diagnosis and the playbook's checks, and keeps only failing and working examples in that language |
+| loops, playbook | Qwen refuses 44% of the list requests. The profile's largest weight-level group was the refusals, which the loop grader counts as passing, so the playbook worked on refusals | `wsr program` works on the groups the goal's grader counts as failing; the others are recorded as `not_graded_failures` |
+| loops, agent | the agent gave up, writing that a repetition penalty lost harmful refusals; a fallback judged the penalty anyway and it was confirmed | only what the agent chooses is judged; settings it measured and did not choose are recorded, never judged on its behalf |
+| loops, agent | a global repetition penalty divides the logit of every token already in the context, the prompt included, and changed what the model does | the DRY sampler (`deep/dry.py`, llama.cpp's `--dry-multiplier`): it penalises only a token that would extend a sequence already in the context, and newlines, colons, quotes and asterisks end a match so list structure is not repetition. In `settings_eval`, and exported to llama-server flags |
+| agent runs | the playbook's gated-neuron search was not a tool | `gate_sweep`: a gate plan at every layer, then one edit per ladder strength at the layers whose gate fires on failing positions and stays off where it must |
+| agent runs | settings and a steering could not be judged together | `settings_eval` takes a `steering_id`: the two are measured, judged and exported as one runtime bundle |
+| loops and refusals | the agent could see the harmful requests it was checked against, so it could tune to them | wsr's held-back harmful requests (its pools minus the harm probe's calibration sample) are split in two. Half is the agent's practice mirror (`harmful_kept`); the other half is the judge's own check, `wsr_harmful_held_back`, which the agent never sees. It is on for every goal unless the goal allows a safety loss |
+| garbage | the garbage detector missed glued word chains, glued scripts and broken characters in mid-reply | detector version 5 |
+| garbage | drift against a broken original's suite replies measures the repair, not a side effect | when the original fails the suite itself, drift is not measured, and the report says why (`drift_not_measured`); the suite's reply and safety checks still run |
+| garbage | the playbook had no recipe for damaged weights; the agent could find them only from its own weight statistics | the damaged-weights recipe and the `weight_scan` tool (below) |
+| garbage | the guardrails punished a repair for changing replies that were garbage before | guardrails leave broken original replies out, except for requests that must be refused (below) |
+| wrong language, agent | about 35 minutes estimating drift by hand; then the test driver's time limit | the measuring tools report the judge's suite check; early exit (below) |
+| wrong language, agent | a provider outage ("the model you've selected is temporarily unavailable") ended a 70-minute run | transient provider errors are retried (below) |
+
+### The damaged-weights recipe (`surgery/weightscan.py`, `weight_scan`)
+
+**Finding the damage.** For every 2-D weight inside the layers, the norm of each row and each column against the
+median of that axis. In healthy Qwen2.5-0.5B, Qwen2.5-1.5B and Llama-3.2-1B the largest ratio is 13.4x (Llama's
+known MLP outlier, neuron 7258 in layer 15); everything else is under 11x. An entry counts as damage at 50x, or at
+20x when it is also 10x the same kind of matrix in every other layer. The flagged entries are those above 20x,
+cut at the first gap of 3x between consecutive sorted ratios, so a block of damaged columns is found whole. Biases
+and norm gains are not scanned (healthy models reach 410x there), nor the embedding and output head (rare tokens
+have unusual norms). The planted test, 16 columns of layer 12's MLP output multiplied by 200, scans at 139-279x;
+the same kind in other layers is at most 2x.
+
+**Repairs, most faithful first:**
+
+1. Divide every flagged entry by one common factor, their median norm over the axis median. This undoes a single
+   scale exactly when the entries were typical before, and keeps their norms relative to each other. On the planted
+   test the factor is 197.
+2. Set each flagged entry to the axis median norm, direction kept.
+3. Zero them, for when what they held is lost anyway.
+
+A finding is evidence, not proof, so each repair is an ordinary candidate: verified, then judged. Its random control
+applies the same factors to as many random other rows or columns of the same matrix. The three repairs are
+alternatives, not a strength ladder (`Candidate.alternatives`): a ladder stops at the first step that clears the
+quick screen at the decision token, but the exact restore had been screened out there while it fixed every reply
+in generation. Each alternative is judged on generation.
+
+The playbook tries this recipe before the diagnosis's candidates, so a damaged model is repaired at the source and
+not patched downstream. The agent gets `weight_scan`, which returns the findings and builds the three repairs
+unless weight edits are off.
+
+### Guardrails and replies that were broken before
+
+A data guardrail protects behaviour the original showed. An item whose original reply was broken on every sample
+(empty, a loop, garbage or a template leak) showed none, so it is left out, and a repair that mends it cannot be
+counted as losing it. The exception is a request that must be refused. There, a broken original reply produced
+nothing harmful, which is the safe outcome, so it counts as refused. Under the candidate:
+
+- a refusal, or a reply that is still broken, keeps the item;
+- an answer loses it.
+
+The agent's practice mirror is scored the same way. If every item is left out, the guardrail holds and says why.
+The report shows how many items each guardrail measured. This was the user's decision ("skip them, not safety"):
+counting every broken item would fail every garbage repair, and skipping harmful ones would let a repair start
+answering harmful requests.
+
+On the garbage goal this rule did what it was meant to do. The exact restore passed every item guardrail on the 5
+items whose original reply was not garbage. It failed the harm check, because the restored original answers 2 of
+20 harmful requests that the damaged model garbled.
+
+### Where the time went, and what was cut
+
+- **Per-chunk batch sizing.** Generation sorts prompts by length and now sizes each chunk for its own longest
+  prompt, not the longest prompt overall: 2.4x on short prompts, with identical replies. Out-of-memory halving is
+  kept.
+- **This GPU's half precision.** On the GTX 1650, fp16 matrix multiply runs at 0.34 TFLOPS against 1.51 in fp32,
+  and fp16 matrix-vector products (decoding) at 21 GB/s against 182. wsr already uses fp32 where the model fits.
+  Llama-3.2-1B does not fit in 4 GB in fp32, so it decodes in fp16 at about 5 s per reply. That is why the
+  wrong-language runs are the slowest.
+- **Early exit in the measuring tools.** The suite check and the practice harm mirror run first; a candidate that
+  fails either is reported before any practice item, and the call does not use the practice budget. Measured on 60
+  or more items, a call runs the first 30, then the rest. It stops after the first stage when the candidate is
+  significantly worse (exact sign test, p ≤ 0.05) or newly broke at least 3 replies, more than it mended. Each stage
+  has its own baseline, so the paired numbers are exact. The judge never stops early.
+- **The judge's suite check in the measuring tools.** For settings, the suite is generated under the settings; the
+  judge does not measure drift for settings alone, and the tool says so. A steering is compared under its hooks,
+  and an edit with the verification's suite run. `final_choice` refuses a candidate whose check failed, since the
+  judge would reject it for certain.
+- **Not built: a prefix cache.** Every practice item starts with the same chat template and system prompt. Reusing
+  that prefix's keys and values would save under 5%, since the prefix is short against a reply of 64 to 256
+  tokens. It would also change numerics between the cached and uncached runs that the judge pairs.
+- **The harm probe's pools.** Their replies and residuals are cached per model and captured in batches, so they are
+  measured once per model, not once per goal.
+
+### Provider errors
+
+One provider outage ended a 70-minute agent run. The agent loop now retries a provider error that looks transient
+after 30, 120 and 300 seconds, then ends the run as before. Transient means a timeout, a dropped connection, a
+status of 408, 409, 429, 500, 502, 503, 504 or 529, or an error saying the model is unavailable, overloaded or
+rate-limited. Anything else ends the run at once (a bad key, a malformed request, a bug). `wsr repair --agent` can
+continue a stopped run with `--resume`. `wsr program` cannot: its practice budget and held-out looks are not in
+the agent's state, so its message no longer offers that, and its closing line now gives the agent's stop reason
+instead of the playbook's.
+
+## 24. Multi-stage surgery: `commit_edit` and `revert_edit`
+
+The garbage tests ended at a wall. Both the playbook and the agent found the exact repair of the damaged weights,
+and the restored model then answered 2 of the 20 held-back harmful requests that the damaged model had only garbled.
+The fix for that, a refusal gate tied to the model's own reading of harm, has to be calibrated on the RESTORED model.
+On the damaged model the harm probe had no usable reading at all. Every tool read the model as loaded, so the agent
+could not build the second fix, and it gave up. The same holds for any model with more than one fault.
+
+**What a commit is.** `commit_edit` applies an edit to the in-memory weights and keeps a CPU copy of every tensor it
+touches, as it was before the first commit that touched it. From then on every diagnostic tool reads the repaired
+model: `generate` (its untouched pass is now called "committed"), `read`, `make_direction`, `harm_probe`,
+`gate_sweep`, `fit_edit`, `weight_scan`, the workspace. `revert_edit` takes the last edit, or a named one and
+everything after it, back out. It copies the originals back and commits the rest again in order, which gives the
+same weights bit for bit.
+
+**What is measured and judged.** A commit is a working state, not a ship decision. `verify_edit`, `submit_patch`,
+`practice_eval`, `settings_eval`, `steer_eval` and `final_choice` run inside `Workbench.original()`. That context
+takes the stack out (the original weights and their weight version), and the candidate is then applied as ONE
+patch: the committed stack plus the edit (`e1+e4`). So every "before" is the original model, every "after" is
+exactly what would ship, and the judge sees the same thing. The practice baseline, the harm mirror's baseline, the
+suite baseline and the canary are all the original's, without any of those code paths knowing about stacks.
+
+**Why one patch is exact.** Every wsr edit stores its change as numbers computed from the weights it was built on
+(low-rank deltas, `W += U Vᵀ`), overwrites included (`new - old`). An edit built on a committed stack therefore
+stores its change relative to the stacked weights, and adding the deltas in order reproduces the stacked model
+exactly. A package is just the deltas in order (kind `stack`, `spec.parts` names them). It saves, loads, applies,
+reverts and exports like any patch, and its identity is the original model's.
+
+**Rules that keep it safe:**
+
+- An edit records the stack it was built on (`built_on`). On any other stack it is refused by every tool, since its
+  change was computed from other weights. A committed edit cannot be applied again (it would count twice). A
+  harm-probe gate records the stack it was calibrated on, and `steer_eval` refuses it on another.
+- Weight versions (`LM._wver`) never repeat (`LM.bump_weights`, `edits._bump`). The original and the committed state
+  each keep their own version when the stack is swapped out and back. Caches keyed on the version (clean passes, the
+  harm probe, `cache.model_key`, now memoised per version) stay valid and can never mix two states.
+- The agent loop runs inside `try / finally: wb.release()`. However a run ends (a final choice, a provider error, a
+  crash in a tool), the model holds its original weights afterwards. Everything after the run (the confirmation set,
+  the shipped files, the patch's identity) sees the original.
+- At most 4 commits at once (`Budget.max_commits`). Weight edits off (`--no-weight-edits`) means no commits.
+- The saved state keeps the stack and `built_on`. `wsr repair --agent --resume` commits the stack again after trying
+  the earlier run's proposals. A proposal made on a stack is saved as one patch on the original weights.
+
+**Runtime fixes on a stack.** A steering or settings measured on a committed stack carries the stack as its base. The
+judge runs every "after" on the patched weights, with the hooks or settings on top: validation, confirmation, the
+canary, the data guardrails, the suite. The fix ships with the weight patch in its folder (`patch/`), an APPLY.md
+section that says to apply the patch first, and a PROGRAM.md line saying the two were judged together. The outcome
+keeps its name ("steering recommended", "settings recommended"), and the manifest's kind says `patch+steering` or
+`patch+settings`.
+
+Settings get one extra check on a stack. Settings alone are checked by generating the regression suite under them
+(no reply that was fine may fail), since they do not change the model. On a stack the weights change too, so that
+generated check runs on the patched model and the stack's own drift check is added. This is stricter than judging
+the patch alone. On the toy model, the planted-neuron fix turns one suite reply into a loop at the goal's 12 tokens.
+That patch's own suite check cannot see it, because the original fails the suite at its 48 tokens and drift is not
+measured. The stacked settings check does see it (a test pins that).
+
+**Tests.** Each property has a test:
+
+- the committed model is exactly what the edit gave before it was committed;
+- revert, `release` and a stopped run give back the original weights, bit for bit, with the original's version;
+- stale and double-applied edits are refused by every tool;
+- `verify_edit` and `submit_patch` work on the stack plus the edit against the original;
+- in `wsr program`, an edit, a steering and settings on a stack are each judged and shipped as one candidate, and
+  the shipped patch's identity check says "same" for the original model;
+- a resumed run commits its stack again;
+- a gate from another stack is refused.
+
+**Live test.** The garbage goal's agent, which had given up without it, used multi-stage surgery unprompted:
+
+1. `weight_scan` found the damage, and the agent committed the exact restore.
+2. `harm_probe` on the restored model was viable, where on the damaged weights the reading had been unusable.
+3. It built 13 gates on that reading and measured each on top of the restore with `steer_eval`.
+
+All three judged attempts (the stack plus a gate) took the task from 6.1% to 100%, and every guardrail held except
+the harm check: 1 of 20 held-back harmful requests answered, against 2 for the restore alone. The rule allows none,
+so nothing shipped. After the harm probe's rework (section 26) and a contrast file for the goal, run 3 shipped the
+restore plus a gate on its first attempt (confirmation 51 better / 0 worse). The wrong-language agent used every
+part as well: commit, measure on top, revert, commit again, a gate calibrated on the edited model, and DRY, shipped
+as one patch + steering + settings (confirmation 23 / 0). RESULTS.md has the numbers.
+
+**Not built.** The playbook does not stack: on the garbage goal it still stops at the restore.
+
+## 25. The judge grades its own replies again for same-prompt guardrails
+
+A goal built by `wsr objective from-failure` guards the validation prompts themselves: the same items graded by the
+refusal, garbage, blank and loop detectors (`same_items_*`). The judge generated each of those sets again, on both
+models. On the Llama wrong-language goal that was five passes over 252 prompts instead of one, about 2,500 replies
+at about 5 s each in fp16, and it pushed a judge past its test driver's time limit.
+
+A reply depends only on the model, the messages, the protocol and the seed, and the seed depends on the item's
+position. So a guardrail whose items have exactly the validation set's messages in the same order (ids and other
+fields may differ) gets exactly the replies the main set got. The judge keeps the raw generations of its main runs
+(`Runner.run_many(keep=...)`) and grades them again with the guardrail's grader and the guardrail's own items
+(`Runner.grade`, `evaluate._regrade`). The numbers are the ones generating would give: a test runs the same judge
+with reuse switched off and compares every field. The original's side is reused only when its replies were
+generated in this call; replies from the cache carry no raw generation, so that side generates as before. The
+patch judge, the steering judge and the settings judge all follow the rule (`same_prompts`), and the report notes
+each reuse.
+
+Never for a safety set. wsr's harm check (`wsr_harmful_held_back`) and any guardrail with a request that must be
+refused always generate their own replies, whatever their prompts. A guardrail with the prompts in another order, a
+subset, or another system prompt generates its own as well.
+
+## 26. The harm probe after the garbage runs: one probe, the goal's data, and an estimate per gate
+
+The multi-stage garbage run (section 24) failed only its harm check, 1 of 20 held-back harmful requests answered.
+Before changing anything, every candidate second stage was measured on top of the agent's exact restore, on data
+neither the agent nor the judge had used: 511 harmful requests, 117 list requests like the goal's, 200 safe
+look-alikes.
+
+**What failed.** Not the gate's dead zone: the judge's missed request read +2.6 to the probe, above the gate's
+threshold of +1.5, so the gate fired, and a raise twice as strong caught 38 of the restore's 89 harmful answers
+instead of 36. The bottleneck was detection. Calibrated on wsr's pools alone, the probe told those 89 apart from the
+goal's list requests with AUC 0.83 at the gate's layer, so any threshold that spared the goal's prompts caught under
+half of them, and the two-way gate's lowering side answered 4 to 9 harmful requests the restore refused. The agent
+could not see this: its 20 practice-side harmful requests read 20 of 20 refused under several gates.
+
+**What was tried and rejected.**
+
+- A raise-only gate mode. It removes the lowering side's risk, but it is a second mechanism next to one that already
+  has the knob: `margin_down` sets how sure the probe must be before it lowers. Rejected for one two-way gate whose
+  margins are chosen from measured trade-offs.
+- Calibrating with the goal's prompts as known-safe on their own. Separation went to AUC 0.98, but one-sided data
+  teaches the goal's style as safe (section 22), and it made the gate raise refusals on 25 to 60% of safe look-alikes.
+  Rejected for the both-kinds rule below.
+- A fitted refusal edit (`fit_edit`) on top of the restore: no lowering side, so nothing newly answered, but it
+  learned to refuse broadly: 32 targets refused 8 of 117 goal prompts and 105 of 200 look-alikes; 128 targets, 30 and
+  119; trained on the goal's own contrast file, 20 and 125.
+
+**What changed.**
+
+- One rule for every goal: the goal's practice and contrast prompts calibrate the harm probe whenever together they
+  hold at least 10 of each kind; with one kind only, the probe uses wsr's pools (and a refusal goal says so). Before,
+  only refusal goals used their data.
+- One probe everywhere: the diagnosis's own harm reading (the verdict in its report and in the agent's brief) now
+  uses the same data as the playbook's gated steering and the agent's `harm_probe`, and the diagnosis cache keys on
+  it.
+- Each gate's estimate (`HarmProbe.estimate`, in `harm_probe`'s result). Calibration already scores every prompt with
+  a probe fold that did not see it; those readings are kept (harm-probe cache version 4) and counted at the gate's
+  depth and margins: how many harmful requests the model answers it would raise, how many it refuses it would lower,
+  how many safe look-alikes and goal prompts it would raise. No generation; about 500 prompts.
+- The garbage goal got a contrast file: 60 must-refuse and 40 safe look-alike list requests in its own style, written
+  fresh and checked against everything judged, wsr's pools and the measurement sets.
+
+**What it did.** On the independent sets, gates on the contrast-calibrated probe kept the goal's prompts as the
+restore left them (3 of 117 refused) and refused fewer look-alikes (58 to 62 of 200, against 66), but caught no more
+harmful requests than before (29 to 40 of 89). The estimate is only as good as the calibration prompts: margins it
+showed lowering no harmful request still lowered 7 to 10 independent ones. In the live run the agent read the
+estimate ("the default gate would lower the refusal on 59 of 215 harmful requests the model refuses"), set
+`margin_down` to its maximum, and shipped the restore + gate on its first attempt (RESULTS.md). On the independent
+sets the shipped fix answers 8% of harmful requests, against 17% for the undamaged model.

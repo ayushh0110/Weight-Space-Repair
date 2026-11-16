@@ -16,8 +16,8 @@ data the fix never saw.
 | Where in the weights? | `wsr deep` | the layer, head or neuron, tested against random controls | the `deep` extra (torch) |
 | Can it be fixed? | `wsr repair`, `wsr fix`, `wsr program` | a patch, a steering or settings, or the reason there is none | the `deep` extra (torch) |
 
-**Status: beta, small models only.** Deep diagnosis is tested on models up to 1.5B parameters, repair and
-`wsr program` up to 1B (Qwen2.5-0.5B and 1.5B, Llama-3.2-1B, Qwen3.5-0.8B). Every number here was measured on
+**Status: beta, small models only.** Deep diagnosis and `wsr program` with the agent are tested on models up to
+1.5B parameters, weight repair up to 1B (Qwen2.5-0.5B and 1.5B, Llama-3.2-1B, Qwen3.5-0.8B). Every number here was measured on
 one 4 GB GTX 1650. [docs/LIMITATIONS.md](docs/LIMITATIONS.md) lists what is not tested.
 
 ## Try it in a minute
@@ -103,17 +103,29 @@ evaluation on a confirmation set, used once, decides whether it ships.
 | Goal | Model | Fix | Validation | Confirmation | Decision |
 |---|---|---|---|---|---|
 | Blank replies (a bug planted in real weights) | Qwen2.5-0.5B | sparse projection on the neurons wsr found blind | 35.7% → 100%, 18 better / 0 worse, p 0.000004 | 15 / 0, p 0.00003 | **shipped, confirmed** |
-| The same, weights not allowed to change | Qwen2.5-0.5B | clamp steering after layer 14 | 6 / 0, p 0.016 | 5 / 0, p 0.031 | **steering recommended, confirmed** |
-| The same bug, a smaller goal | Qwen2.5-0.5B | zero the planted neuron | 6 / 0, p 0.016 | 4 / 0, p 0.0625 | inconclusive: confirmation one item short |
-| Over-refusal of safe prompts (XSTest) | Qwen2.5-0.5B | probe-gated steering (the refusal tied to the model's own harm reading; judged with the experiment's scripts, since built in and found by `wsr program` on its own) | 64% → 84%, 12 / 3, p 0.018; harmful requests still refused | 70% → 93%, 10 / 0, p 0.001 | **confirmed** |
-| Over-refusal of safe prompts (XSTest) | Llama-3.2-1B | a learned edit by the agent (Opus 5.5) | 2 / 0, every refusal kept | not used | inconclusive: too few fixed |
-| Under-refusal of harmful prompts (XSTest) | Qwen2.5-0.5B | a learned edit by the agent (Opus 5.5) | 88% → 96%, 6 / 0 | not used | rejected: the canary lost 3 answers |
-| The blank-reply patch on the served GGUF | Qwen2.5-0.5B | exported to Q8_0, judged on llama-server | 6 / 0; canary and suite hold on the GGUF | (already used) | the patch survives quantisation |
+| The same, weights not allowed to change | Qwen2.5-0.5B | clamp steering after layer 14 | 6 / 0, p 0.016 | 5 / 0, p 0.031 | **steering recommended, confirmed** (small: every failing item had to be fixed) |
+| Over-refusal (safe prompts that sound alarming; fresh) | Qwen2.5-0.5B | probe-gated steering, chosen by the agent (Claude Opus 5.5 with `harm_probe`) | 65% → 93%, 28 / 0; harmful requests still refused | 78% → 91%, 15 / 2, p 0.001 | **confirmed** |
+| Under-refusal (harmful requests answered; fresh) | Qwen2.5-0.5B | probe-gated steering, chosen by the agent | 81% → 88%, 9 / 1; safe prompts still answered | 12 / 0, p 0.0002 | **confirmed** |
+| Under-refusal (fresh and XSTest harmful requests) | Llama-3.2-1B | probe-gated steering, chosen by the agent | 80% → 96%, 32 / 2; safe prompts 98.5% → 97% | 23 / 0, p 1e-7 | **confirmed** |
+| Over-refusal (fresh) | Qwen2.5-1.5B | probe-gated steering, chosen by the agent | 67% → 83%, 12 / 0; harmful requests refused 83% → 93% (net) | 15 / 0, p 0.00003 | **confirmed** |
+| Under-refusal (fresh) | Qwen2.5-1.5B | probe-gated steering, chosen by the agent | 83% → 98%, 17 / 0; safe prompts 65% → 76% | 12 / 1, p 0.002 | **confirmed** |
+| The blank-reply patch on the served GGUF | Qwen2.5-0.5B | exported to Q8_0, judged on llama-server | 6 / 0; canary and suite hold on the GGUF | — | a served-file check: the patch survives quantisation |
+| Blank replies, the agent alone | Qwen2.5-0.5B | zeroed the planted neuron, found in 7 turns | 3.8% → 94.2%, 47 / 0 | 40 / 0 | **shipped, confirmed** |
+| Loops in long lists | Qwen2.5-0.5B | a gated neuron (the playbook) | 85.7% → 93.5%, 17 / 5, p 0.008 | 10 / 0, p 0.001 | **shipped, confirmed** |
+| Loops in long lists (fresh) | Qwen2.5-0.5B | the DRY sampler, chosen by the agent over a repetition penalty | 80.7% → 96.2%, 33 / 0 | 30 / 1, p 1.5e-8 | **settings recommended, confirmed** |
+| Over- and under-refusal (OR-Bench) | Qwen2.5-0.5B and 1.5B | probe-gated steering (the playbook) | 19 / 9, 25 / 10, 56 / 4 | 19 / 3, 20 / 4, 48 / 2 | **confirmed** (three goals) |
+| Garbage from damaged weights (planted: 16 columns x200) | Qwen2.5-0.5B | multi-stage, by the agent: the exact restore (the damaged-weights recipe), then a probe-gated refusal calibrated on the restored model with the goal's contrast file (the restore alone answers harmful requests the damaged model only garbled) | 6.1% → 100%, 62 / 0; all 20 held-back harmful requests refused | 51 / 0, p 4e-16 | **steering + patch recommended, confirmed** |
+| Ukrainian answered in Russian (Global-MMLU) | Llama-3.2-1B | multi-stage, by the agent: a learned weight edit, committed, then a harm gate calibrated on it and the DRY sampler, shipped as one | 90.1% → 98.8%, 23 / 1 | 23 / 0, p 1e-7 | **settings + steering + patch recommended, confirmed** |
 
-Earlier runs under a looser rule (z > 2) also shipped an over-refusal and an under-refusal fix; the first
-(4 better, 0 worse) would not pass the exact test and neither reproduced, so they are not claimed. Every unsafe
-or overfitted candidate was stopped. Triage and deep diagnosis are proven on 15 failure types against a known
-answer. All of it, with the setups and the failures, is in [docs/RESULTS.md](docs/RESULTS.md).
+The refusal rows are the powered tests: at least 15 failing items in validation, fresh data, the full toolkit.
+Runs that could not show a result (Llama barely over-refuses; runs before the harm probe; sets with 5 to 10 failing
+items) are kept as a record in [docs/RESULTS.md](docs/RESULTS.md), with the reason for each. Earlier runs under a
+looser rule (z > 2) also shipped an over-refusal and an under-refusal fix; the first (4 better, 0 worse) would not
+pass the exact test and neither reproduced, so they are not claimed. Every failure type was also tested with the
+playbook alone and the agent alone on fresh data; the playbook found no fix, correctly, for Llama's under-refusal
+and its Ukrainian answered in Russian. Every unsafe or overfitted candidate was stopped. Triage and deep
+diagnosis are proven on 15 failure types against a known answer. All of it, with the setups and the failures, is
+in [docs/RESULTS.md](docs/RESULTS.md).
 
 ## What it does
 
@@ -122,8 +134,8 @@ answer. All of it, with the setups and the failures, is in [docs/RESULTS.md](doc
 | **Triage** | seven layers (file, config, request and response, output, live probes with one-factor reruns, known issues) and a verdict that names one cause and its fix; no GPU, no dependencies |
 | **Deep diagnosis** | on the full-precision model: token trace, failure direction, patching of layers, heads and neurons, known directions (refusal, end-of-turn, language, repetition), calibrated language and loop probes, a harm probe for refusal failures (does the model itself read harm, and do its refusals follow it?), causal tests against random controls |
 | **Quantisation** | GGUF tensor health and error against the original weights; bisection to the tensors that cause a failure |
-| **Repair** | a playbook of verified edits (direction removal, local projection, neuron and head scaling, gated neurons), then activation steering (add, clamp, or probe-gated: the refusal tied to the model's own reading of harm); checked on the failing and working prompts, a regression suite that keeps refusals, serving precision, fresh variants and a random control |
-| **Surgery agent** | a frontier model (Claude, or any OpenAI-compatible model) with weight-editing tools in a workspace that cannot touch files, the network or processes; only an edit that passes the same checks is accepted |
+| **Repair** | a playbook of verified edits (damaged weights brought back to scale, direction removal, local projection, neuron and head scaling, gated neurons), then activation steering (add, clamp, or probe-gated: the refusal tied to the model's own reading of harm); checked on the failing and working prompts, a regression suite that keeps refusals, serving precision, fresh variants and a random control |
+| **Surgery agent** | a frontier model (Claude, or any OpenAI-compatible model) with weight-editing tools in a workspace that cannot touch files, the network or processes; multi-stage surgery for models with more than one fault (commit a fix, build the next on the repaired model, judge the stack as one patch); only an edit that passes the same checks is accepted |
 | **Weight-space programming** | goal files with practice and held-out data, dataset profiles, a paired held-out judge with guardrails; `wsr program` and `wsr fix` ship a patch, a steering or serving settings, only when the judge accepts it |
 | **Verification and provenance** | three data sets (practice, validation, a confirmation set evaluated once and recorded as used), a 32-item semantic canary, guardrails on the served GGUF, exact SHA-256 hashes of every tensor of the base model, and a `MANIFEST.json` per fix with its evidence and decision (`wsr patch show`, `wsr patch check`) |
 | **Shipping** | apply, revert, or export a patch to GGUF through llama.cpp; a patch refuses weights it was not made for, and a revert is checked to restore them exactly |
@@ -275,9 +287,12 @@ only items the original gets right count, and a fix may lose at most one. On lla
 suite's reply checks run on the patched GGUF against the unpatched GGUF of the same quantisation; drift is
 marked "not supported" there, and the manifest records which format each check ran on.
 
-**The agent's limits.** The goal file's `budget` (`practice_evals`, `verifications`, `usd`; defaults 10, 6
-and 5) sets how much the agent may do and spend; `--practice-evals`, `--agent-verifications` and
-`--agent-budget-usd` override it for one run.
+**The agent's limits.** The goal file's `budget` (`practice_evals`, `verifications`, `usd`, `attempts`; defaults
+10, 6, 5 and 3) sets how much the agent may do and spend; `--practice-evals`, `--agent-verifications`,
+`--agent-budget-usd` and `--agent-attempts` override it for one run. Its `final_choice` is judged at once; a
+rejection returns abstract symptoms only (the gain rounded, which guardrail failed and what it protects, counts in
+buckets; never prompts), and it may try a different candidate while attempts remain. Every attempt is a slot of the
+correction, and the confirmation set is used once, after an accepted attempt.
 
 **A patch belongs to its model.** A saved patch records the SHA-256 of every tensor of the model it was made on
 (and of the edited tensors after the edit), with the architecture, the tokenizer and config file hashes and
@@ -344,7 +359,7 @@ given as `WSR_API_KEY` instead of `--api-key`, which keeps it out of the shell h
 ## Tests
 
 ```bash
-python -m pytest -q               # 384 tests; the CUDA comparison is skipped without a GPU
+python -m pytest -q               # 439 tests; the CUDA comparison is skipped without a GPU
 python -m ruff check src tests
 ```
 
