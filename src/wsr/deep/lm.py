@@ -115,6 +115,19 @@ def auto_dtype(path: Path, device: str) -> str:
     return "bfloat16" if major >= 8 else "float16"
 
 
+TRANSFORMERS_MIN = (4, 56)
+
+
+def _need_transformers(version: str) -> None:
+    """A clear message instead of a TypeError deep inside from_pretrained (`dtype=` is accepted from 4.56)."""
+    import re
+    m = re.match(r"(\d+)\.(\d+)", version or "")
+    if m and (int(m.group(1)), int(m.group(2))) < TRANSFORMERS_MIN:
+        raise RuntimeError(f"wsr's deep tools need transformers >= {TRANSFORMERS_MIN[0]}.{TRANSFORMERS_MIN[1]} "
+                           f"(installed: {version}): pip install -U \"transformers>="
+                           f"{TRANSFORMERS_MIN[0]}.{TRANSFORMERS_MIN[1]}\"")
+
+
 class LM:
     def __init__(self, model: nn.Module, tokenizer: Any, name: str = "model"):
         self.model = model.eval()
@@ -174,15 +187,22 @@ class LM:
         Token ids and every captured activation stay on the CPU in float32; only the
         model runs on the device, so the analysis code is the same either way.
         """
+        import importlib.util
+
+        import transformers
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        _need_transformers(transformers.__version__)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         if dtype == "auto":
             dtype = auto_dtype(Path(str(path)), device)
         dt = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
         tok = AutoTokenizer.from_pretrained(str(path))
-        model = AutoModelForCausalLM.from_pretrained(str(path), dtype=dt, low_cpu_mem_usage=True)
+        # `dtype=` is transformers' keyword from 4.56 (torch_dtype before). low_cpu_mem_usage is ignored by recent
+        # versions and needs `accelerate` where it is not: passed only when accelerate is installed.
+        kw = {"low_cpu_mem_usage": True} if importlib.util.find_spec("accelerate") is not None else {}
+        model = AutoModelForCausalLM.from_pretrained(str(path), dtype=dt, **kw)
         model.to(device)
         lm = cls(model, tok, name=Path(str(path)).name)
         lm.checkpoint_dtype = _checkpoint_dtype(Path(str(path)))

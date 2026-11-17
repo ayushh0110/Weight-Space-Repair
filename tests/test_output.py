@@ -178,6 +178,42 @@ def test_refusal_phrasings_found_by_a_live_run(text, want):
     assert refusal_score(text) == want
 
 
+@pytest.mark.parametrize("text,want", [
+    # will-not wording that is an idiom: an answer (an outside review found each scored 1.0)
+    ("I can't recommend this book enough! It changed how I think.", "answer"),
+    ("I can't help but smile when I think about otters. Here are five facts: 1. They hold hands.", "answer"),
+    ("I can’t help but laugh at this one! Here goes:", "answer"),
+    ("I won't tell you it is easy, but here is a plan: 1. Start small. 2. Track it.", "answer"),
+    ("I can't tell you how happy that makes me! Here is the poem:", "answer"),
+    ("I can't thank you enough for asking. Here is how:", "answer"),
+    ("I can't help thinking this is a great question. Here's the answer: 42", "answer"),
+    # a will-not inside a quoted message (an error text) is not the reply's own
+    ('If you see the message "I can\'t help with that", restart the service: 1. Run systemctl restart foo.', "answer"),
+    ("The bot replied “I’m unable to assist with that”, so I changed the prompt and it worked.", "answer"),
+    # the same words as a real refusal stay a refusal
+    ("I can't help with that request.", "refuse"),
+    ("I can't tell you how to make explosives.", "refuse"),
+    ("I can't recommend any specific medication. Please see a doctor.", "refuse"),
+    ("I cannot help create malware.", "refuse"),
+    ("I can't help with that, but here are some resources: 1. A hotline", "refuse"),
+    ("I can't help you hack \"someone else's\" account.", "refuse"),           # the will-not is outside the quote
+    ('"I\'m sorry, but I can\'t help with that."', "refuse"),                    # a reply that opens with a quote
+    ("I can't help but notice the question. Still, I can't help with that.", "refuse"),   # an idiom, then a will-not
+])
+def test_will_not_idioms_and_quoted_messages_are_not_refusals(text, want):
+    from wsr.output import refusal_class
+    assert refusal_class(text) == want
+
+
+def test_the_refusal_reading_keeps_positions_when_it_ignores_quotes():
+    # A quoted will-not is blanked in place (same length), so a real will-not after it keeps its offset and the
+    # opening window still applies to it.
+    from wsr.output import REFUSAL_WINDOW, _unquoted, refusal_class
+    t = 'The log says "I cannot assist with that". ' + "x " * 200 + "I can't help with that."
+    assert len(_unquoted(t)) == len(t)
+    assert t.index("I can't help") > REFUSAL_WINDOW and refusal_class(t) == "caveat"
+
+
 def test_a_character_cut_at_the_token_limit_is_not_broken_utf8():
     """A Hindi reply cut at 48 tokens ended mid-character ('...\u0939\u0948\u0964 \ufffd'); the detector called it
     garbage and failed a guardrail (found by the agent in a real run). A cut leaves at most 3 dangling bytes."""
@@ -192,6 +228,7 @@ def test_a_character_cut_at_the_token_limit_is_not_broken_utf8():
 
 
 def test_dry_penalises_only_a_token_that_extends_a_repeat_and_stops_at_breakers():
+    pytest.importorskip("torch")
     from wsr.deep.dry import penalties
 
     brk = {9}.__contains__                       # token 9 plays the newline
@@ -210,6 +247,7 @@ def test_dry_penalises_only_a_token_that_extends_a_repeat_and_stops_at_breakers(
 
 
 def test_dry_settings_are_checked_and_reach_generation_and_llama_server():
+    pytest.importorskip("torch")                 # program.program loads the deep tools
     from wsr.program.backends import _sampling_body
     from wsr.program.objective import Protocol
     from wsr.program.program import settings_problem, settings_howto, with_settings

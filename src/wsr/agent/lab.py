@@ -15,18 +15,26 @@ start processes, so the agent gets a small language instead:
   Calls the agent makes go through `_call`, which only calls whitelisted functions.
 - in-place tensor methods are not available, and every weight handed out is a copy: the model
   cannot be changed from here. Edits are built only by `build_edit`, from the arrays computed here.
-- every loop step and call checks a wall-clock deadline and a step budget; binary operations and the calls
-  whose result size can be told from their arguments (zeros, outer, cat, diag, a full SVD ...) are checked
-  before computing; results above the element cap are refused; the workspace as a whole has a cap too, and a
-  call that would pass it keeps none of its assignments; integers are capped in size.
+- every loop step and call checks a wall-clock deadline and a step budget; binary operations (augmented
+  assignments such as `x **= 3` too) and the calls whose result size can be told from their arguments (zeros,
+  outer, einsum, tensordot, bincount, cat, diag, a full SVD ...) are checked before computing; results above the
+  element cap are refused; strings, lists, tuples, dicts and sets have a length cap, checked before a
+  concatenation, a join or an extend that would pass it and on every result; the workspace as a whole has a cap
+  too (Python sequences counted by length), and a call that would pass it keeps none of its assignments;
+  integers are capped in size. As a backstop for anything an estimate misses, the process's memory is watched
+  while a call runs (with psutil, part of the deep extra): a call that grows it by more than MAX_MEMORY_GROWTH,
+  or leaves the machine almost out of memory, is stopped at its next operation.
 
 One limit this cannot give: a single torch call that is slow by itself (the SVD of a large matrix) runs to its
-end, because the deadline is only checked between operations.
+end, because the deadline is only checked between operations. The workspace runs in wsr's own process, not in a
+separate one with operating-system limits.
 """
 from __future__ import annotations
 
 import ast
+import copy
 import math
+import operator
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -38,6 +46,10 @@ MAX_WORKSPACE = 8 * MAX_ELEMENTS   # every variable together: 2 GB of float32
 MAX_INT_BITS = 100_000             # integers (10**10000 squared a few times would take minutes and gigabytes)
 MAX_STEPS = 2_000_000              # loop / comprehension iterations per call
 MAX_OUTPUT = 8_000                 # characters returned per call
+MAX_SEQ = 4_000_000                # items in a list, tuple, dict or set, characters in a string
+SEQ_WEIGHT = 8                     # a Python sequence item counted as this many tensor elements (pointer + object)
+MAX_MEMORY_GROWTH = 3 << 30        # bytes a single call may add to the process's memory (backstop, with psutil)
+MIN_FREE_MEMORY = 512 << 20        # bytes the machine keeps available while a call runs (backstop, with psutil)
 
 
 class LabError(Exception):
@@ -103,8 +115,13 @@ def _numel(x: Any) -> int:
     return 1
 
 
+_CONTAINERS = (torch.Tensor, dict, list, tuple, set)
+
+
 def _total(values: Any) -> int:
-    """Elements held by these values, each tensor's memory counted once."""
+    """Elements held by these values, each tensor's memory counted once, a Python sequence's items SEQ_WEIGHT each
+    and a string's characters a quarter each. A sequence over MAX_SEQ items is counted without being walked (it is
+    over every cap anyway), so the count stays fast."""
     seen: set[int] = set()
     n = 0
     stack = [values]
@@ -115,10 +132,17 @@ def _total(values: Any) -> int:
             if key not in seen:
                 seen.add(key)
                 n += v.numel()
-        elif isinstance(v, dict):
-            stack.extend(v.values())
-        elif isinstance(v, (list, tuple, set)):
-            stack.extend(v)
+        elif isinstance(v, str):
+            n += len(v) // 4
+        elif isinstance(v, (dict, list, tuple, set)):
+            if id(v) in seen:
+                continue
+            seen.add(id(v))
+            n += SEQ_WEIGHT * len(v)
+            if len(v) > MAX_SEQ:
+                continue
+            xs = v.values() if isinstance(v, dict) else v
+            stack.extend(x for x in xs if isinstance(x, _CONTAINERS) or (isinstance(x, str) and len(x) > 64))
     return n
 
 
@@ -168,11 +192,72 @@ def _estimate(name: str, fn: Any, args: tuple, kw: dict) -> int:
         if name in ("matmul", "mm", "bmm") and len(ts) == 2 and ts[0].dim() >= 2 and ts[1].dim() >= 2:
             return ts[0].shape[-2] * ts[1].shape[-1] * max(1, math.prod(torch.broadcast_shapes(ts[0].shape[:-2],
                                                                                               ts[1].shape[:-2])))
+        if name == "einsum" and args and isinstance(args[0], str):
+            ops = [a for a in args[1:] if isinstance(a, torch.Tensor)]
+            if not ops and len(args) > 1 and isinstance(args[1], (list, tuple)):
+                ops = [a for a in args[1] if isinstance(a, torch.Tensor)]
+            return _einsum_size(args[0], ops)
+        if name == "tensordot" and len(ts) == 2:
+            dims = kw.get("dims", args[2] if len(args) > 2 else 2)
+            a, b = ts
+            if isinstance(dims, int):
+                return math.prod(a.shape[:a.dim() - dims]) * math.prod(b.shape[dims:])
+            da = [int(d) % a.dim() for d in dims[0]]
+            db = [int(d) % b.dim() for d in dims[1]]
+            return (math.prod(s for i, s in enumerate(a.shape) if i not in da)
+                    * math.prod(s for i, s in enumerate(b.shape) if i not in db))
+        if name == "bincount" and ts:
+            minlength = int(kw.get("minlength", args[2] if len(args) > 2 else 0) or 0)
+            top = int(ts[0].max()) + 1 if ts[0].numel() else 0
+            return max(top, minlength)
+        if name == "inner" and len(ts) == 2:
+            return math.prod(ts[0].shape[:-1]) * math.prod(ts[1].shape[:-1])
+        if name == "histc":
+            return int(kw.get("bins", args[1] if len(args) > 1 else 100))
+        if name == "pad" and ts:
+            p = kw.get("pad", args[1] if len(args) > 1 else ())
+            shape = list(ts[0].shape)
+            for i in range(0, len(p) - 1, 2):
+                d = len(shape) - 1 - i // 2
+                if d >= 0:
+                    shape[d] += int(p[i]) + int(p[i + 1])
+            return math.prod(shape)
+        if name == "nonzero" and ts:
+            return int(torch.count_nonzero(ts[0])) * max(1, ts[0].dim())
         if len(ts) >= 2:
             return math.prod(torch.broadcast_shapes(*[t.shape for t in ts]))
     except (TypeError, ValueError, IndexError, RuntimeError):
         return 0                                          # not the usual arguments: the call itself will say so
     return 0
+
+
+def _einsum_size(eq: str, ops: list) -> int:
+    """Elements of einsum's result, from the equation and the operands' shapes (0 when they do not say)."""
+    eq = eq.replace(" ", "")
+    lhs, arrow, rhs = eq.partition("->")
+    specs = lhs.split(",")
+    if not ops or len(specs) != len(ops):
+        return 0
+    size: dict[str, int] = {}
+    ell: list = []
+    for spec, t in zip(specs, ops):
+        if "..." in spec:
+            pre, post = spec.split("...", 1)
+            n_ell = t.dim() - len(pre) - len(post)
+            ell.append(tuple(t.shape[len(pre):len(pre) + n_ell]))
+            letters = list(pre) + list(post)
+            dims = list(t.shape[:len(pre)]) + list(t.shape[t.dim() - len(post):])
+        else:
+            letters, dims = list(spec), list(t.shape)
+        for c, d in zip(letters, dims):
+            size[c] = max(size.get(c, 1), int(d))
+    if not arrow:                                        # implicit output: the letters used once, sorted
+        once = sorted(c for c in size if lhs.count(c) == 1)
+        rhs = ("..." if ell else "") + "".join(once)
+    n = math.prod(size.get(c, 1) for c in rhs.replace("...", ""))
+    if "..." in rhs and ell:
+        n *= math.prod(torch.broadcast_shapes(*ell))
+    return n
 
 
 class _Rewrite(ast.NodeTransformer):
@@ -195,6 +280,50 @@ class _Rewrite(ast.NodeTransformer):
         return ast.copy_location(ast.Call(ast.Name("_bin", ast.Load()),
                                           [ast.Constant(type(node.op).__name__), node.left, node.right], []), node)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        """`x op= y` as `x = _ibin(op, x, y)`: the same checks as a binary operation, then Python's in-place
+        operator (a list or tensor is still changed in place). A subscript target is evaluated twice."""
+        load = copy.deepcopy(node.target)
+        load.ctx = ast.Load()
+        load = self.visit(load)
+        value = self.visit(node.value)
+        target = self.visit(node.target)
+        call = ast.Call(ast.Name("_ibin", ast.Load()), [ast.Constant(type(node.op).__name__), load, value], [])
+        return ast.copy_location(ast.Assign([target], call), node)
+
+    def _formatted(self, v: ast.FormattedValue) -> None:
+        v.value = self.visit(v.value)
+        if v.format_spec is not None:
+            for w in v.format_spec.values:
+                if isinstance(w, ast.FormattedValue):
+                    self._formatted(w)
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> ast.AST:
+        """An f-string can double a string (f"{s}{s}"): its result goes through the size check."""
+        for v in node.values:
+            if isinstance(v, ast.FormattedValue):
+                self._formatted(v)
+        return ast.copy_location(ast.Call(ast.Name("_chk", ast.Load()), [node], []), node)
+
+    def _display(self, node: ast.AST, unpacks: bool) -> ast.AST:
+        """A list, tuple, set or dict display that unpacks another ([*a, *a], {**d, **d}) can double it: checked."""
+        self.generic_visit(node)
+        if not unpacks or not isinstance(getattr(node, "ctx", ast.Load()), ast.Load):
+            return node
+        return ast.copy_location(ast.Call(ast.Name("_chk", ast.Load()), [node], []), node)
+
+    def visit_List(self, node: ast.List) -> ast.AST:
+        return self._display(node, any(isinstance(e, ast.Starred) for e in node.elts))
+
+    def visit_Tuple(self, node: ast.Tuple) -> ast.AST:
+        return self._display(node, any(isinstance(e, ast.Starred) for e in node.elts))
+
+    def visit_Set(self, node: ast.Set) -> ast.AST:
+        return self._display(node, any(isinstance(e, ast.Starred) for e in node.elts))
+
+    def visit_Dict(self, node: ast.Dict) -> ast.AST:
+        return self._display(node, any(k is None for k in node.keys))
+
     def visit_For(self, node: ast.For) -> ast.AST:
         self.generic_visit(node)
         node.iter = ast.Call(ast.Name("_it", ast.Load()), [node.iter], [])
@@ -206,6 +335,11 @@ class _Rewrite(ast.NodeTransformer):
         return node
 
 
+_IBIN = {"Add": operator.iadd, "Sub": operator.isub, "Mult": operator.imul, "Div": operator.itruediv,
+         "FloorDiv": operator.ifloordiv, "Mod": operator.imod, "Pow": operator.ipow, "MatMult": operator.imatmul,
+         "BitAnd": operator.iand, "BitOr": operator.ior, "BitXor": operator.ixor}
+_SEQS = (str, list, tuple)
+_SIZED = (str, list, tuple, dict, set)
 _BIN = {"Add": lambda a, b: a + b, "Sub": lambda a, b: a - b, "Mult": lambda a, b: a * b,
         "Div": lambda a, b: a / b, "FloorDiv": lambda a, b: a // b, "Mod": lambda a, b: a % b,
         "Pow": lambda a, b: a ** b, "MatMult": lambda a, b: a @ b, "BitAnd": lambda a, b: a & b,
@@ -235,6 +369,12 @@ class Lab:
         self._deadline = 0.0
         self._steps = 0
         self._printed: list[str] = []
+        try:                                             # the memory backstop (psutil comes with the deep extra)
+            import psutil  # type: ignore
+            self._psutil, self._proc = psutil, psutil.Process()
+        except Exception:                                # noqa: BLE001
+            self._psutil, self._proc = None, None
+        self._rss0, self._mem_t = 0, 0.0
         # What the workspace refused, by kind:item ("attr:Tensor.numpy", "call:getattr", "syntax:FunctionDef",
         # "name:open", "limit:time"). Over real runs this says which operations the agent needs.
         self.denied: dict[str, int] = {}
@@ -248,13 +388,56 @@ class Lab:
         self._steps += 1
         if self._steps > MAX_STEPS:
             raise self._deny("limit:steps", f"step budget exceeded ({MAX_STEPS:,} loop iterations)")
-        if time.perf_counter() > self._deadline:
+        now = time.perf_counter()
+        if now > self._deadline:
             raise self._deny("limit:time", f"time limit exceeded ({self.seconds:g} s)")
+        if self._proc is not None and now - self._mem_t > 0.05:      # at most 20 looks a second
+            self._mem_t = now
+            self._memory()
+
+    def _memory(self) -> None:
+        """The backstop: what the estimates miss still cannot take the machine's memory."""
+        try:
+            grown = self._proc.memory_info().rss - self._rss0
+            free = self._psutil.virtual_memory().available
+        except Exception:                                # noqa: BLE001 - a backstop never breaks a call
+            return
+        if grown > MAX_MEMORY_GROWTH:
+            raise self._deny("limit:memory", f"this call grew wsr's memory by {grown / 2**30:.1f} GB (cap "
+                                             f"{MAX_MEMORY_GROWTH / 2**30:.0f} GB): work on smaller pieces")
+        if free < MIN_FREE_MEMORY:
+            raise self._deny("limit:memory", f"the machine is almost out of memory ({free / 2**20:.0f} MB free): "
+                                             "this call was stopped; work on smaller pieces")
 
     def _check(self, v: Any) -> Any:
         if _numel(v) > MAX_ELEMENTS:
             raise self._deny("limit:size", f"result has {_numel(v):,} elements, over the cap {MAX_ELEMENTS:,}")
+        if isinstance(v, _SIZED) and len(v) > MAX_SEQ:
+            raise self._deny("limit:size", f"result has {len(v):,} items, over the cap {MAX_SEQ:,} for a "
+                                           f"{type(v).__name__}")
         return v
+
+    def _seq_estimate(self, fn: Any, args: tuple) -> int:
+        """Items a call on a Python sequence would make, where its arguments say so (else 0)."""
+        owner = getattr(fn, "__self__", None)
+        name = getattr(fn, "__name__", "")
+        try:
+            if isinstance(owner, str) and name == "join" and args and isinstance(args[0], (list, tuple)):
+                return len(owner) * max(0, len(args[0]) - 1) + sum(len(x) for x in args[0] if isinstance(x, str))
+            if isinstance(owner, str) and name == "replace" and len(args) >= 2:
+                old, new = str(args[0]), str(args[1])
+                k = owner.count(old) if old else len(owner) + 1
+                if len(args) > 2 and int(args[2]) >= 0:
+                    k = min(k, int(args[2]))
+                return len(owner) + k * (len(new) - len(old))
+            if (isinstance(owner, (list, set, dict)) and name in ("extend", "update") and args
+                    and hasattr(args[0], "__len__")):
+                return len(owner) + len(args[0])
+            if isinstance(owner, torch.Tensor) and name == "tolist":
+                return owner.numel()
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return 0
 
     def _attr(self, obj: Any, name: str) -> Any:
         if name.startswith("_") or not _allowed_attr(obj, name):
@@ -274,11 +457,21 @@ class Lab:
         if fn is self._svd and "full_matrices" not in kw and len(args) < 2:
             kw["full_matrices"] = False                  # the reduced SVD: the full one of a vocabulary matrix is 90 GB
         name = self._names.get(id(fn)) or getattr(fn, "__name__", "")
+        owner = getattr(fn, "__self__", None)
+        if isinstance(owner, str) and name == "join" and args and not isinstance(args[0], (list, tuple)):
+            args = (list(self._it(args[0])),) + args[1:]  # a generator: its length is known once it has run
         n = _estimate(name, fn, args, kw)
         if n > MAX_ELEMENTS:
             raise self._deny("limit:size", f"{name or 'this call'} would produce {n:,} elements, over the cap "
                                            f"{MAX_ELEMENTS:,}")
-        return self._check(fn(*args, **kw))
+        k = self._seq_estimate(fn, args)
+        if k > MAX_SEQ:
+            raise self._deny("limit:size", f"{name or 'this call'} would make {k:,} items, over the cap {MAX_SEQ:,}")
+        out = self._check(fn(*args, **kw))
+        if isinstance(owner, (list, dict, set)) and len(owner) > MAX_SEQ:    # grown in place past the cap
+            owner.clear()
+            raise self._deny("limit:size", f"the {type(owner).__name__} grew past {MAX_SEQ:,} items and was emptied")
+        return out
 
     def _bound_ok(self, fn: Any) -> bool:
         """A method reached through `_attr` (it was whitelisted for its object's type)."""
@@ -289,7 +482,35 @@ class Lab:
         return _allowed_attr(owner, name)
 
     def _bin(self, op: str, a: Any, b: Any) -> Any:
+        self._bin_check(op, a, b)
+        f = _BIN.get(op)
+        if f is None:
+            raise self._deny(f"syntax:{op}", f"the operator {op} is not available here")
+        return self._check(f(a, b))
+
+    def _ibin(self, op: str, a: Any, b: Any) -> Any:
+        """An augmented assignment (x op= y): the checks of `_bin`, then Python's in-place operator. Not counted as
+        a step (it was not one before it was checked; the loop around it still is)."""
+        self._bin_check(op, a, b, tick=False)
+        f = _IBIN.get(op)
+        if f is None:
+            raise self._deny(f"syntax:{op}", f"the operator {op} is not available here")
+        r = f(a, b)
+        try:
+            return self._check(r)
+        except LabError:
+            if isinstance(r, (list, dict, set)):         # grown in place past the cap: emptied, not kept
+                r.clear()
+            raise
+
+    def _chk(self, v: Any) -> Any:
         self._tick()
+        return self._check(v)
+
+    def _bin_check(self, op: str, a: Any, b: Any, tick: bool = True) -> None:
+        """Refuse an operation whose result would be too large, from its operands, before computing it."""
+        if tick:
+            self._tick()
         if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
             if op == "MatMult":
                 if a.dim() >= 2 and b.dim() >= 2:
@@ -305,15 +526,17 @@ class Lab:
             raise LabError("sequence too long")
         if op == "Mult" and isinstance(b, (list, str, tuple)) and isinstance(a, int) and len(b) * a > 1_000_000:
             raise LabError("sequence too long")
+        if op == "Add" and isinstance(a, _SEQS) and isinstance(b, _SEQS) and len(a) + len(b) > MAX_SEQ:
+            raise self._deny("limit:size", f"the result would have {len(a) + len(b):,} items, over the cap "
+                                           f"{MAX_SEQ:,}")
+        if op == "BitOr" and isinstance(a, (dict, set)) and isinstance(b, (dict, set)) and len(a) + len(b) > MAX_SEQ:
+            raise self._deny("limit:size", f"the result would have {len(a) + len(b):,} items, over the cap "
+                                           f"{MAX_SEQ:,}")
         if isinstance(a, int) and isinstance(b, int):
             bits = (a.bit_length() + b.bit_length() if op == "Mult" else
                     a.bit_length() * max(1, abs(b)) if op == "Pow" else 0)
             if bits > MAX_INT_BITS or (op == "Pow" and abs(b) > 10_000):
                 raise self._deny("limit:int", "integer too large")
-        f = _BIN.get(op)
-        if f is None:
-            raise self._deny(f"syntax:{op}", f"the operator {op} is not available here")
-        return self._check(f(a, b))
 
     def _it(self, xs: Any) -> Any:
         if isinstance(xs, int):
@@ -373,13 +596,20 @@ class Lab:
         rng = self._range
         self._callable_ok |= {id(print), id(rng)}
         fixed = {"__builtins__": {"range": rng, "print": print}, **self.fixed,
-                 "_attr": self._attr, "_call": self._call, "_bin": self._bin, "_it": self._it}
+                 "_attr": self._attr, "_call": self._call, "_bin": self._bin, "_ibin": self._ibin, "_chk": self._chk,
+                 "_it": self._it}
         # One dict for globals and the agent's variables: comprehensions inside exec only see globals.
         g = {**fixed, **self.vars}
         before = dict(self.vars)
         self._deadline = time.perf_counter() + self.seconds
         self._steps = 0
         self._printed = []
+        if self._proc is not None:
+            try:
+                self._rss0 = self._proc.memory_info().rss
+            except Exception:                            # noqa: BLE001 - the backstop is optional
+                self._rss0 = 0
+            self._mem_t = time.perf_counter()
         err: Optional[str] = None
         value = None
         try:

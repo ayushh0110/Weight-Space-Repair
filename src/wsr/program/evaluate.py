@@ -190,6 +190,19 @@ def _rates(rows: list[dict]) -> dict[str, float]:
     return {k: round(v / n, 4) for k, v in sorted(c.items(), key=lambda kv: -kv[1])}
 
 
+def min_failing(m: int = 1, alpha: float = ALPHA) -> int:
+    """Failing items a set needs before a perfect fix can pass the exact sign test at alpha / m: the smallest k with
+    0.5^k below alpha / m (alpha 0.05: 5 at m = 1, 6 at m = 2 or 3, 7 at m = 4 to 6)."""
+    return max(1, math.ceil(math.log2(max(1, int(m)) / alpha) + 1e-9))
+
+
+def candidate_slots(*, playbook: bool, steer_pass: bool, agent_attempts: Optional[int]) -> int:
+    """The candidates a run may judge on the validation set, each tested at alpha / slots: one from the playbook, one
+    steering pass for a refusal goal whose playbook candidate is a weight patch, and each agent attempt (None: no
+    agent)."""
+    return max(1, int(playbook) + int(steer_pass) + (max(1, int(agent_attempts)) if agent_attempts is not None else 0))
+
+
 def power(a: list[float], *, alpha: float = ALPHA, min_gain: float = MIN_GAIN, m: int = 1) -> dict[str, Any]:
     """Whether this set can show an improvement at all. Only items that score below 1 before can become wins
     (the others can only tie or lose), so a perfect fix has k = that many wins and no loss, and its sign-test p is

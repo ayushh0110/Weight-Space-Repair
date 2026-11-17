@@ -28,12 +28,12 @@ dependencies = []
 [project.optional-dependencies]
 templates = ["jinja2>=3.1"]
 modelvet = ["modelvet>=0.1.1"]
-deep = ["torch>=2.2", "transformers>=4.45", "safetensors>=0.4", "numpy>=1.24", "psutil>=5.9"]
+deep = ["torch>=2.2", "transformers>=4.56", "safetensors>=0.4", "numpy>=1.24", "psutil>=5.9"]
 agent = ["anthropic>=0.101"]
 agent-openai = ["openai>=1.40"]
 data = ["huggingface_hub>=0.23", "pyarrow>=15"]      # wsr data fetch (gsm8k and mgsm are parquet)
 yaml = ["pyyaml>=6"]                                 # goal files written as YAML
-all = ["jinja2>=3.1", "modelvet>=0.1.1", "torch>=2.2", "transformers>=4.45", "safetensors>=0.4", "numpy>=1.24",
+all = ["jinja2>=3.1", "modelvet>=0.1.1", "torch>=2.2", "transformers>=4.56", "safetensors>=0.4", "numpy>=1.24",
        "psutil>=5.9", "huggingface_hub>=0.23", "pyarrow>=15", "pyyaml>=6"]
 dev = ["pytest>=8", "ruff>=0.5", "jinja2>=3.1"]
 
@@ -46,6 +46,15 @@ wsr = "wsr.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wsr"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# Long lines are wrapped by hand at 120; the ones left are tables, URLs and messages that read better whole.
+ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

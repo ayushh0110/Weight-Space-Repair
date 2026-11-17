@@ -211,9 +211,25 @@ def usage() -> dict[str, Any]:
 
 
 def targets(groups: list[str], model: Optional[str] = None) -> list[Path]:
-    """What `wsr cache clear` would delete."""
+    """What `wsr cache clear` would delete. `model`: a full key, a model's name (every key of that model), or the
+    start of a key that belongs to one model only; the start of several models' keys is refused, so a short
+    prefix never deletes more models than meant."""
     if model:
-        return [d for d in _group_paths("models") if d.name.startswith(model)]
+        ds = _group_paths("models")
+
+        def name(d: Path) -> str:
+            return d.name.rsplit("-", 1)[0]          # key = <model dir name>-<20 hex>
+
+        exact = [d for d in ds if d.name == model or name(d) == model]
+        if exact:
+            return exact
+        pre = [d for d in ds if d.name.startswith(model)]
+        names = sorted({name(d) for d in pre})
+        if len(names) > 1:
+            raise ValueError(f"--model {model!r} is the start of {len(names)} models' keys ("
+                             + ", ".join(names[:6]) + (", ..." if len(names) > 6 else "")
+                             + "): give one model's name or a full key, as `wsr cache show` lists them")
+        return pre
     out: list[Path] = []
     for g in (list(GROUPS) if "all" in groups else groups):
         if g not in GROUPS:

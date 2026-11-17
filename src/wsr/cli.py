@@ -630,8 +630,9 @@ def build_parser() -> argparse.ArgumentParser:
     chc = chs.add_parser("clear", help="delete cache groups (asks first, unless --yes); remembered consent "
                                        "answers are kept")
     chc.add_argument("groups", nargs="*", help="models, gguf, datasets, converter, probes, or all")
-    chc.add_argument("--model", default=None, metavar="KEY", help="only this model's entries (a key, or its start, "
-                                                                  "as `wsr cache show` lists them)")
+    chc.add_argument("--model", default=None, metavar="KEY", help="only this model's entries: a full key, the "
+                     "model's name (all its keys), or the start of one model's keys, as `wsr cache show` lists them; "
+                     "the start of several models' keys is refused")
     chc.add_argument("--yes", action="store_true", help="delete without asking")
     chc.set_defaults(fn=cmd_cache)
 
@@ -933,7 +934,11 @@ def cmd_fix(args: argparse.Namespace) -> int:
                         dataset=Path(args.dataset) if args.dataset and not auto else None, auto=auto,
                         samples=args.samples, heldout_share=args.heldout_share, seed=args.seed,
                         confirm_share=args.confirm_share,
-                        expect_lang=args.expect_lang, consent=consent)
+                        expect_lang=args.expect_lang, consent=consent,
+                        # the run that follows: its candidate slots size the validation set
+                        playbook=not args.no_playbook, steering=args.steering,
+                        agent_attempts=(None if provider is None else
+                                        _agent_limits(args, None)[3]))
     if not args.json:
         print(F.render(ff))
     if ff.get("stopped"):

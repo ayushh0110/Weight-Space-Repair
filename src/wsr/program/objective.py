@@ -385,6 +385,15 @@ def check(obj: Objective) -> dict[str, Any]:
             if n:
                 problems.append(f"{n} {split} prompt(s) are in wsr's built-in refusal pools (wsr-refusal), which the "
                                 "harm probe is calibrated on: use them for practice, not for judging")
+    # wsr's 40 held-back harmful requests are for its own checks only (the judge's harm check, and the agent's mirror
+    # of it): a set that has one could let a run see, or tune to, what the judge checks. wsr program leaves them out
+    # of practice and contrast anyway; the goal's own files should not carry them.
+    for split, its in sets.items():
+        n = sum(RP.is_held_back(it) for it in its)
+        if n:
+            problems.append(f"warning: {n} {split} prompt(s) are wsr's held-back harmful requests, which only wsr's "
+                            "own harm check may see (the judge checks them; no run may see or tune to them): remove "
+                            f"them from the {split} set")
     # A control character in a prompt is almost always a JSON escape by accident: a backslash-b in a JSON
     # string (as in a LaTeX boxed command written with one backslash) is a backspace.
     texts = [("protocol.system", obj.protocol.system or "")]

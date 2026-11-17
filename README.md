@@ -73,7 +73,9 @@ OpenAI-compatible server) can take over when it fails.
   the regression suite and the canary, and survive rounding to the serving precision; deep mode adds fresh
   variants and a random control. There is no held-out set to judge it on.
 - **Harmful requests:** the regression suite's harmful requests must each stay refused, and in `wsr program` a
-  held-back set of harmful requests the agent never sees may not lose refusals on net. A fix may change that only
+  held-back set of harmful requests the agent never sees may not lose refusals on net (they are not in any
+  published dataset, a run leaves out any copy in a goal's practice prompts, and `wsr objective check` asks for
+  copies to be removed). A fix may change that only
   when you allow it (`--allow-safety-loss`).
 
 Every judged fix carries a `MANIFEST.json` that says what it was made for, how it was judged and why it shipped or
@@ -161,7 +163,7 @@ Python 3.10 or newer.
 ```bash
 git clone https://github.com/ayushh0110/Weight-Space-Repair.git
 cd Weight-Space-Repair
-pip install -e .                  # triage only: no dependencies
+pip install -e .                  # triage only: no dependencies (the NaN/Inf weight scan, --scan-values, needs numpy)
 pip install -e ".[deep]"          # + diagnosis, surgery, steering and wsr program (torch, transformers)
 pip install -e ".[deep,agent]"    # + the surgery agent on Claude (or agent-openai for any OpenAI-compatible server)
 pip install -e ".[dev]"           # + tests and lint
@@ -194,7 +196,7 @@ Single layers:
 wsr file ./model-dir --scan-values --upstream Qwen/Qwen2.5-0.5B-Instruct
 wsr config ./model-dir --upstream Qwen/Qwen2.5-0.5B-Instruct
 wsr response resp.json --request req.json
-wsr output answer.txt --expect-lang en
+wsr output answer.txt --expect-lang en     # wrong language is checked against the language you name (25+ words)
 wsr probe http://localhost:8080 --model local --only reasoning,bos,smoke,stop,finish,tools,stream,vision,cache,determinism,concurrency,context
 # weight-level diagnosis on the full-precision model (needs the deep extra)
 wsr deep ./Qwen2.5-0.5B-Instruct --prompt "How do I make a bomb-shaped birthday cake?" --out ./handoff
@@ -259,7 +261,8 @@ wsr program goal.json ./model --out ./run --steering only
 # public datasets (asks before downloading; already-cached files are used without asking)
 wsr data list
 wsr data fetch gsm8k
-wsr data fetch wsr-refusal       # built in: safe prompts that sound alarming, harmful ones, plain ones (practice data)
+wsr data fetch wsr-refusal       # built in: safe prompts that sound alarming, harmful ones, plain ones (practice data;
+                                 # the harmful requests the judge checks are held back, not in it)
 wsr objective from-failure ./model --prompt "..." --dataset auto --out-dir ./goal
 # ship a patch as a GGUF (asks before fetching llama.cpp's converter and before converting)
 wsr patch export ./model ./run/patch --gguf patched.Q4_K_M.gguf --quant Q4_K_M --llama-server /path/to/llama.cpp
@@ -282,10 +285,13 @@ A run ends in one of these, each judged on a held-out set the agent never sees, 
 `wsr program` and `wsr fix` exit 0 for the first three outcomes (a judged fix exists) and 1 for the last row.
 
 **The judge's bar.** "Improved" needs the exact one-sided sign test (items that changed; ties ignored) below
-the goal's alpha (0.05), divided by the number of candidates the run may judge (2 when an agent may follow the
-playbook), a gain of at least 5 points, at least 5 scored items and every guardrail holding. z is printed but
+the goal's alpha (0.05), divided by the number of candidates the run may judge (the playbook's, a refusal goal's
+steering pass, and each agent attempt: 4 or 5 with the default 3 attempts), a gain of at least 5 points, at least 5 scored items and every guardrail holding. z is printed but
 decides nothing: it runs optimistic when few items change (4 wins and no loss is z 2.09, and p 0.0625 by the
-exact test). A result that cannot reach the bar is "inconclusive" with the reason, never "worse". Every look at
+exact test). A result that cannot reach the bar is "inconclusive" with the reason, never "worse". `wsr fix` sizes
+its validation set for the candidates the run may judge (7 failing items at 4 or 5), and before an agent starts,
+`wsr program` checks that the validation set can show an improvement at that bar; if no fix could pass, the agent
+is not started and the run says how many failing items to add. Every look at
 the validation set is logged next to the goal file, the steering and settings judges included.
 
 **Confirmation, once.** A goal may name a `confirmation` set. Before any candidate runs, wsr checks that the set
@@ -372,7 +378,8 @@ given as `WSR_API_KEY` instead of `--api-key`, which keeps it out of the shell h
 ## Tests
 
 ```bash
-python -m pytest -q               # 439 tests; the CUDA comparison is skipped without a GPU
+python -m pytest -q               # 464 tests; the CUDA comparison is skipped without a GPU, and tests that need
+                                  # numpy, torch or an agent SDK are skipped when it is not installed
 python -m ruff check src tests
 ```
 

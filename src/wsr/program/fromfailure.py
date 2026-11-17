@@ -60,25 +60,28 @@ def _split(items: list[dict], share: float, rng: random.Random) -> tuple[list[di
 
 
 # Failing items a set needs before any fix can pass the exact sign test there: 0.5^k below alpha. Validation is
-# judged at alpha / 2 when an agent may add a second candidate (6 items); confirmation once at alpha (5 items).
-MIN_FAILING_VALIDATION = 6
+# judged at alpha / m, m the run's candidate slots (evaluate.candidate_slots): 6 failing items at m = 2 or 3, 7 at
+# m = 4 to 6 (the playbook, a refusal goal's steering pass and an agent's three attempts are 5). Confirmation is judged
+# once, at alpha (5 items).
+MIN_FAILING_VALIDATION = 6               # at m = 2 (the default of _three_way's min_val)
 MIN_FAILING_CONFIRMATION = 5
 
 
 def _three_way(fail: list[dict], work: list[dict], heldout_share: float, confirm_share: float,
-               rng: random.Random) -> tuple[list[dict], list[dict], Optional[str]]:
+               rng: random.Random, min_val: int = MIN_FAILING_VALIDATION
+               ) -> tuple[list[dict], list[dict], Optional[str]]:
     """Take the confirmation set out first, when the failing items allow it without shrinking validation below what
-    it needs. Returns (confirmation failing, confirmation working, why there is none)."""
+    it needs (`min_val` failing items). Returns (confirmation failing, confirmation working, why there is none)."""
     if confirm_share <= 0:
         return [], [], "no confirmation set requested (--confirm-share 0)"
     n = len(fail)
     n_conf = max(MIN_FAILING_CONFIRMATION, int(round(confirm_share * n)))
     rest = n - n_conf
     n_val = int(round(heldout_share * rest))
-    need = MIN_FAILING_CONFIRMATION + MIN_FAILING_VALIDATION + 1
-    if n_val < MIN_FAILING_VALIDATION or rest - n_val < 1:
+    need = MIN_FAILING_CONFIRMATION + min_val + 1
+    if n_val < min_val or rest - n_val < 1:
         return [], [], (f"no confirmation set: {n} failing items, and a confirmation set needs "
-                        f"{MIN_FAILING_CONFIRMATION} failing items next to {MIN_FAILING_VALIDATION} for validation and "
+                        f"{MIN_FAILING_CONFIRMATION} failing items next to {min_val} for validation and "
                         f"at least 1 for practice ({need} in all); validation is not reduced to make room. Add items "
                         "that fail (a dataset, more --failing prompts) to get one")
     fail[:] = rng.sample(fail, len(fail))
@@ -128,7 +131,12 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
                  dataset: Optional[Path] = None, auto: bool = False, profile: Optional[dict] = None,
                  group: Optional[str] = None, grader: Optional[str] = None, samples: int = 200,
                  heldout_share: float = 0.5, seed: int = 0, deep: bool = False, name: Optional[str] = None,
-                 expect_lang: Optional[str] = None, consent=None, confirm_share: float = 0.25) -> dict[str, Any]:
+                 expect_lang: Optional[str] = None, consent=None, confirm_share: float = 0.25,
+                 playbook: bool = True, steering: str = "fallback",
+                 agent_attempts: Optional[int] = -1) -> dict[str, Any]:
+    """`playbook`, `steering`, `agent_attempts` (None: no agent; -1: an agent with the default attempts may follow):
+    the run the goal is built for, which sets how many candidates its validation set judges and so how many failing
+    items it needs."""
     rng = random.Random(seed)
     res: dict[str, Any] = {"steps": []}
     step = res["steps"].append
@@ -222,6 +230,12 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
     elif dataset is not None:
         assert r is not None
         items = O.load_items(dataset, system=protocol.system, limit=samples)
+        from ..deep import refusal_pools as RP
+        held = sum(RP.is_held_back(it) for it in items)
+        if held:                                   # wsr's own harm check's requests: never in a goal's sets
+            items = [it for it in items if not RP.is_held_back(it)]
+            step(f"{held} row(s) of {dataset.name} are wsr's held-back harmful requests (its own harm check's): "
+                 "left out")
         for it in items:
             if expect_lang and "lang" not in it:
                 it["lang"] = expect_lang
@@ -262,10 +276,23 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
                                                      "dataset"}
 
     # 4. stratified split (confirmation first, when there are enough failing items); 5. the goal file
-    cf, cw, no_conf = _three_way(fail_items, work_items, heldout_share, confirm_share, rng)
+    from .attempts import ATTEMPTS
+    from .evaluate import candidate_slots, min_failing
+    from .profile import DEEP_KIND
+
+    slots = candidate_slots(playbook=playbook,
+                            steer_pass=playbook and steering != "off" and DEEP_KIND.get(label) in ("refusal",
+                                                                                                  "complied"),
+                            agent_attempts=ATTEMPTS if agent_attempts == -1 else agent_attempts)
+    min_val = max(MIN_FAILING_CONFIRMATION, min_failing(slots))
+    cf, cw, no_conf = _three_way(fail_items, work_items, heldout_share, confirm_share, rng, min_val=min_val)
     if no_conf:
         step(no_conf)
     fp, fh = _split(fail_items, heldout_share, rng)
+    if len(fh) < min_val:
+        step(f"validation has {len(fh)} failing item(s); a run that may judge {slots} candidate(s) needs at least "
+             f"{min_val} before any fix can be accepted (sign test below alpha / {slots}): add items that fail (a "
+             "dataset, more --failing prompts)")
     wp, wh = _split(work_items, heldout_share, rng) if work_items else ([], [])
     out_dir.mkdir(parents=True, exist_ok=True)
     nm = name or f"fix-{label.lower()}"
@@ -289,6 +316,7 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
     step(f"split: practice {len(fp)} failing + {len(wp)} working; validation (held-out) {len(fh)} failing + "
          f"{len(wh)} working" + (f"; confirmation {len(cf)} failing + {len(cw)} working (used once)" if cf else ""))
     return {**res, "stopped": None, "goal": str(path), "label": label, "grader": grader, "source": source,
+            "candidate_slots": slots, "validation_min_failing": min_val,
             "practice": {"failing": len(fp), "working": len(wp)}, "heldout": {"failing": len(fh), "working": len(wh)},
             "confirmation": {"failing": len(cf), "working": len(cw)} if cf else {"none": no_conf}}
 

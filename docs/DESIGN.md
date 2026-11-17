@@ -805,7 +805,10 @@ Full tool list:
   used, so `().__class__`-style escapes do not parse. Every attribute access and call is checked
   at run time against a per-type whitelist (tensor maths yes; `numpy`, `storage`, in-place `add_`,
   `str.format`, `torch.save` no). Loops and calls check a 120 s deadline and a step budget, and
-  binary operations check the result size before computing (64M elements).
+  binary operations (augmented assignments too) and calls whose size their arguments tell
+  (einsum, tensordot, bincount, outer, cat ...) check the result size before computing (64M
+  elements); strings and lists are capped at 4M items, and a memory watch stops a call that grows
+  the process by more than 3 GB (section 27).
 - Weights handed to the workspace are copies, so the model cannot be changed from there. The tests
   try a set of escapes and check that the weights are bit-identical afterwards.
 - Every edit is applied only for one tool call, and the weights are restored bit for bit after it
@@ -1917,7 +1920,11 @@ replies exactly (checked on Qwen).
 **4. The contrast pools as data (deep/refusal_pools.jsonl, `wsr data fetch wsr-refusal`).** 640 safe prompts that
 sound alarming, 240 harmful requests (requests only) and 61 plain ones, written for wsr; none is an XSTest prompt,
 the suite's harmful prompts or the canary. Because the probe is fitted on them, `wsr objective check` flags a
-validation or confirmation set that overlaps them.
+validation or confirmation set that overlaps them. The 40 harmful requests the probe is not fitted on are held back
+for wsr's own harm check (20 for the judge, 20 for the agent's mirror of it): the published dataset leaves them
+out (200 harmful), `wsr program` leaves any copy out of a goal's practice and contrast prompts, `wsr objective
+from-failure` out of a dataset it splits, and `wsr objective check` asks for any copy in a goal's sets to be
+removed. So the requests the judge checks are not in any data a run is given.
 
 In a live run (Claude Opus 5.5, Qwen under-refusal, playbook skipped) the agent used the tool as intended without
 being told to: it read the verdict, checked the gate on failing and benign prompts, measured it on practice
@@ -2272,3 +2279,40 @@ showed lowering no harmful request still lowered 7 to 10 independent ones. In th
 estimate ("the default gate would lower the refusal on 59 of 215 harmful requests the model refuses"), set
 `margin_down` to its maximum, and shipped the restore + gate on its first attempt (RESULTS.md). On the independent
 sets the shipped fix answers 8% of harmful requests, against 17% for the undamaged model.
+
+## 27. Third review round: the guarantees around the judge
+
+An outside review reproduced eight problems in the guarantees around the judge rather than in the judge itself. The
+statistics, the sandbox's escape protection and the quick-start example held up.
+
+**What changed.**
+
+- **Validation sized for the run.** `wsr fix` set aside 6 failing validation items, enough at alpha / 2. A default
+  agent run declares 4 or 5 candidate slots, so even a perfect fix on those 6 items scored inconclusive
+  (0.5^6 = 0.0156, above 0.05 / 4). The minimum is now the smallest k with 0.5^k below alpha / slots
+  (`evaluate.min_failing`), sized for the run `wsr fix` starts. And before an agent starts, `wsr program` checks
+  the validation set's power on the original model's replies (cached, so a PyTorch judge does not generate them
+  twice). If no fix could pass, the agent is not started, and the run says how many failing items to add.
+- **The judge's harm prompts stay the judge's.** The held-back harmful requests (20 for the judge, 20 for the
+  agent's mirror) were in the published `wsr-refusal` dataset, which the README suggests as practice data. They
+  are not published now. A run leaves any copy out of a goal's practice and contrast prompts, `from-failure` leaves
+  them out of a dataset it splits, and `wsr objective check` asks for them to be removed. Copies are matched on
+  normalised text, so a user's own copy is found too.
+- **Will-not idioms.** "I can't recommend this book enough", "I can't help but smile", "I won't tell you it is
+  easy, but here is a plan" and a quoted error message each read as a full refusal. The reading now skips a list of
+  idioms after the will-not, and will-nots inside a quoted message (unless the reply opens with the quote). It can
+  only turn a refusal reading into an answer, never the reverse, so harm checks can only get stricter. 2,009
+  recorded Qwen and Llama replies read the same before and after the change. Detector version 6.
+- **Sandbox limits.** `z **= 10000`, `s = s + s`, `l.extend(l)` and `m *= 50_000_000` went past the caps, and
+  einsum or bincount could allocate gigabytes before their result was checked. Augmented assignments now go
+  through the operator checks, keeping Python's in-place behaviour and the old step counts. Strings, lists, dicts and
+  sets are capped at 4M items, checked before a concatenation, join, replace, extend or `tolist`. einsum,
+  tensordot, bincount, inner, pad and nonzero are sized before they run. The workspace count no longer walks a
+  huge list item by item. As a backstop, a memory watch (psutil) stops a call that grows the process by more
+  than 3 GB. The workspace still runs in wsr's own process (LIMITATIONS.md).
+- **Smaller fixes.**
+  - `transformers>=4.56` (the `dtype=` keyword), with a clear message on an older version.
+  - Tests skip when numpy or torch is missing.
+  - `cache clear --model` refuses a prefix shared by several models.
+  - A `[tool.ruff]` config.
+  - The README now says the NaN scan needs numpy, and the language check needs the language named.

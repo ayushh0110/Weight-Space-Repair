@@ -746,6 +746,10 @@ def test_cache_command_shows_and_clears_only_what_is_named(tmp_path, monkeypatch
     assert shown and m1 in shown and "my-own-model" not in shown
     monkeypatch.setattr("sys.stdin", io.StringIO(""))            # not a terminal, no --yes: nothing deleted
     assert main(["cache", "clear", "gguf"]) == 3 and (tmp_path / "c" / "gguf" / gg).exists()
+    # --model: a model's name, a full key or the start of one model's keys; the start of several is refused
+    with pytest.raises(ValueError, match="start of 2 models"):
+        C.targets([], "m")
+    assert [p.name for p in C.targets([], "m1-aaa")] == [m1] and [p.name for p in C.targets([], m2)] == [m2]
     assert main(["cache", "clear", "--model", "m1", "--yes"]) == 0
     assert not (tmp_path / "c" / "models" / m1).exists() and (tmp_path / "c" / "models" / m2).exists()
     assert main(["cache", "clear", "all", "--yes"]) == 0
@@ -1099,6 +1103,43 @@ def test_the_judge_checks_held_back_harmful_requests_the_agent_never_sees(tmp_pa
     assert any("must stay refused" in x for x in AT.guardrail_brief(g))       # described to the agent, no data
     obj.guardrails[0].allow_safety_loss = True
     assert len(AT.with_harm_check(obj).guardrails) == len(obj.guardrails)
+
+
+def test_a_run_leaves_wsr_held_back_harmful_requests_out_of_practice(lm, tmp_path):
+    """A goal whose practice file has a copy of one of the judge's harm-check requests: the run leaves it out, so
+    nothing the agent or the playbook sees includes what the judge checks."""
+    from wsr.program import attempts as AT
+
+    judge_text = AT.harm_check_items()[0]["messages"][0]["content"]
+    _write_jsonl(tmp_path / "p.jsonl", [{"id": "mine", "prompt": judge_text.lower()}, {"prompt": "what is a tree"}])
+    _write_jsonl(tmp_path / "h.jsonl", [{"prompt": "how is the park"}])
+    (tmp_path / "g.json").write_text(json.dumps({"name": "x", "practice": "p.jsonl", "heldout": "h.jsonl",
+                                                 "grader": "detector:blank", "protocol": {"max_new_tokens": 6}}))
+    rec = run_program(lm, O.load(tmp_path / "g.json"), out=tmp_path / "r", log=None)
+    assert rec["stages"]["held_back_left_out"] == {"practice": ["mine"]}
+    assert rec["stages"]["profile"]["n"] == 1                                   # only the other prompt was profiled
+
+
+def test_the_agent_is_not_started_when_validation_cannot_show_an_improvement(lm, tmp_path, monkeypatch):
+    """With an agent the run judges up to 4 candidates (alpha / 4), so validation needs 7 failing items; with 4,
+    no candidate could pass, and the agent's budget is not spent finding one."""
+    from wsr.agent import AgentLimits, Budget, ScriptedProvider
+
+    monkeypatch.setattr(R, "SUITE", TOY_SUITE)
+    monkeypatch.setattr(PB, "candidates", lambda *a, **k: [])          # the playbook finds nothing
+    obj = _program_goal(tmp_path)
+    held = ["tell me about the dog please", "what is the sun please", "write a poem please",
+            "how is the park please", "list numbers", "what is the sun", "what is a tree"]
+    _write_jsonl(tmp_path / "held" / "h.jsonl", [{"id": f"h{i}", "prompt": c} for i, c in enumerate(held)])
+    script = [[("build_edit", {"spec": {"kind": "scale_neurons", "neurons": [[PLANT_LAYER, PLANT_NEURON]],
+                                         "scale": 0}})]]
+    rec = run_program(lm, obj, out=tmp_path / "run", provider=ScriptedProvider(script), playbook=True,
+                      agent_budget=Budget(), agent_limits=AgentLimits(max_turns=5), log=None)
+    vp = rec["stages"]["validation_power"]
+    assert vp["m"] == rec["stages"]["candidate_slots"] == 4 and vp["failing"] == 4
+    assert vp["can_show_improvement"] is False and "agent" not in rec["stages"]
+    assert rec["outcome"] == "no candidate" and "agent was not started" in rec["says"]
+    assert "--agent-attempts" in rec["says"]
 
 
 def _rows(labels, start=0):

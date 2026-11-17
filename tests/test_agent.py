@@ -895,6 +895,60 @@ def test_workspace_refuses_huge_results_before_computing_them(setup, monkeypatch
     assert wb.lab.denied.get("limit:workspace", 0) >= 2
 
 
+def test_workspace_limits_hold_for_augmented_assignment_sequences_and_unestimated_calls(setup):
+    """An outside review found ways past the caps: `z **= 10000` skipped the integer check, strings and lists
+    grew without limit (s = s + s, l.extend(l), m *= 50_000_000), and einsum / bincount allocated gigabytes
+    before their result was checked. Each is refused now, quickly, and ordinary code still runs."""
+    import time
+
+    from wsr.agent.lab import MAX_SEQ, Lab, LabError
+    lab = Lab({}, seconds=10)
+    t0 = time.perf_counter()
+    for code, why in (("z = 10\nz **= 10000\nz **= 3000", "integer too large"),
+                      ("m = [0] * 1000\nm *= 50000", "too long"),
+                      ("s = 'ab'\nfor i in range(40):\n    s = s + s", "over the cap"),
+                      ("s = 'ab'\nfor i in range(40):\n    s = f'{s}{s}'", "over the cap"),
+                      ("l = [0]\nfor i in range(40):\n    l.extend(l)", "over the cap"),
+                      ("l = [0]\nfor i in range(40):\n    l += l", "over the cap"),
+                      ("l = [0]\nfor i in range(40):\n    l = [*l, *l]", "over the cap"),
+                      ("t = ('x' * 100000).join(['a'] * 100000)", "over the cap"),
+                      ("t = ('a' * 1000000).replace('a', 'bbbbbbbbbb')", "over the cap"),
+                      ("a = torch.ones(60000)\nx = torch.einsum('i,j->ij', a, a)", "would produce"),
+                      ("x = torch.bincount(torch.tensor([400000000]))", "would produce"),
+                      ("a = torch.ones(10000, 1)\nx = torch.tensordot(a, a, dims=0)", "would produce"),
+                      ("a = torch.ones(20000, 2)\nx = torch.inner(a, a)", "would produce"),
+                      ("x = F.pad(torch.ones(10), (0, 1000000000))", "would produce"),
+                      ("x = torch.ones(8000000).tolist()", "over the cap")):
+        with pytest.raises(LabError, match=why):
+            lab.run(code)
+    assert time.perf_counter() - t0 < 30
+    assert all(len(v) <= MAX_SEQ for v in lab.vars.values() if isinstance(v, (str, list, dict, set)))
+    # augmented assignment keeps Python's meaning: in place for a tensor or a list, a new value for a number
+    assert lab.run("a = torch.ones(3)\nb = a\na += 1\nb.sum()")["output"].endswith("[6.0]")
+    assert lab.run("l = [1]\nm = l\nl += [2]\nlen(m)")["output"] == "2"
+    assert lab.run("x = torch.zeros(4)\nx[1] += 5\nx[1].item()")["output"] == "5.0"
+    assert lab.run("n = 0\nfor i in range(1000):\n    n += i\nn")["output"] == "499500"
+    assert lab.run("w = 3\nf'{w:>{w}} {1.5:.2f}'")["output"] == "'  3 1.50'"
+    assert lab.run("a = torch.ones(2, 5, 4)\ntorch.einsum('...ij->...ji', a).shape")["output"] == \
+        "torch.Size([2, 4, 5])"
+    assert lab.run("torch.einsum('ij,jk->ik', torch.ones(5, 4), torch.ones(4, 3)).shape")["output"] == \
+        "torch.Size([5, 3])"
+    assert lab.run("a, *b = [1, 2, 3]\n[*b, 4]")["output"] == "[2, 3, 4]"
+    assert lab.run("{**{'k': 1}, 'j': 2}")["output"] == "{'k': 1, 'j': 2}"
+    assert lab.run("', '.join(str(i) for i in range(3))")["output"] == "'0, 1, 2'"
+
+
+def test_workspace_memory_backstop_stops_a_call_that_grows_memory(setup, monkeypatch):
+    """What no estimate covers is still bounded: the process's memory is watched while a call runs."""
+    pytest.importorskip("psutil")
+    from wsr.agent import lab as L
+    lab = L.Lab({}, seconds=20)
+    monkeypatch.setattr(L, "MAX_MEMORY_GROWTH", 64 << 20)                     # 64 MB for the test
+    with pytest.raises(L.LabError, match="grew wsr's memory"):
+        lab.run("keep = []\nfor i in range(400):\n    keep.append(torch.ones(1000000))")
+    assert lab.denied.get("limit:memory") == 1
+
+
 def test_harm_probe_tool_reports_the_reading_and_gates_are_checked(setup, monkeypatch):
     """The agent's harm_probe: a model with no refusals gets the probe's verdict and a clear refusal to build a gate;
     a gate id that does not exist is an error in generate's interventions."""

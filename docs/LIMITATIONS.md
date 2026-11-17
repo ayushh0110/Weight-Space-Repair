@@ -35,6 +35,9 @@ Known limits:
 - A fluent answer that is off task, with no cause in the request, is out of reach for generic detectors.
 - Probes cannot run in parallel on llama-server without changing the replies (measured: it is not batch
   invariant).
+- The language check needs the expected language (`--expect-lang`, or an item's `lang`); it is not inferred from
+  the request, and replies under 25 words are not judged. `--expect-script` checks the writing system instead.
+- `--scan-values` (NaN / Inf in safetensors weights) needs numpy; without it the scan is reported as skipped.
 
 ## Quantisation
 
@@ -178,8 +181,11 @@ Known limits:
   while 10 requests the model used to refuse were answered. Only the regression suite's safety check is per item.
   A per-item limit for refusal guardrails is not built yet.
 - The workspace is a restricted numeric language with Python-like syntax, not a kernel; an isolated container
-  kernel is not built.
-- A single slow torch call in the workspace runs to its end (the deadline is checked between operations).
+  kernel is not built. It runs in wsr's own process: its limits are wsr's checks (sizes estimated before a call,
+  lengths of strings and lists, integer size, steps, time), with a memory watch as the backstop (with psutil,
+  3 GB of growth per call), not operating-system limits on a separate process.
+- A single slow torch call in the workspace runs to its end (the deadline is checked between operations), and a
+  single call whose size no estimate covers can allocate before the memory watch sees it.
 - The agent's state is rewritten after every turn, up to 1 GB of workspace tensors.
 
 ## Graders
@@ -187,9 +193,21 @@ Known limits:
 - No IFEval instruction checker and no model-as-judge grader: format goals are graded by the detectors only.
 - The refusal reading is rule-based English phrasing. It separates a will-not, a non-answer and an answer, but it
   cannot tell a rebuttal of a harmful premise from compliance, and a refusal phrased in a way it has not seen is
-  read as an answer. It was checked by hand on samples of Qwen2.5-0.5B and Llama-3.2-1B replies only.
+  read as an answer. It was checked by hand on samples of Qwen2.5-0.5B and Llama-3.2-1B replies only. Common
+  idioms with will-not wording ("I can't help but smile", "I can't recommend it enough") and a will-not inside a
+  quoted message are not read as refusals (2,009 recorded replies read the same before and after that change);
+  idioms it does not list still are.
 - The `wsr-refusal` pools are wsr's own writing (templated in part): good for calibration and practice, not a
   benchmark. `wsr objective check` flags a validation or confirmation set that overlaps them.
+
+## Downloads and caches
+
+- The llama.cpp converter is downloaded (after asking) from the official GitHub tag that matches your llama-server
+  build, over HTTPS, with no checksum of its own. Point `--llama-cpp` (or `WSR_LLAMA_CPP`) at a checkout you trust
+  to skip the download.
+- The GGUF judge's cache of converted original models is keyed by file names, sizes and modification times (and
+  the config's content), not a hash of the weights: replacing a weight file in place with one of the same size
+  and time would reuse the old conversion. `wsr cache clear gguf` removes them.
 
 ## Open work
 

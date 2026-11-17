@@ -1085,6 +1085,15 @@ def prior_labels(lm, obj: Objective, items: list[dict]) -> Optional[list]:
     return out
 
 
+def _validation_power(lm, obj: Objective, m: int, limit: Optional[int]) -> dict[str, Any]:
+    """EV.power on the validation set at alpha / m, from the original model's replies on PyTorch: the same items,
+    seeds and cache entry as judge_steering's and the PyTorch patch judge's original side."""
+    items = load_items(obj.resolve(obj.heldout), system=obj.protocol.system, limit=limit)
+    r0 = PF.Runner(TorchBackend(lm), obj.protocol, obj.grader)
+    a, _ = EV._metric(EV.original_set(r0, items, samples=1, seed=0))
+    return {**EV.power(a, m=m, **EV.judge_settings(obj)), "m": m, "measured_on": "pytorch (original model)"}
+
+
 def _user_text(it: dict) -> str:
     return next((str(m.get("content")) for m in reversed(it["messages"]) if m.get("role") == "user"), "")
 
@@ -1107,9 +1116,19 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
         obj = AT.with_harm_check(obj)      # held-back harmful requests the agent never sees: every judge checks them
     proto = obj.protocol
     practice = load_items(obj.resolve(obj.practice), system=proto.system) if obj.practice else []
+    rec: dict[str, Any] = {"objective": obj.to_dict(), "stages": {}}
+    # wsr's held-back harmful requests are seen by its own harm check only (the judge's half, the agent's mirror):
+    # a copy in the goal's practice set would let the run see, or tune to, what the judge checks. Left out here,
+    # whatever the goal file says (wsr objective check asks for them to be removed).
+    from ..deep import refusal_pools as RP
+    held = [it["id"] for it in practice if RP.is_held_back(it)]
+    if held:
+        practice = [it for it in practice if not RP.is_held_back(it)]
+        say(f"practice: {len(held)} prompt(s) are wsr's held-back harmful requests (its own harm check's); left out "
+            "of this run (remove them from the practice file)")
+        rec["stages"]["held_back_left_out"] = {"practice": held}
     if not practice:
         raise ValueError("wsr program needs a practice set in the goal file")
-    rec: dict[str, Any] = {"objective": obj.to_dict(), "stages": {}}
 
     # 1. profile
     src = profile_source or lm
@@ -1203,7 +1222,13 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
     harm_extra = None
     pool = [it for it in practice if it.get("messages")]
     if obj.contrast:
-        pool += load_items(obj.resolve(obj.contrast), system=proto.system)
+        con = load_items(obj.resolve(obj.contrast), system=proto.system)
+        held_c = [it["id"] for it in con if RP.is_held_back(it)]
+        if held_c:
+            say(f"contrast: {len(held_c)} prompt(s) are wsr's held-back harmful requests; left out of the harm probe's "
+                "data (remove them from the contrast file)")
+            rec["stages"].setdefault("held_back_left_out", {})["contrast"] = held_c
+        pool += [it for it in con if not RP.is_held_back(it)]
     why_not = harm_extra_problem(pool)
     if not why_not:
         harm_extra = pool
@@ -1262,7 +1287,8 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
     # symptoms only: attempts.py). Every one is tested at alpha / slots, declared here before anything is judged, so
     # several looks at the same set cannot multiply the chance of a false acceptance.
     agent_attempts = max(1, int(agent_attempts))
-    slots = max(1, int(playbook) + steer_pass + (agent_attempts if provider is not None else 0))
+    slots = EV.candidate_slots(playbook=playbook, steer_pass=steer_pass,
+                               agent_attempts=agent_attempts if provider is not None else None)
     rec["stages"]["candidate_slots"] = slots
 
     # 4. agent, 5. the judge. A playbook candidate that the held-out judge rejects hands over to the agent once
@@ -1356,6 +1382,21 @@ def run_program(lm, obj: Objective, *, out: Path, profile_source=None, provider=
             return _finish(rec, out, t0)
     if candidate is None and provider is not None and (rep.status == "could_not_fix" or rejected):
         from ..agent import run as agent_run
+
+        # Before the agent spends its budget: can the validation set show an improvement at all, at the level every
+        # attempt is judged at? It depends only on the original model's replies (no candidate is looked at), the
+        # ones the PyTorch judges compare with (kept across runs, so a PyTorch judge does not generate them again).
+        vp = _validation_power(lm, obj, slots, eval_limit)
+        rec["stages"]["validation_power"] = vp
+        if not vp["can_show_improvement"]:
+            say(f"\nthe agent is not started: {vp['note']} (each candidate is judged at alpha / {slots}, the run's "
+                f"{slots} candidate slots)")
+            rec["outcome"] = "no candidate"
+            rec["says"] = ((f"the playbook's candidate ({rejected}) was not accepted, and " if rejected else "")
+                           + f"the agent was not started: on the full-precision model, {vp['note']} (alpha / {slots}: "
+                           f"{slots} candidate slots). Add items that fail to the validation set, or allow fewer "
+                           "attempts (--agent-attempts)")
+            return _finish(rec, out, t0)
 
         def judge_attempt(kind: str, ref: str, wb) -> dict:
             n = len(tools.attempts) + 1

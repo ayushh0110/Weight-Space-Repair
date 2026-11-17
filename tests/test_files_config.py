@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from conftest import CHATML, make_hf_dir, write_gguf, write_safetensors
 
 from wsr.config_checks import check_config, load_gguf
@@ -39,6 +40,7 @@ def test_safetensors_overlap_and_size(tmp_path):
 
 
 def test_nan_scan(tmp_path):
+    pytest.importorskip("numpy")                 # the value scan needs numpy (without it: a SKIP finding)
     import struct
 
     p = write_safetensors(tmp_path / "m.safetensors", {"w": ("F32", [2])})

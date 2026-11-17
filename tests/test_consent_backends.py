@@ -141,6 +141,7 @@ def test_expected_refusals_score_the_other_way():
 
 
 def test_export_finds_a_converter_and_asks_before_downloading_or_converting(tmp_path, monkeypatch):
+    pytest.importorskip("torch")                 # surgery.export loads torch
     from wsr.surgery import export as X
 
     monkeypatch.setenv("WSR_CACHE_DIR", str(tmp_path / "cache"))
@@ -163,6 +164,7 @@ def test_export_finds_a_converter_and_asks_before_downloading_or_converting(tmp_
 
 
 def test_export_refuses_without_disk_space(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
     import shutil as sh
     from collections import namedtuple
 
@@ -362,6 +364,7 @@ def test_watchdog_stops_the_server_when_the_disk_runs_low(monkeypatch):
 
 
 def test_heavy_optional_steps_are_skipped_when_the_machine_cannot_take_them(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
     from wsr import resources as RS
     from wsr.program import backends as B
     from wsr.surgery import export as X

@@ -50,7 +50,7 @@ K_HARM, K_ANSWER, K_DECLINE, K_REFUSE, K_GOAL, K_PLAIN = 1, 2, 4, 8, 16, 32
 BASE_KIND = "harm-probe-pools"   # the built-in pools' replies and residuals, shared by every goal's calibration
 MIN_AUC = 0.75                # below this the model has no usable linear reading of harm
 MIN_READS_ERRORS = 0.5        # the probe must read at least this share of the model's refusal mistakes correctly
-PER_SET = {"safe": 260, "harmful": 200, "plain": 40}
+PER_SET = {"safe": 260, "harmful": 200, "plain": 40}            # = refusal_pools.PROBE_PER_SET (a test checks)
 MAX_NEW = 48
 L2 = 30.0
 

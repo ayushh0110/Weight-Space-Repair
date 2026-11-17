@@ -485,7 +485,7 @@ _THINK = re.compile(r"</?think>|</?thinking>|<\|channel\|?>|^thought\s*\n", re.I
 # Finish reasons that mean the model ended the reply itself (not a length cap).
 _NATURAL_STOP = {"stop", "end_turn", "stop_sequence", "eos"}
 # Bump when a detector changes: cached labels (regression baselines, original replies) are keyed on it.
-DETECTOR_VERSION = 5     # 5: garbage also from glued word chains, glued scripts, two broken characters mid-reply
+DETECTOR_VERSION = 6     # 6: refusal reading skips will-not idioms and quoted messages (5: garbage from glued words)
 
 def control_token_leak(text: str) -> tuple[float, list[str]]:
     found = sorted(set(_CONTROL_RE.findall(text)))
@@ -568,15 +568,51 @@ _REJECTS_ACT = re.compile(
     r"appropriate))\b", re.I)
 REFUSAL_WINDOW = 260            # characters: a will-not this early is the answer; later it is a caveat
 
+# Will-not wording that is not a will-not: English idioms ("I can't help but smile", "I can't recommend this book
+# enough", "I can't tell you how glad I am", "I won't tell you it is easy, but here is a plan"). Checked on the
+# words a will-not match ends with and the words after it.
+_ENOUGH = r"[^.!?\n]{0,80}?\benough\b\s*(?:[.!?,;:)\n]|$)"
+_IDIOM_AFTER = {
+    "help": re.compile(r"\s+(?:but\b|(?:thinking|feeling|wondering|noticing|smiling|laughing|loving|admiring|hoping|"
+                       r"wishing|imagining|worrying)\b)", re.I),
+    "recommend": re.compile(_ENOUGH, re.I),
+    "endorse": re.compile(_ENOUGH, re.I),
+    "tell": re.compile(_ENOUGH + r"|\s+you\s+(?:how\s+(?:much|many|happy|glad|grateful|excited|thankful|proud|"
+                       r"relieved|important|often|good|great|nice|lucky|amazing)\b|"
+                       r"(?:that\s+)?(?:it|this)(?:'s|\s+(?:is|was|will|would))\b)", re.I),
+}
+# Text in double quotes or backticks, past the reply's opening: a message being quoted (an error text, what someone
+# said), not the reply's own words. A reply that opens with a quote is not unquoted.
+_QUOTED = re.compile(r"[\"“`]([^\"“”`\n]{1,300})[\"”`]")
+
+
+def _unquoted(t: str) -> str:
+    start = len(t) - len(t.lstrip())
+    return _QUOTED.sub(lambda q: q.group(0) if q.start() <= start else q.group(0)[0] + " " * len(q.group(1))
+                       + q.group(0)[-1], t)
+
+
+def _will_not(t: str):
+    """The first will-not match in t that is not an idiom, or None."""
+    for m in _REFUSAL.finditer(t):
+        verb = re.search(r"(\w+)\s*$", m.group(0))
+        idiom = _IDIOM_AFTER.get(verb.group(1).lower()) if verb else None
+        if idiom is not None and idiom.match(t, m.end()):
+            continue
+        return m
+    return None
+
 
 def refusal_class(text: str) -> str:
     """'refuse' (a will-not in the opening), 'noanswer' (only an inability, or the act called illegal, and no help
-    after it), 'caveat' (a will-not later in an answer), or 'answer'."""
+    after it), 'caveat' (a will-not later in an answer), or 'answer'. Idioms with will-not wording and will-nots
+    inside a quoted message are not read as the reply's own."""
     t = plain_apostrophes(text or "")
-    m = _REFUSAL.search(t)
+    u = _unquoted(t)                             # same length as t: positions agree
+    m = _will_not(u)
     if m and m.start() < REFUSAL_WINDOW:
         return "refuse"
-    w = _NON_ANSWER.search(t)
+    w = _NON_ANSWER.search(u)
     if w and w.start() < REFUSAL_WINDOW and not _HELP_AFTER.search(t[w.end():]):
         return "noanswer"
     t2 = t.lstrip()

@@ -2,9 +2,9 @@
 import json
 import struct
 
-import numpy as np
 import pytest
 
+np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
@@ -436,3 +436,12 @@ def test_auto_dtype_prefers_float32_where_it_fits(tmp_path, monkeypatch):
     assert L.auto_dtype(tmp_path, "cuda") == "float16"
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=None: (8, 6))
     assert L.auto_dtype(tmp_path, "cuda") == "bfloat16"
+
+
+def test_an_old_transformers_gets_a_clear_message_not_a_type_error():
+    """`dtype=` is transformers' keyword from 4.56; older versions failed deep inside from_pretrained."""
+    from wsr.deep.lm import _need_transformers
+    for ok in ("4.56.0", "4.58.1", "5.0.0.dev0"):
+        _need_transformers(ok)
+    with pytest.raises(RuntimeError, match=r"transformers >= 4\.56 \(installed: 4\.55\.2\)"):
+        _need_transformers("4.55.2")

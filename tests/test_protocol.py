@@ -120,6 +120,54 @@ def test_the_split_keeps_a_confirmation_set_only_when_validation_stays_whole():
     assert FF._three_way(fail, work, 0.5, 0.0, random.Random(0))[2].startswith("no confirmation set requested")
 
 
+def test_validation_is_sized_for_the_candidates_the_run_may_judge():
+    """A default agent run judges up to 1 + 3 candidates (5 for a refusal goal): 6 failing validation items, sized
+    for 2, could not pass even with a perfect fix (0.5^6 = 0.0156 is not below 0.05 / 4)."""
+    import random
+    assert [EV.min_failing(m) for m in (1, 2, 3, 4, 5, 6, 7)] == [5, 6, 6, 7, 7, 7, 8]
+    assert all(0.5 ** EV.min_failing(m) < EV.ALPHA / m <= 0.5 ** (EV.min_failing(m) - 1) for m in range(1, 20))
+    assert EV.candidate_slots(playbook=True, steer_pass=False, agent_attempts=None) == 1
+    assert EV.candidate_slots(playbook=True, steer_pass=True, agent_attempts=3) == 5
+    assert EV.candidate_slots(playbook=False, steer_pass=False, agent_attempts=None) == 1
+    fail = [{"id": f"f{i}"} for i in range(17)]          # 5 for confirmation, 12 left: 6 validation, 6 practice
+    assert FF._three_way(list(fail), [], 0.5, 0.25, random.Random(0))[2] is None            # sized for 2: room
+    cf, _, why = FF._three_way(list(fail), [], 0.5, 0.25, random.Random(0), min_val=EV.min_failing(4))
+    assert not cf and "13 in all" in why                                                  # sized for 4: none
+
+
+def test_held_back_harmful_requests_are_only_for_wsr_own_harm_check(tmp_path):
+    """The 40 harmful requests the harm probe is not fitted on (the judge's harm check and the agent's mirror) are
+    not in the published wsr-refusal dataset, are found in a custom set whatever its case and punctuation, and
+    `wsr objective check` asks for them to be removed."""
+    from wsr.deep import refusal_pools as RP
+    from wsr.program import attempts as AT
+    from wsr.program import datasets as D
+
+    held = RP.held_back()
+    assert len(held) == 40 and {i["id"] for i in held} == {i["id"] for i in AT.harm_check_items() + AT.harm_mirror()}
+    rows = D._wsr_refusal(None)
+    assert len(rows) == len(RP.rows()) - 40 and sum(r.get("expect") == "refuse" for r in rows) == 200
+    published = {RP.norm(r["prompt"]) for r in rows}
+    assert not (RP.held_back_texts() & published)
+    probe = {it["id"] for it in RP.sample(dict(RP.PROBE_PER_SET))}
+    assert probe <= {r["id"] for r in rows}                                 # the probe's own data stays published
+    judge_text = AT.harm_check_items()[0]["messages"][0]["content"]
+    copy = {"id": "mine-1", "messages": [{"role": "system", "content": "be brief"},
+                                        {"role": "user", "content": "  " + judge_text.upper() + "!! "}]}
+    assert RP.is_held_back(copy) and not RP.is_held_back({"messages": [{"role": "user", "content": "hello"}]})
+    for split in ("practice", "heldout", "contrast"):
+        (tmp_path / f"{split}.jsonl").write_text(json.dumps({"id": "a", "prompt": "what is a tree"}) + "\n" +
+                                                 json.dumps({"id": "b", "prompt": judge_text}) + "\n",
+                                                 encoding="utf-8")
+    (tmp_path / "goal.json").write_text(json.dumps({"name": "x", "practice": "practice.jsonl",
+                                                    "heldout": "heldout.jsonl", "contrast": "contrast.jsonl",
+                                                    "grader": "detector:refusal"}), encoding="utf-8")
+    obj = O.load(tmp_path / "goal.json")
+    probs = [p for p in O.check(obj)["problems"] if "held-back" in p]
+    assert len(probs) == 3 and all("remove them" in p for p in probs)
+    assert {p.split(" prompt")[0].split()[-1] for p in probs} == {"practice", "heldout", "contrast"}
+
+
 def test_a_confirmation_set_is_consumed_by_its_content(tmp_path):
     a = tmp_path / "a.jsonl"
     _jsonl(a, ["x", "y"])

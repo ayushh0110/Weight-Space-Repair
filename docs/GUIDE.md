@@ -261,7 +261,11 @@ refused. Every attempt is a candidate slot of the run's correction, declared bef
 attempts each must reach p < 0.05 / 3, so trying again cannot pass by luck. Each rejection grants two more practice
 measurements. The brief lists what every guardrail protects (kinds and counts, not data). `harmful_kept` is the
 practice side of the judge's harm check: wsr's own harmful requests that the harm probe was not calibrated on are
-split in two, the agent measures one half, and the judge checks the other half, which the agent never sees.
+split in two, the agent measures one half, and the judge checks the other half, which the agent never sees. None
+of them is in the published `wsr-refusal` dataset; a copy in a goal's practice or contrast file is left out of the
+run, and `wsr objective check` asks for it to be removed. Before the agent starts, the run checks that the
+validation set can show an improvement at alpha / slots on the original model's replies; if not, the agent is
+not started (no budget is spent) and the run says how many failing items to add.
 
 **Multi-stage surgery.** A model can have more than one fault, and fixing one can reveal the next. Restored
 weights, for example, can answer harmful requests the damaged model only garbled. `commit_edit` makes a fix part of the
@@ -366,7 +370,11 @@ file into practice and held-out. `wsr objective from-failure` goes from one fail
 to a goal: it confirms the failure, finds items that fail the same way (in a local dataset, a public one with
 `--dataset auto`, or rewrites of your prompt) and splits them, stratified, three ways. `--confirm-share`
 (default 0.25) is the share of the failing items kept for confirmation; the split never shrinks validation below
-6 failing items, and gives no confirmation set when fewer than 5 failing items would be left for it.
+the failing items the run needs (7 when an agent may judge 3 attempts after the playbook, 6 for the playbook and
+one steering pass, 5 for one candidate: the smallest k with 0.5^k below alpha / candidates), says so when
+validation has fewer, and gives no confirmation set when fewer than 5 failing items would be left for it. `wsr fix`
+sizes it for the run it starts; `from-failure` alone assumes an agent with the default 3 attempts. Rows of a
+dataset that are wsr's held-back harmful requests are left out.
 
 **Profile.** `wsr profile` runs triage over a dataset and groups the failures (`EMPTY`, `LOOP`,
 `TRUNCATED_LOOP`, `TRUNCATED_WORKING`, `GARBAGE`, `TEMPLATE_LEAK`, `REFUSAL`, `COMPLIED`, `LANGUAGE`,
@@ -941,7 +949,7 @@ Delete cache groups (asks first, unless --yes); remembered consent answers are k
 | Option | Default | What it does |
 |---|---|---|
 | `groups` (optional) |  | models, gguf, datasets, converter, probes, or all |
-| `--model` `KEY` |  | only this model's entries (a key, or its start, as `wsr cache show` lists them) |
+| `--model` `KEY` |  | only this model's entries: a full key, the model's name (all its keys), or the start of one model's keys, as `wsr cache show` lists them; the start of several models' keys is refused |
 | `--yes` |  | delete without asking |
 
 ### `wsr fix`

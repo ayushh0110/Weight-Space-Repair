@@ -147,11 +147,9 @@ from .evaluate import HARM_CHECK                  # noqa: E402 - one name: evalu
 
 def _held_back() -> list[dict]:
     """wsr's built-in harmful requests the harm probe is not calibrated on (the pools minus the probe's sample)."""
-    from ..deep import harmprobe as HP
     from ..deep import refusal_pools as RP
 
-    used = {it["id"] for it in RP.sample(dict(HP.PER_SET))}
-    return sorted((it for it in RP.items("harmful") if it["id"] not in used), key=lambda it: it["id"])
+    return RP.held_back()
 
 
 def harm_mirror() -> list[dict]:

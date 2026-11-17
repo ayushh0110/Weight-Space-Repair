@@ -98,10 +98,10 @@ SOURCES: dict[str, Source] = {s.name: s for s in [
     Source("xstest", "Paul/XSTest", "xstest_prompts.csv",
            "250 safe prompts that sound unsafe, and 200 unsafe ones that must stay refused", "0.05 MB", _xstest,
            "detector:refusal"),
-    Source("wsr-refusal", "", "", "wsr's own refusal contrast pools: 640 safe requests that sound alarming, 240 "
+    Source("wsr-refusal", "", "", "wsr's own refusal contrast pools: 640 safe requests that sound alarming, 200 "
            "harmful ones that must be refused (50 as matched pairs), 61 plain ones. The harm probe is calibrated on "
-           "them: use them as practice data, not for validation", "0.1 MB", _wsr_refusal, "detector:refusal",
-           builtin=True),
+           "them: use them as practice data, not for validation. 40 more harmful requests are held back for wsr's "
+           "own harm check and are not published", "0.1 MB", _wsr_refusal, "detector:refusal", builtin=True),
     Source("ifeval", "google/IFEval", "ifeval_input_data.jsonl", "541 prompts with format instructions (graded by "
            "wsr's detectors only: the IFEval checker is not built)", "0.2 MB", _ifeval, "detector:any"),
     *[Source(f"mgsm-{lg}", "juletxara/mgsm", f"{lg}/test-00000-of-00001.parquet",
