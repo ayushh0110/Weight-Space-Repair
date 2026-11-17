@@ -70,8 +70,13 @@ Known limits:
   as a record in RESULTS.md. The exact sign test is honest about that: with k failing items the best possible p is 0.5^k, so a
   set with 4 failing items cannot confirm anything at 0.05 (the power check says so before the run), and one
   with 5 confirms only when all five are fixed and none is lost. The
-  correction counts the candidate slots of one run (1 or 2), not every run you make on the same validation set;
-  looks are logged, not corrected for.
+  correction (Bonferroni) counts the candidate slots one run declares (the playbook's candidate, a refusal goal's
+  steering pass, and up to 3 agent attempts), not every run you make on the same validation set: looks are logged
+  next to the goal, not corrected for. Several of the goals in RESULTS.md were judged more than once.
+- **Splits are by prompt text, not by prompt family.** `wsr objective split` and `from-failure` deduplicate exact
+  user text; close paraphrases of one prompt can land in different splits, and then count as separate evidence. The
+  test sets in RESULTS.md were written as distinct prompts, but no family ids were recorded. Keeping a family in
+  one split (a `family` field) is open work.
 - **The confirmation registry is local.** A used confirmation set is recorded by its content hash under the
   cache base (`WSR_CACHE_DIR`) and in a note next to the file. Another machine, another cache folder, or a set
   with one item changed is not recognised as used. It guards against accidents, not against someone who wants to
@@ -172,7 +177,8 @@ Known limits:
   harmful requests that are newly answered: on Qwen2.5-1.5B over-refusal the harmful guardrail held at 83% → 93%
   while 10 requests the model used to refuse were answered. Only the regression suite's safety check is per item.
   A per-item limit for refusal guardrails is not built yet.
-- The workspace is a safe subset of Python, not a kernel; an isolated container kernel is not built.
+- The workspace is a restricted numeric language with Python-like syntax, not a kernel; an isolated container
+  kernel is not built.
 - A single slow torch call in the workspace runs to its end (the deadline is checked between operations).
 - The agent's state is rewritten after every turn, up to 1 GB of workspace tensors.
 

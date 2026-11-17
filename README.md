@@ -3,16 +3,18 @@
 > No model fails silently.
 
 When an open-weight model gives a bad reply (blank, looping, the wrong language, a refusal of a harmless
-request), wsr finds out why. Most failures are not the model: they are a chat template, a sampler setting, a
-truncated context or one quantised tensor, and wsr names the cause and the exact fix. A failure that survives
-all of those is traced inside the network at full precision, and wsr looks for the smallest change that repairs
-it: a weight patch, an activation steering, or serving settings. A fix ships only when a judge accepts it on
-data the fix never saw.
+request), wsr finds out why. Many apparent model failures are not the model at all: a chat template, a sampler
+setting, a truncated context or one quantised tensor. wsr tests each of these and names the cause it finds, with
+its evidence and the fix, or says plainly that it found none. A failure that survives all of those is traced
+inside the network at full precision, and wsr looks for the smallest change that repairs it: a weight patch, an
+activation steering, serving settings, or several of these stacked. For a goal measured over a dataset
+(`wsr program`, `wsr fix`), a fix ships only when a statistical judge accepts it on held-out data the fix never
+saw, and then once more on a fresh confirmation set.
 
 | Question | Command | What you get | Needs |
 |---|---|---|---|
 | Is it my setup or the model? | `wsr triage` | one cause and its fix | nothing: no GPU, no dependencies |
-| Did quantisation break it? | `wsr quant`, `wsr qbisect` | the tensor responsible | the GGUF and the original weights |
+| Did quantisation break it? | `wsr quant`, `wsr qbisect` | the tensors responsible (a pruned set, tested on a PyTorch rebuild of the GGUF) | the GGUF and the original weights |
 | Where in the weights? | `wsr deep` | the layer, head or neuron, tested against random controls | the `deep` extra (torch) |
 | Can it be fixed? | `wsr repair`, `wsr fix`, `wsr program` | a patch, a steering or settings, or the reason there is none | the `deep` extra (torch) |
 
@@ -61,10 +63,21 @@ wsr triage --endpoint http://localhost:8080 --model local --prompt "your failing
 ## How a fix is judged
 
 A rule-based playbook goes first; a model with weight-editing tools (a frontier model, or a local one behind any
-OpenAI-compatible server) can take over when it fails. Nothing ships without a paired judge on data the fix
-never saw (an exact sign test and a minimum gain), a regression suite and a semantic canary; refusals of harmful
-requests are kept by default. Every judged fix carries a `MANIFEST.json` that says what it was made for, how it
-was judged and why it shipped or not, and a patch refuses any weights other than the exact ones it was made on.
+OpenAI-compatible server) can take over when it fails.
+
+- **Goals over a dataset** (`wsr program`, `wsr fix`): nothing ships without a paired judge on held-out data the
+  fix never saw (an exact sign test with a Bonferroni correction over every candidate the run may judge, and a
+  minimum gain), the regression suite, a semantic canary and every data guardrail; then one evaluation on a fresh
+  confirmation set decides.
+- **One failing prompt** (`wsr repair`): the fix must fix the prompt and its variants, keep the working ones, pass
+  the regression suite and the canary, and survive rounding to the serving precision; deep mode adds fresh
+  variants and a random control. There is no held-out set to judge it on.
+- **Harmful requests:** the regression suite's harmful requests must each stay refused, and in `wsr program` a
+  held-back set of harmful requests the agent never sees may not lose refusals on net. A fix may change that only
+  when you allow it (`--allow-safety-loss`).
+
+Every judged fix carries a `MANIFEST.json` that says what it was made for, how it was judged and why it shipped or
+not, and a patch refuses any weights other than the exact ones it was made on.
 
 The fixes the judge rejected are reported next to the ones it accepted.
 
@@ -114,8 +127,8 @@ evaluation on a confirmation set, used once, decides whether it ships.
 | Loops in long lists | Qwen2.5-0.5B | a gated neuron (the playbook) | 85.7% → 93.5%, 17 / 5, p 0.008 | 10 / 0, p 0.001 | **shipped, confirmed** |
 | Loops in long lists (fresh) | Qwen2.5-0.5B | the DRY sampler, chosen by the agent over a repetition penalty | 80.7% → 96.2%, 33 / 0 | 30 / 1, p 1.5e-8 | **settings recommended, confirmed** |
 | Over- and under-refusal (OR-Bench) | Qwen2.5-0.5B and 1.5B | probe-gated steering (the playbook) | 19 / 9, 25 / 10, 56 / 4 | 19 / 3, 20 / 4, 48 / 2 | **confirmed** (three goals) |
-| Garbage from damaged weights (planted: 16 columns x200) | Qwen2.5-0.5B | multi-stage, by the agent: the exact restore (the damaged-weights recipe), then a probe-gated refusal calibrated on the restored model with the goal's contrast file (the restore alone answers harmful requests the damaged model only garbled) | 6.1% → 100%, 62 / 0; all 20 held-back harmful requests refused | 51 / 0, p 4e-16 | **steering + patch recommended, confirmed** |
-| Ukrainian answered in Russian (Global-MMLU) | Llama-3.2-1B | multi-stage, by the agent: a learned weight edit, committed, then a harm gate calibrated on it and the DRY sampler, shipped as one | 90.1% → 98.8%, 23 / 1 | 23 / 0, p 1e-7 | **settings + steering + patch recommended, confirmed** |
+| Garbage from damaged weights (planted: 16 columns x200) | Qwen2.5-0.5B | multi-stage, by the agent: the exact restore (the damaged-weights recipe), then a probe-gated refusal calibrated on the restored model with the goal's contrast file (the restore alone answers harmful requests the damaged model only garbled) | 6.1% → 100%, 62 / 0; all 20 held-back harmful requests refused | 51 / 0, p 4e-16 | **steering recommended (with its patch), confirmed**; on 511 independent harmful requests it answers 8%, half as many as the undamaged model (17%) |
+| Ukrainian answered in Russian (Global-MMLU) | Llama-3.2-1B | multi-stage, by the agent: a learned weight edit, committed, then a harm gate calibrated on it and the DRY sampler, shipped as one | 90.1% → 98.8%, 23 / 1 | 23 / 0, p 1e-7 | **settings recommended (with its patch and steering), confirmed** |
 
 The refusal rows are the powered tests: at least 15 failing items in validation, fresh data, the full toolkit.
 Runs that could not show a result (Llama barely over-refuses; runs before the harm probe; sets with 5 to 10 failing

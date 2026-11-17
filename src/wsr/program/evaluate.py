@@ -224,7 +224,7 @@ def power(a: list[float], *, alpha: float = ALPHA, min_gain: float = MIN_GAIN, m
 def decide(p: dict[str, Any], rails_ok: bool, *, alpha: float = ALPHA, min_gain: float = MIN_GAIN,
            m: int = 1) -> dict[str, Any]:
     """The acceptance policy. `m`: the number of candidates this run may judge on the same set; each is tested at
-    alpha / m (Bonferroni; with a run that stops at its first accepted candidate this is also Holm's procedure).
+    alpha / m (Bonferroni over the m candidate slots the run declared before anything was judged).
     Returns {verdict, reason, test, p, p_adjusted, p_worse, m, alpha, min_gain}."""
     out: dict[str, Any] = {"test": "exact one-sided sign test", "alpha": alpha, "min_gain": min_gain, "m": m}
     if not p.get("n"):

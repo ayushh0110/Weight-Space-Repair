@@ -137,8 +137,9 @@ model's other results; the diagnosis, the playbook and the agent then reuse it.
   outliers against the same tensor in other layers, and with the original weights the relative error of every
   tensor against what its type normally loses (AWQ-style folded scales are fitted out first).
 - `wsr qbisect HF_DIR FILE.gguf --prompt "..."`: rebuilds the served model in PyTorch from the GGUF's
-  dequantised weights and swaps tensors back to full precision until the failure goes: the smallest set of
-  tensors to requantise at more bits.
+  dequantised weights and swaps tensors back to full precision until the failure goes, then drops every tensor the
+  fix does not need: a small set (greedy, then pruned) of tensors to requantise at more bits. The rebuild runs in
+  PyTorch, not llama.cpp's integer kernels.
 
 ## Repair: the smallest fix that passes the checks
 
@@ -218,7 +219,9 @@ check it failed) to a frontier model that works through tools. The checks stay t
 **Providers.** `--agent-provider anthropic` (default; Claude, model `claude-opus-5-5` unless
 `--agent-model`; key in `ANTHROPIC_API_KEY`) or `openai` (any OpenAI-compatible server: OpenAI, OpenRouter,
 Together, Groq, DeepSeek, Mistral, Gemini's OpenAI endpoint, or a local llama-server / vLLM / Ollama with
-`--agent-base-url`). Keys come from environment variables only (`--agent-key-env`), never the command line.
+`--agent-base-url`). Keys come from environment variables only (`--agent-key-env`), never the command line. The
+`openai` provider has run live (Gemini, OpenRouter, a local Gemma); the `anthropic` provider is covered by tests but
+not yet by a live run: the Claude results in RESULTS.md used the same model through a test-only driver.
 
 **Tools.**
 
@@ -294,7 +297,8 @@ the tensor itself, no plain rescale of a whole tensor, strengths at most 10; a g
 the positions that must stay unchanged. The input embedding, output layer and final norm are frozen unless you
 unlock them with `--agent-allow` (`embed`, `unembed`, `final_norm`, `rescale`, `large`).
 
-**Its workspace** is a small language, not Python: no imports, files, network, processes or attribute tricks;
+**Its workspace** is a restricted numeric language with Python-like syntax (not Python itself): no imports, files,
+network, processes or attribute tricks;
 every weight it reads is a copy; sizes are checked before anything large is computed (64M elements per value, 2
 GB in all). Every trial edit is undone after the call that tried it. When it needs something its tools do not
 allow, it files a capability request with evidence; the report names the flag that grants it, and
@@ -383,12 +387,17 @@ the playbook fails or its candidate is rejected (the agent hears only that it wa
 | `settings recommended` | serving settings, with the `generation_config.json` keys and llama-server flags in `PROGRAM.md` |
 | `not shipped`, `no candidate`, `nothing to edit` | the numbers and the reason in `PROGRAM.md` |
 
+A fix built in stages (multi-stage surgery: a committed weight patch with a steering and / or settings on top)
+reports the outcome of its top layer, `steering recommended` or `settings recommended`, and ships every part in
+one folder: `patch/` (apply it first, `wsr patch apply`), `steering/` with its hook, `settings.json`, and an
+`APPLY.md` that says to deploy them together. Its `MANIFEST.json` names the kind (`patch+steering`,
+`patch+settings`, `patch+settings+steering`); the judge accepted the parts as one, and none of them alone.
+
 **The judge** (`wsr evaluate`, and inside `program`): the original and the candidate answer the same validation
 items with the same seeds, and the items that changed are counted. `improved` needs:
 
-- the exact one-sided sign test (wins against losses, ties ignored) below `alpha` divided by the number of
-  candidate slots the run has (1, or 2 when an agent may judge a candidate after the playbook; with stopping at
-  the first acceptance this equals Holm's correction);
+- the exact one-sided sign test (wins against losses, ties ignored) below `alpha` divided by m, the number of candidate slots the run declares before anything is judged: 1 for the playbook's candidate, 1 for the playbook's steering pass on a refusal goal whose weight patch was rejected, and 1 per judged agent attempt (3 by default)
+  (a Bonferroni correction: the p-values the judge prints are already adjusted, raw p x m);
 - a gain of at least `min_gain`;
 - at least 5 scored items and every guardrail holding.
 
