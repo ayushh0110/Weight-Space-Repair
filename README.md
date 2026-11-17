@@ -87,8 +87,9 @@ The fixes the judge rejected are reported next to the ones it accepted.
 
 The triage layer combines the techniques of llm-output-guard, llm-stopcheck, LLMDoctor, ModelVet and Raschka's
 repetition checklist into one layered pipeline, with a verdict engine that links symptoms to causes. The repair
-agent follows the weight-space programming of Takehi et al. (2026), with the playbook and the judge in front of
-it. Ported code is listed in `NOTICE`.
+agent follows the weight-space programming of Takehi et al. (2026, MIT CSAIL:
+[Sparks of Weight-Space Programming](https://rikiyat.github.io/blog/weight-space-programming/)), with the playbook
+and the judge in front of it. Ported code is listed in `NOTICE`.
 
 **Documentation:** [docs/GUIDE.md](docs/GUIDE.md) covers every command, check, output file and option;
 [docs/RESULTS.md](docs/RESULTS.md) every result measured so far, with its control;
@@ -381,6 +382,26 @@ given as `WSR_API_KEY` instead of `--api-key`, which keeps it out of the shell h
 python -m pytest -q               # 464 tests; the CUDA comparison is skipped without a GPU, and tests that need
                                   # numpy, torch or an agent SDK are skipped when it is not installed
 python -m ruff check src tests
+```
+
+## Citation
+
+wsr's repair agent builds on weight-space programming, introduced by Takehi, Teoh, Zhang and Khattab at MIT
+CSAIL. If you use the agent, please cite their work:
+
+> Rikiya Takehi, Jayden Teoh, Alex Zhang, and Omar Khattab. "Sparks of Weight-Space Programming: LLMs can natively
+> read & write neural network weights." November 2026.
+> <https://rikiyat.github.io/blog/weight-space-programming/>
+
+```bibtex
+@misc{takehi2026weightspace,
+  title        = {{Sparks of Weight-Space Programming: LLMs can natively read \& write neural network weights}},
+  author       = {Takehi, Rikiya and Teoh, Jayden and Zhang, Alex and Khattab, Omar},
+  year         = {2026},
+  month        = nov,
+  howpublished = {\url{https://rikiyat.github.io/blog/weight-space-programming/}},
+  note         = {Blog post}
+}
 ```
 
 ## Licence
