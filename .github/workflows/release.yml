@@ -65,8 +65,12 @@ jobs:
           python -m venv /tmp/smoke
           /tmp/smoke/bin/pip install dist/*.whl
           /tmp/smoke/bin/wsr --version
+          # The example is a failing reply, so triage exits 1 (findings) by design; anything else is an error.
+          status=0
           /tmp/smoke/bin/wsr triage --response examples/blank_reply/response.json \
-            --request examples/blank_reply/request.json | tee /tmp/smoke-out.txt
+            --request examples/blank_reply/request.json > /tmp/smoke-out.txt || status=$?
+          cat /tmp/smoke-out.txt
+          test "$status" -eq 1 || { echo "::error::wsr triage exited $status, expected 1"; exit 1; }
           grep -q "VERDICT: REQUEST" /tmp/smoke-out.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
