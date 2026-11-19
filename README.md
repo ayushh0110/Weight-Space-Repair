@@ -164,11 +164,16 @@ in [docs/RESULTS.md](https://github.com/ayushh0110/Weight-Space-Repair/blob/main
 Python 3.10 or newer.
 
 ```bash
+pip install wsr                   # triage only: no dependencies (the NaN/Inf weight scan, --scan-values, needs numpy)
+pip install "wsr[deep]"           # + diagnosis, surgery, steering and wsr program (torch, transformers)
+pip install "wsr[deep,agent]"     # + the surgery agent on Claude (or agent-openai for any OpenAI-compatible server)
+```
+
+From source, for the examples and the tests:
+
+```bash
 git clone https://github.com/ayushh0110/Weight-Space-Repair.git
 cd Weight-Space-Repair
-pip install -e .                  # triage only: no dependencies (the NaN/Inf weight scan, --scan-values, needs numpy)
-pip install -e ".[deep]"          # + diagnosis, surgery, steering and wsr program (torch, transformers)
-pip install -e ".[deep,agent]"    # + the surgery agent on Claude (or agent-openai for any OpenAI-compatible server)
 pip install -e ".[dev]"           # + tests and lint
 ```
 

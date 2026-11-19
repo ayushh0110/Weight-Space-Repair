@@ -9,7 +9,7 @@ every release needs its own `## [x.y.z] - YYYY-MM-DD` heading here before it is 
 
 ## [Unreleased]
 
-## [0.1.0] - YYYY-MM-DD
+## [0.1.0] - 2026-11-20
 
 The first release.
 
