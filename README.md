@@ -173,7 +173,7 @@ pip install -e ".[dev]"           # + tests and lint
 ```
 
 On a Mac everything runs on the CPU by default; `--device mps` uses the Apple GPU (opt-in, checked by a
-self-test first; see [Devices](docs/GUIDE.md#devices-cuda-cpu-and-apples-mps)). Triage there reads Metal's share
+self-test first; see [Devices](https://github.com/ayushh0110/Weight-Space-Repair/blob/main/docs/GUIDE.md#devices-cuda-cpu-and-apples-mps)). Triage there reads Metal's share
 of the unified memory and recognises MLX checkpoints.
 
 Core has no dependencies. `jinja2` (templates extra) renders chat templates;
@@ -385,7 +385,7 @@ given as `WSR_API_KEY` instead of `--api-key`, which keeps it out of the shell h
 ## Tests
 
 ```bash
-python -m pytest -q               # 464 tests; the CUDA comparison is skipped without a GPU, and tests that need
+python -m pytest -q               # 484 tests; the CUDA comparison is skipped without a GPU, and tests that need
                                   # numpy, torch or an agent SDK are skipped when it is not installed
 python -m ruff check src tests
 ```

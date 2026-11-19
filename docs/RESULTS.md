@@ -53,7 +53,7 @@ How each part was built is in [DESIGN.md](DESIGN.md); what is not tested is in [
 | Semantic canary | 32 deterministic items (arithmetic, units, sequences, comparisons, facts, instruction formats) with computed or hand-checked answers; only items the original gets right count; at most 1 may be lost |
 | Agents | Claude Opus 5.5 (through a test-only driver for the Kiro CLI, not part of wsr), Gemini 3.8 Flash (AI Studio's OpenAI-compatible endpoint), Nemotron 3 Ultra (OpenRouter free tier), Gemma 4 E2B (local, llama-server on the CPU) |
 | Hardware | GTX 1650 4 GB, CUDA 12.4, float32 by default (float16 for 1.5B), 15 GB RAM |
-| Automated tests | 439 passing, including regression tests built from real model replies |
+| Automated tests | 484 passing, including regression tests built from real model replies |
 
 ## Triage and deep diagnosis: proven against a known answer
 

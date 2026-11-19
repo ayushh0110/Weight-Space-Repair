@@ -417,24 +417,37 @@ def test_the_token_cap_holds_for_providers_without_prices(setup):
     assert "token cap" in out.checks["agent"]["stopped"] and out.checks["agent"]["cost_usd"] == 0
 
 
-def test_cli_agent_provider_fails_early_and_clearly(monkeypatch):
+def _provider_args(**kw):
     import argparse
+    a = dict(agent_provider="openai", agent_model=None, agent_base_url=None, agent_key_env=None,
+             agent_effort=None, agent_price=None)
+    a.update(kw)
+    return argparse.Namespace(**a)
+
+
+def test_cli_agent_provider_fails_early_and_clearly(monkeypatch):
+    """Checked before any SDK is imported, so these hold with or without the agent extras."""
+    import importlib.util
 
     from wsr.cli import _agent_provider
-    a = argparse.Namespace(agent_provider="openai", agent_model=None, agent_base_url=None, agent_key_env=None,
-                           agent_effort=None, agent_price=None)
     with pytest.raises(ValueError, match="--agent-model"):
-        _agent_provider(a)
+        _agent_provider(_provider_args())
+    with pytest.raises(ValueError, match="effort"):
+        _agent_provider(_provider_args(agent_provider="anthropic", agent_effort="bogus"))
+    if importlib.util.find_spec("openai") is None:                # without the SDK: said, with the install line
+        with pytest.raises(ValueError, match="pip install openai"):
+            _agent_provider(_provider_args(agent_model="gpt-x", agent_base_url="http://127.0.0.1:8080/v1"))
+
+
+def test_cli_openai_provider_needs_a_key_unless_the_server_is_local(monkeypatch):
+    pytest.importorskip("openai")
+    from wsr.cli import _agent_provider
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    a.agent_model = "gpt-x"
+    a = _provider_args(agent_model="gpt-x")
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
         _agent_provider(a)
     a.agent_base_url = "http://127.0.0.1:8080/v1"                 # a local server needs no key
     assert _agent_provider(a).name == "openai-compatible:gpt-x@http://127.0.0.1:8080/v1"
-    a2 = argparse.Namespace(agent_provider="anthropic", agent_model=None, agent_key_env=None, agent_effort="bogus",
-                            agent_base_url=None, agent_price=None)
-    with pytest.raises(ValueError, match="effort"):
-        _agent_provider(a2)
 
 
 # -- agent state: saved every turn, --resume continues, drafts come back first -----------------------------
