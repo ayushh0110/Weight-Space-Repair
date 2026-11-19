@@ -16,12 +16,13 @@ generated from the CLI itself.
 7. [Weight-space programming: goals, profiles and the held-out judge](#weight-space-programming-goals-profiles-and-the-held-out-judge)
 8. [What a fix is made for: identity, manifest, evidence](#what-a-fix-is-made-for-identity-manifest-evidence)
 9. [Backends: PyTorch and llama-server](#backends-pytorch-and-llama-server)
-10. [Safety: what wsr will not do without you](#safety-what-wsr-will-not-do-without-you)
-11. [Caching](#caching)
-12. [Files wsr writes](#files-wsr-writes)
-13. [Environment variables](#environment-variables)
-14. [Exit codes](#exit-codes)
-15. [Command reference](#command-reference)
+10. [Devices: CUDA, CPU and Apple's MPS](#devices-cuda-cpu-and-apples-mps)
+11. [Safety: what wsr will not do without you](#safety-what-wsr-will-not-do-without-you)
+12. [Caching](#caching)
+13. [Files wsr writes](#files-wsr-writes)
+14. [Environment variables](#environment-variables)
+15. [Exit codes](#exit-codes)
+16. [Command reference](#command-reference)
 
 ## Which command for which question
 
@@ -474,6 +475,47 @@ auto` exports the original (cached) and the candidate to GGUF and judges on them
 always runs on PyTorch. A server wsr starts is placed on the GPU only when it fits next to what is loaded, is
 stopped when free disk falls below 2 GB, and is stopped when wsr exits.
 
+## Devices: CUDA, CPU and Apple's MPS
+
+`--device auto` (the default) uses an NVIDIA GPU when PyTorch sees one, else the CPU, on every machine: a Mac too.
+`--device cuda:1` picks a GPU. Precision (`--dtype auto`) is float32 wherever it fits, else bfloat16 or float16.
+
+**Apple Silicon (MPS, opt-in).** `--device mps` runs the full-precision model on the Mac's GPU. wsr does not choose
+it by itself, because MPS results have not yet been checked across Macs (see LIMITATIONS.md), and it checks a Mac
+before using it:
+
+- MPS must be usable: a Mac with Apple Silicon, macOS 14 or later, a torch build with MPS, and a tensor that really
+  runs there. If not, the command stops with the reason, as it would for a missing CUDA device.
+- A self-test, once per chip, macOS and library versions (kept in the `device` cache group; a few seconds, once): a tiny
+  model built in code runs on the CPU and on MPS. Logits must agree, two greedy runs must give the same tokens, a
+  batched row must match the row alone, and a weight restored from its copy must be bit-identical. An op MPS lacks
+  (an SVD) must run through PyTorch's CPU fallback, which wsr turns on (`PYTORCH_ENABLE_MPS_FALLBACK=1`) when it is
+  imported before torch. A failure prints which check failed, and the run uses the CPU.
+- After loading, the real model generates a short reply twice. The judge compares the original and the candidate
+  on the same device, which only means something when a run repeats exactly; if it does not, the run uses the CPU.
+
+Memory on a Mac is shared: Metal lets the GPU use about two thirds of the RAM (three quarters above 36 GB;
+`sysctl iogpu.wired_limit_mb` raises it). Batches, `fit_edit`'s memory check and the choice between float32 and
+half precision all use the smaller of what Metal and the RAM still allow. Float64 never goes to MPS (Metal has
+none): the weights checksum in cache keys is summed on the CPU. A cache entry made on MPS names the chip and the
+macOS version, so it is never reused by another device or macOS release.
+
+`python scripts/check_mps.py [model folder]` measures more on your Mac (logits against the CPU, greedy replies,
+batching, speed) and writes a report; an "MPS report" issue with it helps decide when `--device auto` may pick
+MPS.
+
+**Elsewhere on a Mac**, with no GPU needed:
+
+- `wsr config` compares a model's memory need with the GPU's share of the unified memory, not the whole RAM: a
+  model that fits the RAM but not Metal's share is a warning (llama.cpp would run part of it on the CPU).
+- An MLX checkpoint (mlx-community, LM Studio's MLX engine) is recognised: its quantisation is reported
+  ("MLX 4-bit (group 64)"), it is not treated as full precision, and `wsr deep` says it needs the full-precision
+  model it was converted from.
+- A llama-server wsr starts is placed against Metal's share too, and wsr finds Homebrew's `llama-server` when its
+  folder is not on PATH.
+- Memory headroom counts macOS's swap only as far as the system disk can hold it above 3 GB free (macOS grows its
+  swap files onto the disk).
+
 ## Safety: what wsr will not do without you
 
 - **Refusals are kept.** A fix that stops refusing a harmful request the model refused before fails the
@@ -524,6 +566,7 @@ confirmation set stays used. `WSR_CACHE=off` turns caching off.
 | `WSR_CACHE_DIR` | where wsr keeps its cache and remembered answers (default `~/.cache/wsr`) |
 | `WSR_DATA_DIR` | where converted datasets go (default `~/.cache/wsr/datasets`) |
 | `WSR_BATCH=off`, `WSR_MAX_BATCH=N` | turn batched generation off, or cap the batch |
+| `PYTORCH_ENABLE_MPS_FALLBACK` | on a Mac, wsr sets it to 1 when it is not set (MPS ops it lacks run on the CPU) |
 | `WSR_ASSUME`, `WSR_ALLOW`, `WSR_DENY` | answer wsr's questions in scripts (`yes` / `no`, or kinds) |
 | `WSR_LLAMA_SERVER`, `WSR_LLAMA_CPP` | the llama-server binary, and a llama.cpp checkout with the converter |
 | `WSR_API_KEY` | the key of the server under triage (instead of `--api-key`) |
@@ -683,7 +726,7 @@ Layer 7: weight-level diagnosis on a full-precision HF model (needs torch).
 | `--expect-lang` |  | expected answer language (for wrong-language failures) |
 | `--max-new` | `48` | tokens generated per run (default 48) |
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
-| `--device` | `auto` | auto (CUDA when available), cpu, cuda, cuda:1 ... |
+| `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first) |
 | `--no-thinking` |  | render the template with enable_thinking=false |
 | `--base` |  | base model directory, to measure how much fine-tuning changed the culprits |
 | `--gguf` |  | the quantised file in use: quantisation error of the implicated tensors |
@@ -709,7 +752,7 @@ Surgery: diagnose (as wsr deep), then find and verify the smallest weight edit t
 | `--expect-lang` |  | expected answer language (for wrong-language failures) |
 | `--max-new` | `48` | tokens generated per run (default 48) |
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
-| `--device` | `auto` | auto (CUDA when available), cpu, cuda, cuda:1 ... |
+| `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first) |
 | `--no-thinking` |  | render the template with enable_thinking=false |
 | `--base` |  | base model directory, to measure how much fine-tuning changed the culprits |
 | `--gguf` |  | the quantised file in use: quantisation error of the implicated tensors |
@@ -800,7 +843,7 @@ Which quantised tensor causes a failure: rebuild the served model from the GGUF 
 | `--expect-lang` |  | language the reply must be in |
 | `--max-new` | `64` | tokens generated per reply |
 | `--max-set` | `24` | largest tensor set to try before calling it diffuse |
-| `--device` | `auto` | auto (CUDA when available), cpu, cuda, cuda:1 ... |
+| `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first by a self-test and a repeat check; on a failure the run uses the CPU) |
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
 | `--no-thinking` |  | render the chat template with enable_thinking=false |
 | `--json` |  | machine-readable report |
@@ -870,7 +913,7 @@ Turn a failure (a prompt, or a profile group) into a goal file: confirm it, find
 | `--seed` | `0` | random seed |
 | `--out-dir` |  | where goal.json, practice/ and heldout/ are written |
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
-| `--device` | `auto` | auto (CUDA when available), cpu, cuda, cuda:1 ... |
+| `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first by a self-test and a repeat check; on a failure the run uses the CPU) |
 | `--backend` `auto\|torch\|llama-server` | `auto` | auto: llama-server when its binary and --gguf are there and you agree to start it (faster for long or many replies), else PyTorch; torch: always the full-precision model |
 | `--gguf` |  | GGUF of the model, for the llama-server backend |
 | `--endpoint` |  | an already-running llama-server (http://host:port): used as is, nothing started |
@@ -904,7 +947,7 @@ Work towards a goal file: profile the practice set, diagnose the largest weight-
 | `--judge-quant` | `Q8_0` | GGUF type the llama-server judge serves (default Q8_0) |
 | `--fast` |  | the playbook's fast checks instead of deep ones (no fresh variants or random control; the held-out judge still decides) |
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
-| `--device` | `auto` | auto (CUDA when available), cpu, cuda, cuda:1 ... |
+| `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first by a self-test and a repeat check; on a failure the run uses the CPU) |
 | `--agent` |  | when the rule-based playbook cannot fix it, hand the diagnosis and every failed trial to a frontier model with tools to inspect and edit the weights; only a patch that passes the same checks is accepted |
 | `--agent-provider` `anthropic\|openai` | `anthropic` | anthropic: Claude (ANTHROPIC_API_KEY, pip install anthropic); openai: any model behind the OpenAI Chat Completions API - OpenAI itself, or with --agent-base-url any compatible server: OpenRouter, Together, Groq, DeepSeek, Mistral, Gemini's OpenAI endpoint, a local vLLM / Ollama / llama-server (pip install openai) |
 | `--agent-model` |  | the agent's model id (anthropic default: claude-opus-5-5; openai: required) |
@@ -985,7 +1028,7 @@ One command, one model load: from a failing prompt to a judged patch (objective 
 | `--judge` `auto\|torch\|llama-server` | `auto` | where the held-out judge runs: auto (llama-server when there and allowed), torch, llama-server |
 | `--judge-quant` | `Q8_0` | GGUF type the llama-server judge serves |
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
-| `--device` | `auto` | auto (CUDA when available), cpu, cuda, cuda:1 ... |
+| `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first by a self-test and a repeat check; on a failure the run uses the CPU) |
 | `--agent` |  | when the rule-based playbook cannot fix it, hand the diagnosis and every failed trial to a frontier model with tools to inspect and edit the weights; only a patch that passes the same checks is accepted |
 | `--agent-provider` `anthropic\|openai` | `anthropic` | anthropic: Claude (ANTHROPIC_API_KEY, pip install anthropic); openai: any model behind the OpenAI Chat Completions API - OpenAI itself, or with --agent-base-url any compatible server: OpenRouter, Together, Groq, DeepSeek, Mistral, Gemini's OpenAI endpoint, a local vLLM / Ollama / llama-server (pip install openai) |
 | `--agent-model` |  | the agent's model id (anthropic default: claude-opus-5-5; openai: required) |
@@ -1053,7 +1096,7 @@ Triage verdicts over a dataset: failure groups, rates and their causes (from tes
 | `--seed` | `0` | random seed |
 | `--out` |  | write the profile JSON here (the agent's brief reads it) |
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
-| `--device` | `auto` | auto (CUDA when available), cpu, cuda, cuda:1 ... |
+| `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first by a self-test and a repeat check; on a failure the run uses the CPU) |
 | `--backend` `auto\|torch\|llama-server` | `auto` | auto: llama-server when its binary and --gguf are there and you agree to start it (faster for long or many replies), else PyTorch; torch: always the full-precision model |
 | `--gguf` |  | GGUF of the model, for the llama-server backend |
 | `--endpoint` |  | an already-running llama-server (http://host:port): used as is, nothing started |
@@ -1082,7 +1125,7 @@ Score a model, or a patch against the original, on a goal file's held-out set an
 | `--no-guardrails` |  | score the main set only |
 | `--out` |  | write the result JSON here |
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
-| `--device` | `auto` | auto (CUDA when available), cpu, cuda, cuda:1 ... |
+| `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first by a self-test and a repeat check; on a failure the run uses the CPU) |
 | `--backend` `auto\|torch\|llama-server` | `auto` | auto: llama-server when its binary and --gguf are there and you agree to start it (faster for long or many replies), else PyTorch; torch: always the full-precision model |
 | `--gguf` |  | GGUF of the model, for the llama-server backend |
 | `--endpoint` |  | an already-running llama-server (http://host:port): used as is, nothing started |

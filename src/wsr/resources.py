@@ -7,8 +7,9 @@ committed at idle by other software; loading a 1B model in PyTorch added 6 GB.
 
 `headroom()` is the extra memory a step can commit before the page file would have to eat into the last
 `DISK_FLOOR` of the system drive. Optional heavy steps (starting llama-server, converting to GGUF) check it and
-are skipped, with the reason, when they do not fit. Elsewhere it is free RAM plus swap (Linux / macOS do not
-grow swap onto the disk this way).
+are skipped, with the reason, when they do not fit. Elsewhere it is free RAM plus swap. macOS grows its swap
+files onto the system disk as memory runs short, as Windows grows its page file, so there the swap counted is at
+most what the disk can still give above the same `DISK_FLOOR` (Linux's swap does not grow).
 """
 from __future__ import annotations
 
@@ -64,9 +65,12 @@ def headroom() -> Optional[int]:
     try:
         import psutil  # type: ignore
         vm, sw = psutil.virtual_memory(), psutil.swap_memory()
-        return int(vm.available + sw.free)
     except ImportError:
         return None
+    swap = int(sw.free)
+    if sys.platform == "darwin" and disk is not None:
+        swap = min(swap, max(0, disk - DISK_FLOOR))     # never more than before: less when the disk is nearly full
+    return int(vm.available) + swap
 
 
 def check(step: str, need: int) -> Optional[str]:

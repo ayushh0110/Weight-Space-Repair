@@ -58,7 +58,9 @@ def _is_full_precision(spec: Optional[ModelSpec], model_dir: Optional[Path]) -> 
         cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return "quantization_config" not in cfg
+    from .config_checks import mlx_quantization
+
+    return "quantization_config" not in cfg and mlx_quantization(cfg) is None   # MLX's packed weights too
 
 
 def _prompt_tokens_estimate(messages: list[dict]) -> int:

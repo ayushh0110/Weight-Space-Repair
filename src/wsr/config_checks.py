@@ -104,10 +104,29 @@ def _ids(v: Any) -> list[int]:
     return []
 
 
+def mlx_quantization(cfg: dict) -> Optional[dict]:
+    """The quantisation block of an MLX checkpoint (mlx-lm writes `quantization`, and the same as
+    `quantization_config`, with `bits` and `group_size` and no `quant_method`, which Hugging Face's own quantised
+    formats always name), or None. Its weights are packed integers with per-group scales: Apple's MLX and LM Studio
+    on a Mac run them, transformers does not."""
+    for k in ("quantization", "quantization_config"):
+        q = cfg.get(k)
+        if isinstance(q, dict) and "bits" in q and "group_size" in q and "quant_method" not in q:
+            return q
+    return None
+
+
+def mlx_label(q: dict) -> str:
+    return f"MLX {q.get('bits')}-bit (group {q.get('group_size')})"
+
+
 def load_hf(d: Path) -> ModelSpec:
     s = ModelSpec("hf", d)
     cfg = _load_json(d / "config.json") or {}
     s.meta = cfg
+    mq = mlx_quantization(cfg)
+    if mq:
+        s.quant = mlx_label(mq)
     text_cfg = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
     get = lambda k: text_cfg.get(k, cfg.get(k))  # noqa: E731
     s.arch = (cfg.get("architectures") or [cfg.get("model_type")])[0]
@@ -512,6 +531,12 @@ def _ram_bytes() -> Optional[int]:
 
 
 def _vram_bytes() -> Optional[int]:
+    """The GPU's memory: NVIDIA's from nvidia-smi; on Apple Silicon the share of the unified memory Metal lets the
+    GPU use (macos.gpu_limit_bytes), which is what decides whether a model runs on the GPU there."""
+    from . import macos
+
+    if macos.apple_silicon():
+        return macos.gpu_limit_bytes()
     if not shutil.which("nvidia-smi"):
         return None
     try:
@@ -542,7 +567,10 @@ def check_memory(spec: ModelSpec, target_ctx: int = 32768) -> list[Finding]:
     gib = lambda b: f"{b / 2**30:.1f} GiB"  # noqa: E731
     ev = dict(weights=spec.weights_bytes, kv_cache=kv, context=ctx, ram=ram, vram=vram)
     budget = vram or ram
-    where = "VRAM" if vram else "RAM"
+    from . import macos
+
+    where = ("GPU memory (Metal's share of the unified memory)" if vram and macos.apple_silicon() else
+             "VRAM" if vram else "RAM")
     if budget is None:
         return [_f("MEMORY_FIT_UNKNOWN", Severity.SKIP, f"need ~{gib(need)}; could not read system memory", **ev)]
     msg = f"weights {gib(spec.weights_bytes)} + f16 KV at {ctx} tokens {gib(kv)} = {gib(need)} vs {where} {gib(budget)}"
@@ -558,8 +586,19 @@ def check_memory(spec: ModelSpec, target_ctx: int = 32768) -> list[Finding]:
 
 
 def check_quant(spec: ModelSpec) -> list[Finding]:
-    if spec.kind != "gguf" or not spec.quant:
+    if not spec.quant:
         return []
+    if spec.kind != "gguf":                              # an MLX checkpoint (load_hf): the only HF quant read
+        mq = mlx_quantization(spec.meta or {}) or {}
+        bits = mq.get("bits")
+        if isinstance(bits, int) and bits <= 3 and spec.weights_bytes < 3 * 2**30:
+            return [_f("LOW_BIT_SMALL_MODEL", Severity.WARN,
+                       f"{spec.quant} on a small model: 2- and 3-bit quants of small models are loop- and "
+                       "garbage-prone", "try the 4-bit or 8-bit MLX conversion before blaming the weights",
+                       cause=Cause.QUANTISATION, source="troubleshooting guides", quant=spec.quant)]
+        return [_f("QUANT_INFO", Severity.INFO, f"quantisation {spec.quant}: Apple's MLX format (LM Studio, mlx-lm); "
+                   "wsr's deep tools need the original full-precision weights", cause=Cause.QUANTISATION,
+                   quant=spec.quant)]
     low = spec.quant.startswith(("Q2", "Q3", "IQ1", "IQ2", "IQ3", "TQ"))
     small = spec.weights_bytes < 3 * 2**30
     if low and small:

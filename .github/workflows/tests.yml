@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:        # release.yml runs the whole suite before it builds anything
 
 concurrency:
   group: tests-${{ github.ref }}
@@ -27,9 +28,11 @@ jobs:
         include:
           - os: windows-latest
             python: "3.12"
+          - os: macos-14
+            python: "3.12"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
       - name: Install (core, no dependencies, plus test tools)
@@ -46,12 +49,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - name: Install CPU torch
         run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install (deep extra, both agent SDKs, plus test tools)
+        run: python -m pip install -e ".[dev,deep,yaml,agent,agent-openai]"
+      - name: Tests
+        run: python -m pytest -q -ra
+
+  # The same on a Mac (Apple Silicon). GitHub's Macs have no usable GPU (they can even report MPS as available when it
+  # is not), so this runs on CPU torch: it catches what differs on macOS itself. MPS's own code paths are tested with
+  # stand-ins in tests/test_device.py; MPS on a real Mac is checked by scripts/check_mps.py (an "MPS report" issue).
+  deep-macos:
+    name: deep (macOS, CPU torch, Python 3.12)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install torch (the macOS wheel)
+        run: python -m pip install torch
       - name: Install (deep extra, both agent SDKs, plus test tools)
         run: python -m pip install -e ".[dev,deep,yaml,agent,agent-openai]"
       - name: Tests

@@ -1,0 +1,60 @@
+name: Wrong verdict or a missed failure
+description: wsr named the wrong cause, or did not catch a failure your model or server has.
+labels: ["verdict"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These reports are the most useful kind: they show where wsr's checks fall short on real setups.
+        Please remove anything private (keys, prompts you cannot share) before attaching files.
+  - type: textarea
+    id: failure
+    attributes:
+      label: What the model did
+      description: The failing reply (blank, a loop, the wrong language, a refusal...) and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: The wsr command you ran
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: verdict
+    attributes:
+      label: What wsr said
+      description: The verdict block, or better the full `--json` report.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: cause
+    attributes:
+      label: The real cause, if you know it
+      description: For example a setting that fixed it, or a template or server bug.
+  - type: input
+    id: model
+    attributes:
+      label: Model and file
+      placeholder: "Qwen2.5-0.5B-Instruct, Q4_K_M GGUF"
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Server and version
+      placeholder: "llama-server b10244, Ollama 0.x, vLLM 0.x, transformers 4.x"
+  - type: input
+    id: version
+    attributes:
+      label: wsr version
+      description: Output of `wsr --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Request and response files
+      description: "`wsr triage ... --handoff DIR` writes them; attach failing_request.json and response.json if you can."

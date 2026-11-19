@@ -24,3 +24,6 @@ agent_proposals/
 # Secrets
 .env
 *.key
+
+# Launch drafts (kept local)
+launch/

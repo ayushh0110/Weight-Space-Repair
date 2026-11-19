@@ -1,0 +1,41 @@
+name: MPS report (Apple Silicon)
+description: Results of scripts/check_mps.py on your Mac. A few reports from different Macs decide whether wsr may use MPS by default.
+labels: ["mps-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for checking wsr on Apple's GPU. On your Mac, from the repository folder:
+
+        ```
+        pip install -e ".[deep]"
+        python scripts/check_mps.py                          # the self-test (a tiny model, no download)
+        python scripts/check_mps.py ./Qwen2.5-0.5B-Instruct  # and a real model, if you have one
+        ```
+
+        It writes `mps_report.json` and prints a summary. A report that does not pass is just as useful.
+  - type: textarea
+    id: summary
+    attributes:
+      label: The printed summary
+      description: Everything from "self-test on mps" to the PASS / NOT PASSED line.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac, chip, memory and macOS
+      placeholder: "MacBook Air, M2, 16 GB, macOS 14.5"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: The model you checked (if any)
+      placeholder: "Qwen/Qwen2.5-0.5B-Instruct"
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Warnings printed during the run, other wsr commands you tried with --device mps, how they went.

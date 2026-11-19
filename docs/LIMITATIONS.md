@@ -11,6 +11,16 @@ in [DESIGN.md](DESIGN.md).
   Llama-3.2-1B-Instruct, Qwen3.5-0.8B, and a tiny random Qwen3.5 for the hybrid linear-attention path. Qwen3.5-0.8B
   was too slow on this GPU for a refusal test (its hybrid layers generate one prompt at a time). Nothing larger has been verified. On a 4 GB GPU, models
   above about 1.5B do not fit for editing.
+- **Apple's MPS is opt-in and not yet measured on a Mac.** It was built without one: its code paths are tested
+  with stand-ins, the self-test's checks on CPU and CUDA, and macOS itself on CPU in CI (GitHub's Macs have no
+  usable GPU). Each Mac checks itself before MPS is used (a self-test and a repeat check, falling back to the CPU),
+  which catches unsound or non-repeatable results, not every difference a large model could show. `--device auto`
+  does not pick MPS until `scripts/check_mps.py` reports from real Macs agree; until then a run on MPS is checked
+  but unmeasured. Metal's share of the unified memory is macOS's default estimate unless PyTorch or
+  `iogpu.wired_limit_mb` gives the exact figure. The CPU fallback for ops MPS lacks is set only when wsr is
+  imported before torch (every `wsr` command; a script that imports torch first must set it itself).
+- **MLX checkpoints are recognised, not loaded.** Triage reads them; the deep tools need the full-precision model
+  they were converted from.
 - **Gemma and Mistral are untested** at the weight level. Writer shares assume a plain pre-norm residual;
   Gemma's extra norms rescale each write, so they are approximate there.
 - **Surgery removes, suppresses or redirects behaviour the model already has.** It cannot add knowledge or

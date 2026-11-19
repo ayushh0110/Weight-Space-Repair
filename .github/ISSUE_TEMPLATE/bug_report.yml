@@ -1,0 +1,42 @@
+name: Bug report
+description: wsr crashed, hung, wrote something wrong, or a command does not do what the docs say.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: The command you ran
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output or traceback
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: wsr version
+      description: Output of `wsr --version`.
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Python, OS, and torch / CUDA if used
+      placeholder: "Python 3.12, Ubuntu 24.04, torch 2.6 + CUDA 12.4, GTX 1650 4 GB"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Which model, and its size, if the command loads one.

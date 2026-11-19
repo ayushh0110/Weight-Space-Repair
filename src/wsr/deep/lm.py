@@ -102,6 +102,8 @@ def auto_dtype(path: Path, device: str) -> str:
     also 3.6x slower. Only a model too large for float32 drops to bfloat16
     (Ampere and newer) or float16.
     """
+    if device.startswith("mps"):
+        return _mps_dtype(path)
     if not device.startswith("cuda"):
         return "float32"
     need = _weight_bytes_fp32(path)
@@ -113,6 +115,51 @@ def auto_dtype(path: Path, device: str) -> str:
         return "float32"
     major, _ = torch.cuda.get_device_capability(torch.device(device))
     return "bfloat16" if major >= 8 else "float16"
+
+
+def _not_mlx(path: Path) -> None:
+    """A clear message for an MLX checkpoint (packed integer weights for Apple's MLX), which transformers would fail
+    on deep inside loading."""
+    from ..config_checks import mlx_label, mlx_quantization
+
+    try:
+        cfg = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    q = mlx_quantization(cfg) if isinstance(cfg, dict) else None
+    if q:
+        raise ValueError(f"{path.name} is an {mlx_label(q)} checkpoint (Apple's MLX format): wsr's deep tools load "
+                         "full-precision Hugging Face weights. Use the model it was converted from (an mlx-community "
+                         "model's card names it), and keep the MLX files for serving")
+
+
+def _mps_dtype(path: Path, bf16: Optional[bool] = None) -> str:
+    """On MPS, as on CUDA: float32 when it fits the memory Metal leaves (unified memory: the RAM's share too), else
+    bfloat16 where this Mac offers it (the self-test tries it), else float16."""
+    from . import device as D
+
+    need = _weight_bytes_fp32(path)
+    if need is not None and need * 1.25 + (768 << 20) <= D.mps_free_bytes():
+        return "float32"
+    if bf16 is None:
+        bf16 = bool(D.self_test().get("bfloat16"))
+    return "bfloat16" if bf16 else "float16"
+
+
+def _mps_ready(device: str) -> str:
+    """The device a request for MPS ends up on: "mps" when it can be used and the self-test passes, "cpu" (with the
+    reason printed) when the self-test fails. A machine where MPS cannot be used at all is an error, as a missing
+    CUDA device is."""
+    from . import device as D
+
+    why = D.mps_problem()
+    if why:
+        raise ValueError(why)
+    st = D.self_test()
+    if not st.get("passed"):
+        D.note(f"MPS failed wsr's self-test ({st.get('why')}); running on the CPU instead")
+        return "cpu"
+    return device
 
 
 TRANSFORMERS_MIN = (4, 56)
@@ -193,8 +240,11 @@ class LM:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         _need_transformers(transformers.__version__)
+        _not_mlx(Path(str(path)))
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device.startswith("mps"):                     # opt-in only: auto never picks MPS
+            device = _mps_ready(device)
         if dtype == "auto":
             dtype = auto_dtype(Path(str(path)), device)
         dt = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
@@ -207,6 +257,15 @@ class LM:
         lm = cls(model, tok, name=Path(str(path)).name)
         lm.checkpoint_dtype = _checkpoint_dtype(Path(str(path)))
         lm.path = Path(str(path))
+        if lm.device.type == "mps":
+            # The judge pairs runs on one device: that only means something when a run repeats exactly.
+            from . import device as D
+
+            why = D.repeat_problem(lm)
+            if why:
+                D.note(f"on MPS {why}; running on the CPU instead")
+                lm.model.to("cpu")
+                D.empty_cache("mps")
         return lm
 
     # -- structure ------------------------------------------------------------
@@ -375,8 +434,9 @@ class LM:
             except Exception as e:                     # noqa: BLE001 - only memory errors are retried
                 if not BT.is_oom(e) or len(chunk) == 1:
                     raise
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
+                if self.device.type in ("cuda", "mps"):
+                    from .device import empty_cache
+                    empty_cache(self.device)
                 h = len(chunk) // 2
                 queue[:0] = [chunk[:h], chunk[h:]]          # split this chunk; the plan is updated below
                 self._count("batch_oom")
@@ -665,8 +725,9 @@ class LM:
             except Exception as e:                     # noqa: BLE001 - only memory errors are retried
                 if not BT.is_oom(e) or len(chunk) == 1:
                     raise
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
+                if self.device.type in ("cuda", "mps"):
+                    from .device import empty_cache
+                    empty_cache(self.device)
                 h = len(chunk) // 2
                 queue[:0] = [chunk[:h], chunk[h:]]
                 self._count("batch_oom")

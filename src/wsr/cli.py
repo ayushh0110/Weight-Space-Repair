@@ -337,7 +337,7 @@ def _deep_opts(d: argparse.ArgumentParser) -> None:
     d.add_argument("--max-new", type=int, default=48, help="tokens generated per run (default 48)")
     d.add_argument("--dtype", default="auto", choices=["auto", "float32", "bfloat16", "float16"],
                    help="auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16")
-    d.add_argument("--device", default="auto", help="auto (CUDA when available), cpu, cuda, cuda:1 ...")
+    d.add_argument("--device", default="auto", help="auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first)")
     d.add_argument("--no-thinking", action="store_true", help="render the template with enable_thinking=false")
     d.add_argument("--base", help="base model directory, to measure how much fine-tuning changed the culprits")
     d.add_argument("--gguf", help="the quantised file in use: quantisation error of the implicated tensors")
@@ -746,7 +746,7 @@ HELP = {
     "agent_turns": "stop the agent after this many turns",
     "ctx": "context size for the memory-fit estimate",
     "data": "JSONL file to shuffle and split",
-    "device": "auto (CUDA when available), cpu, cuda, cuda:1 ...",
+    "device": "auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first by a self-test and a repeat check; on a failure the run uses the CPU)",
     "dtype": "auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16",
     "endpoint": "the server's base URL, e.g. http://localhost:8080",
     "eval_limit": "held-out items the judge scores (default: all)",

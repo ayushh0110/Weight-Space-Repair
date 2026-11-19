@@ -1,0 +1,53 @@
+# Changelog
+
+All notable changes to wsr are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the version is 0.x, a minor
+release may change commands, file formats or defaults; each change is listed under its release.
+
+The release workflow publishes the section whose heading matches the pushed tag as the GitHub Release notes, so
+every release needs its own `## [x.y.z] - YYYY-MM-DD` heading here before it is tagged.
+
+## [Unreleased]
+
+## [0.1.0] - YYYY-MM-DD
+
+The first release.
+
+### Added
+
+- **Triage** (`wsr triage`, and the single layers `file`, `config`, `response`, `output`, `probe`): seven layers
+  (file, config, request and response, output, live probes with one-factor reruns, known issues) and a verdict that
+  names one cause and its fix. No GPU and no dependencies.
+- **Deep diagnosis** (`wsr deep`): token trace, failure direction, patching of layers, heads and neurons, known
+  directions (refusal, end-of-turn, language, repetition), calibrated language and loop probes, the harm probe for
+  refusal failures, causal tests against random controls.
+- **Quantisation** (`wsr quant`, `wsr qbisect`): GGUF tensor health, error against the original weights, and
+  bisection to the tensors that cause a failure.
+- **Repair** (`wsr repair`): a playbook of verified weight edits (damaged weights brought back to scale, direction
+  removal, local projection, neuron and head scaling, gated neurons), then activation steering (add, clamp, or
+  probe-gated); checked on the failing and working prompts, a regression suite that keeps refusals, a semantic
+  canary and serving precision.
+- **Surgery agent** (`--agent`): Claude or any OpenAI-compatible model with weight-editing tools in a restricted
+  numeric workspace, multi-stage surgery (`commit_edit`, `revert_edit`), and `--resume`.
+- **Weight-space programming** (`wsr objective`, `profile`, `evaluate`, `program`, `fix`): goal files with
+  practice, validation and confirmation sets, a paired held-out judge (exact sign test with a Bonferroni
+  correction, a minimum gain, guardrails), and a confirmation set used once.
+- **Shipping and provenance** (`wsr patch apply | revert | export | show | check`): exact SHA-256 identity of every
+  tensor of the base model, a `MANIFEST.json` per judged fix, export to GGUF through llama.cpp.
+- llama-server and batched PyTorch backends, per-model caches (`wsr cache`), and questions before any download,
+  conversion or server start (`wsr consent`).
+- **Apple Silicon** (`--device mps`, opt-in): before a model goes on MPS, wsr checks the Mac (Apple Silicon,
+  macOS 14+, a torch build with MPS), runs a self-test once per chip, macOS and library versions (CPU against MPS
+  on a tiny model built in code: logits, repeated greedy runs, batching, bit-exact restores, the CPU fallback for
+  missing ops), and checks that the real model's greedy reply repeats; on a failure the run uses the CPU and says
+  why. `--device auto` picks CUDA, else the CPU, on every machine. `scripts/check_mps.py` measures a real model on
+  a Mac, and an "MPS report" issue form collects the results.
+- **On a Mac, without MPS:** triage's memory check uses Metal's share of the unified memory; MLX checkpoints are
+  recognised (their quantisation reported, not treated as full precision, a clear message from `wsr deep`); a
+  llama-server wsr starts is placed against Metal's share, and Homebrew's `llama-server` is found off PATH;
+  memory headroom counts swap only as far as the system disk can hold it.
+- Continuous integration: core tests on Linux, Windows and macOS with no optional dependencies, deep tests on CPU
+  torch on Linux and macOS.
+
+[Unreleased]: https://github.com/ayushh0110/Weight-Space-Repair/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ayushh0110/Weight-Space-Repair/releases/tag/v0.1.0

@@ -177,6 +177,9 @@ class ServerBackend:
 
 # -- starting a llama-server -----------------------------------------------------------------------------
 
+MAC_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")     # Homebrew on Apple Silicon, then on Intel Macs
+
+
 def find_llama_server(explicit: Optional[str] = None) -> Optional[Path]:
     for c in (explicit, os.environ.get("WSR_LLAMA_SERVER")):
         if c:
@@ -186,7 +189,15 @@ def find_llama_server(explicit: Optional[str] = None) -> Optional[Path]:
             if p.exists():
                 return p
     w = shutil.which("llama-server") or shutil.which("llama-server.exe")
-    return Path(w) if w else None
+    if w:
+        return Path(w)
+    from .. import macos
+    if macos.is_mac():                                   # Homebrew's, when its bin folder is not on PATH
+        for d in MAC_BIN_DIRS:
+            p = Path(d) / "llama-server"
+            if p.is_file() and os.access(p, os.X_OK):
+                return p
+    return None
 
 
 def _free_port() -> int:
@@ -205,16 +216,23 @@ class ServerResources(RuntimeError):
 
 def _vram_free() -> Optional[int]:
     """Free VRAM after PyTorch hands back the memory it caches but does not use (other processes cannot use a
-    cache). None when there is no CUDA device to ask about."""
+    cache). On Apple Silicon, what llama-server's Metal work may use: the smaller of Metal's limit for a process
+    and the free RAM (the GPU shares it). None when there is no GPU to ask about."""
     try:
         import torch
-        if not torch.cuda.is_available():
-            return None
-        torch.cuda.empty_cache()
-        free, _ = torch.cuda.mem_get_info()
-        return int(free)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            free, _ = torch.cuda.mem_get_info()
+            return int(free)
     except Exception:                                    # noqa: BLE001 - no CUDA: llama-server decides itself
-        return None
+        pass
+    from .. import macos
+    if macos.apple_silicon():
+        limit, ram = macos.gpu_limit_bytes(), _ram_free()
+        if limit and ram is not None:
+            return min(limit, ram)
+        return limit or ram
+    return None
 
 
 def _ram_free() -> Optional[int]:
@@ -259,7 +277,9 @@ def plan_offload(gguf: Path, ctx_total: int) -> tuple[int, str]:
     need_gpu = size + kv + 512 * 2**20
     vram = _vram_free()
     if vram is None or vram >= need_gpu:
-        return 99, "GPU" if vram is not None else "llama-server's own choice (no CUDA device seen)"
+        from .. import macos
+        gpu = "GPU (Metal, memory shared with the CPU)" if macos.apple_silicon() else "GPU"
+        return 99, gpu if vram is not None else "llama-server's own choice (no CUDA device seen)"
     ram = _ram_free()
     need_cpu = int(1.3 * size) + kv + 1024 * 2**20
     if ram is None or ram >= need_cpu:

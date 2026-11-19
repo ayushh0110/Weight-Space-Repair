@@ -27,6 +27,7 @@ from typing import Callable, Optional, Sequence
 import torch
 
 from ..deep import batching as BT
+from ..deep import device as DV
 from ..deep.lm import LM
 
 TOPK = 32                    # tokens of the original distribution the keep loss compares at each position
@@ -77,7 +78,7 @@ def fit_lowrank(lm: LM, params: Sequence[str], targets: Sequence[tuple[torch.Ten
     # Memory is measured, not guessed (a formula cannot be right for every GPU, model and dtype): the first
     # passes run for real, and an out-of-memory error ends the fit cleanly with a clear refusal. A fit is not
     # started at all with almost no free memory (BT.free_bytes already keeps a reserve for other programs).
-    if dev.type == "cuda" and BT.free_bytes(dev) < MIN_FREE:
+    if dev.type in ("cuda", "mps") and BT.free_bytes(dev) < MIN_FREE:
         raise ValueError(f"not enough free GPU memory to fit ({BT.free_bytes(dev) / 2**20:.0f} MB free)")
     g = torch.Generator().manual_seed(seed)
     UV = []
@@ -106,8 +107,7 @@ def fit_lowrank(lm: LM, params: Sequence[str], targets: Sequence[tuple[torch.Ten
     try:
         refs = [reference(k) for k in keep]
     except Exception as e:                          # noqa: BLE001 - memory errors become a clear refusal
-        if dev.type == "cuda":
-            torch.cuda.empty_cache()
+        DV.empty_cache(dev)
         if BT.is_oom(e):
             raise ValueError("out of GPU memory reading the keep texts: use shorter or fewer texts") from None
         raise
@@ -147,10 +147,8 @@ def fit_lowrank(lm: LM, params: Sequence[str], targets: Sequence[tuple[torch.Ten
     frozen = [(p, p.requires_grad) for p in lm.model.parameters()]
     for p, _ in frozen:                            # gradients for U and V only
         p.requires_grad_(False)
-    if dev.type == "cuda":
-        free0 = BT.free_bytes(dev)
-        reserved0 = torch.cuda.memory_reserved(dev)
-        torch.cuda.reset_peak_memory_stats(dev)
+    free0 = BT.free_bytes(dev) if dev.type in ("cuda", "mps") else None
+    mark0 = DV.mark(dev) if free0 is not None else None    # CUDA: reserved memory and a fresh peak; MPS: driver
     try:
         start, _ = losses(False)
         done = 0
@@ -169,11 +167,12 @@ def fit_lowrank(lm: LM, params: Sequence[str], targets: Sequence[tuple[torch.Ten
                     if dn > cap > 0:
                         U.mul_(cap / dn)
             done = step + 1
-            if step == 0 and dev.type == "cuda":
+            if step == 0 and free0 is not None:
                 # Measured after one real step: more than was free means the driver is spilling into system memory
-                # (Windows' sysmem fallback does that instead of raising out-of-memory) or is about to run out.
-                extra = torch.cuda.max_memory_reserved(dev) - reserved0
-                if extra > free0:
+                # (Windows' sysmem fallback does that instead of raising out-of-memory; a Mac swaps) or is about to
+                # run out.
+                extra = DV.grown(dev, mark0)
+                if extra is not None and extra > free0:
                     raise ValueError(f"this fit needs about {extra / 2**30:.2f} GB of GPU memory and "
                                      f"{free0 / 2**30:.2f} GB was free: use shorter texts, fewer of them, a lower rank "
                                      "or later layers")
@@ -188,8 +187,7 @@ def fit_lowrank(lm: LM, params: Sequence[str], targets: Sequence[tuple[torch.Ten
     finally:
         for p, rg in frozen:
             p.requires_grad_(rg)
-        if dev.type == "cuda":
-            torch.cuda.empty_cache()
+        DV.empty_cache(dev)
     deltas = [(n, U.detach().float().cpu(), V.detach().float().cpu()) for n, (U, V) in zip(params, UV)
               if float(U.detach().abs().sum()) > 0]
     return FitResult(deltas, done, round(time.time() - t0, 1), start, end, stopped)

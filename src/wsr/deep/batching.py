@@ -1,7 +1,8 @@
 """How many sequences to generate at once without running the machine out of memory.
 
 `plan(lm, prompt_len, max_new)` looks at what is free right now (CUDA: `torch.cuda.mem_get_info`; CPU:
-available RAM) and estimates what one sequence costs:
+available RAM; Apple MPS: what Metal's limit and the shared RAM both still allow, device.mps_free_bytes) and
+estimates what one sequence costs:
 * the KV cache for prompt + reply (layers x KV heads x head dim x 2 x bytes per element);
 * the prefill: the MLP and attention activations of the prompt (only the last position's logits are kept);
 * the last-step logits in float32, plus sampling buffers.
@@ -55,6 +56,9 @@ def batchable(lm: Any) -> bool:
 
 
 def free_bytes(device: torch.device) -> int:
+    if device.type == "mps":
+        from .device import mps_free_bytes
+        return mps_free_bytes()
     if device.type == "cuda":
         free, _ = torch.cuda.mem_get_info(device)
         # Memory PyTorch already holds but is not using (freed tensors in its caching allocator) serves new
@@ -100,7 +104,7 @@ def plan(lm: Any, prompt_len: int, max_new: int, n: int) -> int:
     if budget <= 0:
         return 1
     b = budget // per_sequence_bytes(lm, prompt_len, max_new)
-    limit = cap() if dev.type == "cuda" else min(cap(), MAX_BATCH_CPU)
+    limit = cap() if dev.type in ("cuda", "mps") else min(cap(), MAX_BATCH_CPU)
     return int(max(1, min(b, limit, n)))
 
 
@@ -114,7 +118,7 @@ def sizes(lm: Any, lengths: list[int], max_new: int) -> list[int]:
     if n <= 1 or not batchable(lm):
         return [1] * n
     budget = int(free_bytes(lm.device) * SHARE)
-    limit = cap() if lm.device.type == "cuda" else min(cap(), MAX_BATCH_CPU)
+    limit = cap() if lm.device.type in ("cuda", "mps") else min(cap(), MAX_BATCH_CPU)
     out, i = [], 0
     while i < n:
         b = min(limit, n - i) if budget > 0 else 1

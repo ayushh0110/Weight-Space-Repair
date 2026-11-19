@@ -4,19 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wsr-triage"
-version = "0.1.0"
+dynamic = ["version"]          # from src/wsr/__init__.py (__version__), the one place it is set
 description = "Weight-Space Repair: find out why an open-weight model failed, and fix it at the right level, from a setting to a verified weight edit."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Ayush" }]
-keywords = ["llm", "debugging", "triage", "interpretability", "model-editing", "gguf", "safetensors"]
+keywords = ["llm", "debugging", "triage", "interpretability", "model-editing", "gguf", "safetensors", "llama.cpp",
+            "ollama", "activation-steering", "weight-space-programming"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -40,12 +41,21 @@ dev = ["pytest>=8", "ruff>=0.5", "jinja2>=3.1"]
 [project.urls]
 Repository = "https://github.com/ayushh0110/Weight-Space-Repair"
 Issues = "https://github.com/ayushh0110/Weight-Space-Repair/issues"
+Documentation = "https://github.com/ayushh0110/Weight-Space-Repair/blob/main/docs/GUIDE.md"
+Changelog = "https://github.com/ayushh0110/Weight-Space-Repair/blob/main/CHANGELOG.md"
 
 [project.scripts]
 wsr = "wsr.cli:main"
 
+[tool.hatch.version]
+path = "src/wsr/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/wsr"]
+
+[tool.hatch.build.targets.sdist]
+# Source, tests, docs and examples; not the repository's CI and funding files (launch/ is in .gitignore).
+exclude = ["/.github"]
 
 [tool.ruff]
 line-length = 120

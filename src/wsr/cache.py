@@ -55,7 +55,10 @@ def _weights_checksum(lm: Any) -> str:
             t = p.detach().reshape(-1)
             s = s2 = sw = 0.0
             for i in range(0, t.numel(), 1 << 22):
-                c = t[i:i + (1 << 22)].double()
+                c = t[i:i + (1 << 22)]
+                if c.device.type == "mps":                # Metal has no float64: summed on the CPU
+                    c = c.cpu()
+                c = c.double()
                 w = torch.arange(i + 1, i + 1 + c.numel(), device=c.device, dtype=torch.float64)
                 s += float(c.sum())
                 s2 += float((c * c).sum())
@@ -86,7 +89,9 @@ def model_key(lm: Any) -> Optional[str]:
             if f.suffix == ".json" and st.st_size < 50_000_000:
                 h.update(f.read_bytes())
     dev = lm.device
-    dev_name = torch.cuda.get_device_name(dev) if dev.type == "cuda" else "cpu"
+    from .deep.device import name as device_name
+
+    dev_name = device_name(dev)                        # CUDA: the GPU's name; CPU: "cpu"; MPS: chip and macOS
     p = next(lm.model.parameters())
     from .output import DETECTOR_VERSION
 
@@ -155,6 +160,7 @@ GROUPS = {"models": "per-model results: regression baselines, original replies, 
           "datasets": "converted public datasets (wsr data fetch)",
           "converter": "the downloaded llama.cpp converter source",
           "identity": "exact tensor hashes of model checkpoints (computed again when needed)",
+          "device": "Apple MPS self-test results, per chip and macOS (run again when needed)",
           "legacy": "probe caches written by older wsr versions (no longer read)"}
 
 _MODEL_ENTRY = re.compile(r".+-[0-9a-f]{20}$")                    # <model folder name>-<key>, as model_key writes it
@@ -183,6 +189,11 @@ def _group_paths(group: str) -> list[Path]:
         if not d.is_dir():
             return []
         return sorted(p for p in d.iterdir() if p.is_file() and re.match(r".+-[0-9a-f]{20}\.json$", p.name))
+    if group == "device":
+        d = b / "device"
+        if not d.is_dir():
+            return []
+        return sorted(p for p in d.iterdir() if p.is_file() and re.match(r"mps-selftest-[0-9a-f]{20}\.json$", p.name))
     if group == "legacy":
         return [p for p in (b / "langprobe", b / "copyheads") if p.is_dir()]
     return []

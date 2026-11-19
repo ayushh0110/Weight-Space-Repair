@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Keeps the actions in .github/workflows current (security fixes in checkout, setup-python, the PyPI action).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

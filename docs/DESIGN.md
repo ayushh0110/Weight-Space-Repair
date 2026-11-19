@@ -2316,3 +2316,50 @@ statistics, the sandbox's escape protection and the quick-start example held up.
   - `cache clear --model` refuses a prefix shared by several models.
   - A `[tool.ruff]` config.
   - The README now says the NaN scan needs numpy, and the language check needs the language named.
+
+## 28. Apple Silicon: MPS, opt-in and checked
+
+Macs ran wsr on the CPU only: `--device mps` crashed when cache keys were built, because the weights checksum
+summed in float64 on the device and Metal has no float64. Everything else device-specific was CUDA-only and did
+nothing on MPS: free memory, cache clearing, `fit_edit`'s memory check.
+
+**Built without a Mac.** No one here has one, and GitHub's Macs have no usable GPU (they can report MPS as
+available when it is not). So MPS is opt-in, and each Mac checks itself:
+
+- **Can MPS run?** Apple Silicon, macOS 14+, a torch build with MPS, and a tensor that really runs there. If not,
+  the run stops with the reason.
+- **A self-test**, once per chip, macOS and library versions. A tiny model built in code runs on the CPU and on
+  MPS; logits must agree, greedy runs must repeat, a batched row must match the row alone, and a weight restored
+  from its copy must be bit-identical. An SVD (an op MPS lacks) must run through PyTorch's CPU fallback, which
+  wsr's package import sets before torch loads. On CUDA against the CPU the same checks agree to about 1e-7
+  (limit 1e-3).
+- **A repeat check** on the real model after loading: its short greedy reply must come out the same twice.
+
+A failure of either check prints why, and the run uses the CPU. These checks catch unsound or non-repeatable
+results, not every difference a large model could show, so `--device auto` keeps choosing CUDA, else the CPU,
+until `scripts/check_mps.py` reports from real Macs agree.
+
+**What the paired judge needs.** Its guarantee is that the original and the candidate run on the same device with
+the same seeds and batch plans; it does not need MPS to match the CPU. Running the original on the CPU and the
+candidate on MPS (an outside review's suggestion) would count the device's difference as the fix's effect. What
+it does need is a run that repeats exactly, which is why the repeat check is required, and that cached results
+never cross devices or macOS releases. An MPS cache key names the chip and the macOS version; CPU and CUDA keys
+are byte-identical to before (checked against the previous release on both).
+
+**Unified memory.** Metal lets the GPU use about two thirds of the RAM (three quarters above 36 GB), and the CPU
+shares the rest. Free memory on MPS is the smaller of what Metal's limit and the RAM still allow: batches,
+`fit_edit` and the float32-or-half choice use it. Triage's memory check and a llama-server's placement use
+Metal's share too, so a model that fits the RAM but not the GPU's share is a warning, not a pass.
+
+**MLX.** Macs often hold MLX checkpoints (packed integer weights with per-group scales). They are recognised from
+`config.json` (`bits` and `group_size`, no `quant_method`): triage reports their quantisation and does not treat
+them as full precision, and `wsr deep` says it needs the model they were converted from.
+
+**Elsewhere.** macOS grows swap files onto the system disk, so memory headroom counts swap only as far as the disk
+can hold it above 3 GB free (never more than before). wsr finds Homebrew's `llama-server` off PATH. CI runs the
+core and deep tests on macOS on CPU torch.
+
+**Two corrections to the first plan.** It named two SVD crashes on MPS, but both SVDs already run on the CPU: their
+inputs are copied there first, a weight with `.cpu()` and every capture by design. A review then claimed that
+`auto_dtype` crashes on MPS (it returns before any CUDA call) and that MPS and CPU share cache entries (the key holds
+the device type). Neither is so. Its points that hold, MPS's cache clearing and Metal's memory limit, are built.

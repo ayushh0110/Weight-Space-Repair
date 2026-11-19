@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: >-
+  If you use wsr, please cite it as below. If you use its repair agent, please also cite the weight-space
+  programming work it builds on (listed under references).
+title: "wsr: Weight-Space Repair"
+abstract: >-
+  Find out why an open-weight language model gave a bad reply (a chat template, a sampler setting, a truncated
+  context, a quantised tensor, or the weights), and fix it at the right level: a setting, an activation steering
+  or a verified weight edit, accepted only by a statistical judge on held-out data.
+type: software
+authors:
+  - given-names: Ayush
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/ayushh0110/Weight-Space-Repair"
+keywords:
+  - large language models
+  - debugging
+  - interpretability
+  - model editing
+  - activation steering
+references:
+  - type: blog
+    title: "Sparks of Weight-Space Programming: LLMs can natively read & write neural network weights"
+    authors:
+      - family-names: Takehi
+        given-names: Rikiya
+      - family-names: Teoh
+        given-names: Jayden
+      - family-names: Zhang
+        given-names: Alex
+      - family-names: Khattab
+        given-names: Omar
+    year: 2026
+    month: 11
+    url: "https://rikiyat.github.io/blog/weight-space-programming/"
