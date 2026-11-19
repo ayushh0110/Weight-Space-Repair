@@ -94,7 +94,7 @@ def _model(path: str, device: str, max_new: int) -> dict:
             diffs.append(float((a - b).abs().max()))
             top1 += int(a.argmax()) == int(b.argmax())
     out["logits_max_diff"] = max(diffs)
-    out["top1_agree"] = f"{top1}/{len(ids)}"
+    out["top1_agree"] = top1
     print(f"  last-position logits: largest difference {max(diffs):.3g}; same top token {top1}/{len(ids)}")
 
     def timed(lm, xs):
@@ -112,9 +112,8 @@ def _model(path: str, device: str, max_new: int) -> dict:
     repeat = sum(a == b for a, b in zip(g_out, g_again))
     batched = gpu.generate_batch(ids, max_new)
     same_batch = sum(a == b for a, b in zip(g_out, batched))
-    out.update(greedy_same_as_cpu=f"{same_cpu}/{len(ids)}", greedy_repeats=f"{repeat}/{len(ids)}",
-               batched_same_as_single=f"{same_batch}/{len(ids)}", cpu_tokens_per_s=round(c_tps, 1),
-               device_tokens_per_s=round(g_tps, 1))
+    out.update(prompts=len(ids), greedy_same_as_cpu=same_cpu, greedy_repeats=repeat,
+               batched_same_as_single=same_batch, cpu_tokens_per_s=round(c_tps, 1), device_tokens_per_s=round(g_tps, 1))
     print(f"  greedy replies ({max_new} tokens): same as the CPU {same_cpu}/{len(ids)}, repeat exactly "
           f"{repeat}/{len(ids)}, batched same as one at a time {same_batch}/{len(ids)}")
     print(f"  speed: CPU {c_tps:.1f} tokens/s, {device} {g_tps:.1f} tokens/s")
@@ -126,8 +125,8 @@ def _finish(rep: dict, out: str) -> int:
     Path(out).write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
     st = rep.get("self_test") or {}
     m = rep.get("model") or {}
-    ok = bool(st.get("passed")) and (not m or (m.get("greedy_repeats", "0/1").split("/")[0] ==
-                                                 m.get("greedy_repeats", "0/1").split("/")[1]))
+    repeats = not m or m.get("fell_back") or m.get("greedy_repeats") == m.get("prompts")
+    ok = bool(st.get("passed")) and bool(repeats) and not m.get("fell_back")
     print(f"\n{'PASS' if ok else 'NOT PASSED'}: report written to {out}. Please paste this summary, or attach the "
           "file, in an 'MPS report' issue: https://github.com/ayushh0110/Weight-Space-Repair/issues/new/choose")
     return 0 if ok else 1

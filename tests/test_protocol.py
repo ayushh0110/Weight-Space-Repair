@@ -129,6 +129,9 @@ def test_validation_is_sized_for_the_candidates_the_run_may_judge():
     assert EV.candidate_slots(playbook=True, steer_pass=False, agent_attempts=None) == 1
     assert EV.candidate_slots(playbook=True, steer_pass=True, agent_attempts=3) == 5
     assert EV.candidate_slots(playbook=False, steer_pass=False, agent_attempts=None) == 1
+    import inspect
+    from wsr.program.attempts import ATTEMPTS
+    assert inspect.signature(FF.from_failure).parameters["agent_attempts"].default == ATTEMPTS    # no magic -1
     fail = [{"id": f"f{i}"} for i in range(17)]          # 5 for confirmation, 12 left: 6 validation, 6 practice
     assert FF._three_way(list(fail), [], 0.5, 0.25, random.Random(0))[2] is None            # sized for 2: room
     cf, _, why = FF._three_way(list(fail), [], 0.5, 0.25, random.Random(0), min_val=EV.min_failing(4))

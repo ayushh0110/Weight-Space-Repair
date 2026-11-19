@@ -111,6 +111,7 @@ def test_the_self_test_checks_pass_cpu_against_cpu_and_name_every_check():
 
 def test_the_self_test_result_is_kept_per_machine_and_cleared_with_its_group(monkeypatch, tmp_path):
     monkeypatch.setenv("WSR_CACHE_DIR", str(tmp_path / "c"))
+    monkeypatch.setattr(D, "_SELF_TESTS", {})
     runs = []
     monkeypatch.setattr(D, "run_self_test", lambda device="mps": runs.append(device) or
                         {"version": D.SELF_TEST_VERSION, "passed": True, "checks": [], "bfloat16": True, "why": None})
@@ -122,6 +123,48 @@ def test_the_self_test_result_is_kept_per_machine_and_cleared_with_its_group(mon
     D.self_test()
     assert runs == ["mps", "mps"] and len(C._group_paths("device")) == 2
     assert "device" in C.GROUPS and set(C.targets(["device"])) == set(C._group_paths("device"))
+
+
+def test_a_failed_self_test_is_not_kept_and_runs_again_next_time(monkeypatch, tmp_path):
+    """A failure may be passing (another program on the GPU): it is remembered for this process only, never on disk,
+    so the next run tests again. A pass is read from disk; WSR_CACHE=off still runs it once per process."""
+    monkeypatch.setenv("WSR_CACHE_DIR", str(tmp_path / "c"))
+    monkeypatch.setattr(D, "_SELF_TESTS", {})
+    monkeypatch.setattr(macos, "describe", lambda: "Apple M1, macOS 14.2")
+    results = iter([False, True])
+    runs = []
+
+    def fake(device="mps"):
+        runs.append(1)
+        return {"version": D.SELF_TEST_VERSION, "passed": next(results), "checks": [], "bfloat16": False, "why": "x"}
+    monkeypatch.setattr(D, "run_self_test", fake)
+    assert D.self_test()["passed"] is False and D.self_test()["passed"] is False and len(runs) == 1
+    assert C._group_paths("device") == []                                  # the failure is not on disk
+    monkeypatch.setattr(D, "_SELF_TESTS", {})                              # a new process
+    assert D.self_test()["passed"] is True and len(runs) == 2 and len(C._group_paths("device")) == 1
+    monkeypatch.setattr(D, "_SELF_TESTS", {})
+    assert D.self_test()["passed"] is True and len(runs) == 2              # the pass is read from disk
+    monkeypatch.setenv("WSR_CACHE", "off")
+    monkeypatch.setattr(D, "_SELF_TESTS", {})
+    monkeypatch.setattr(D, "run_self_test", lambda device="mps": runs.append(1) or
+                        {"version": D.SELF_TEST_VERSION, "passed": True, "checks": [], "bfloat16": True})
+    D.self_test()
+    D.self_test()
+    assert len(runs) == 3                                                  # cache off: once per process
+
+
+def test_a_fallback_from_mps_runs_the_cpu_in_float32_when_it_fits(monkeypatch, toy):
+    m, t = planted_model()
+    lm = LM(m.half(), t, name="toy")
+    monkeypatch.setattr(BT, "ram_available", lambda: 64 * 2**30)
+    L._cpu_precision(lm, toy, auto=True)
+    assert next(lm.model.parameters()).dtype == torch.float32
+    lm2 = LM(planted_model()[0].half(), t, name="toy")
+    L._cpu_precision(lm2, toy, auto=False)                                 # the user asked for this precision
+    assert next(lm2.model.parameters()).dtype == torch.float16
+    monkeypatch.setattr(BT, "ram_available", lambda: 0)
+    L._cpu_precision(lm2, toy, auto=True)                                  # float32 would not fit: kept, said
+    assert next(lm2.model.parameters()).dtype == torch.float16
 
 
 def test_the_repeat_check_on_the_real_model(monkeypatch):
@@ -137,15 +180,15 @@ def test_mps_memory_is_the_smaller_of_metals_limit_and_the_shared_ram(monkeypatc
     G = 2**30
     monkeypatch.setattr(torch.mps, "recommended_max_memory", lambda: 10 * G, raising=False)
     monkeypatch.setattr(torch.mps, "driver_allocated_memory", lambda: 3 * G, raising=False)
-    monkeypatch.setattr(D, "_ram_available", lambda: 20 * G)
+    monkeypatch.setattr(BT, "ram_available", lambda: 20 * G)
     assert D.mps_free_bytes() == 10 * G - 3 * G - D.RESERVE_MPS          # Metal's limit decides
-    monkeypatch.setattr(D, "_ram_available", lambda: 5 * G)
-    assert D.mps_free_bytes() == 5 * G - D.RESERVE_RAM                    # the shared RAM decides
+    monkeypatch.setattr(BT, "ram_available", lambda: 5 * G)
+    assert D.mps_free_bytes() == 5 * G - BT.RESERVE_CPU                   # the shared RAM decides
     assert BT.free_bytes(torch.device("mps")) == D.mps_free_bytes()
     monkeypatch.setattr(torch.mps, "recommended_max_memory", lambda: (_ for _ in ()).throw(RuntimeError()),
                         raising=False)
     monkeypatch.setattr(macos, "gpu_limit_bytes", lambda ram=None: 12 * G)
-    monkeypatch.setattr(D, "_ram_available", lambda: 64 * G)
+    monkeypatch.setattr(BT, "ram_available", lambda: 64 * G)
     assert D.mps_free_bytes() == 12 * G - 3 * G - D.RESERVE_MPS           # older torch: macOS's own figure
     start = D.mark("mps")
     monkeypatch.setattr(torch.mps, "driver_allocated_memory", lambda: 4 * G, raising=False)

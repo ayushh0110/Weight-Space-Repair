@@ -148,7 +148,8 @@ def fit_lowrank(lm: LM, params: Sequence[str], targets: Sequence[tuple[torch.Ten
     for p, _ in frozen:                            # gradients for U and V only
         p.requires_grad_(False)
     free0 = BT.free_bytes(dev) if dev.type in ("cuda", "mps") else None
-    mark0 = DV.mark(dev) if free0 is not None else None    # CUDA: reserved memory and a fresh peak; MPS: driver
+    # CUDA: reserved memory and a fresh peak counter; MPS: what the Metal driver holds now (device.mark / grown)
+    mark0 = DV.mark(dev) if free0 is not None else None
     try:
         start, _ = losses(False)
         done = 0

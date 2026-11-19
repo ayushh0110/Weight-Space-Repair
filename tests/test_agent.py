@@ -936,6 +936,10 @@ def test_workspace_limits_hold_for_augmented_assignment_sequences_and_unestimate
     assert lab.run("a, *b = [1, 2, 3]\n[*b, 4]")["output"] == "[2, 3, 4]"
     assert lab.run("{**{'k': 1}, 'j': 2}")["output"] == "{'k': 1, 'j': 2}"
     assert lab.run("', '.join(str(i) for i in range(3))")["output"] == "'0, 1, 2'"
+    # the size checks cost no loop step: as many f-strings and unpackings in a loop as before they were checked
+    lab2 = Lab({}, seconds=60)
+    assert "error" not in lab2.run("for i in range(1500000):\n    t = f'{i}'")
+    assert "error" not in lab2.run("for i in range(1500000):\n    t = [*[i]]")
 
 
 def test_workspace_memory_backstop_stops_a_call_that_grows_memory(setup, monkeypatch):

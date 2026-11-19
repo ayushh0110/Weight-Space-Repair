@@ -55,6 +55,16 @@ def batchable(lm: Any) -> bool:
     return not any(x in mt for x in ("mamba", "rwkv", "jamba", "next", "falcon_h", "lfm"))
 
 
+def ram_available() -> int:
+    """Available RAM, or a careful 4 GB without a way to measure it."""
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().available)
+    except ImportError:
+        return 4 * 2**30
+
+
 def free_bytes(device: torch.device) -> int:
     if device.type == "mps":
         from .device import mps_free_bytes
@@ -66,13 +76,7 @@ def free_bytes(device: torch.device) -> int:
         # to what the driver reports, so another program never loses memory it could have had.
         cached = max(0, torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
         return max(0, int(free) - RESERVE_CUDA) + int(cached)
-    try:
-        import psutil  # type: ignore
-
-        avail = int(psutil.virtual_memory().available)
-    except ImportError:                       # be careful without a way to measure
-        avail = 4 * 2**30
-    return avail - RESERVE_CPU
+    return ram_available() - RESERVE_CPU
 
 
 def per_sequence_bytes(lm: Any, prompt_len: int, max_new: int) -> int:

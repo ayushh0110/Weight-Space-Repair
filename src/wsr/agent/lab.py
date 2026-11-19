@@ -504,7 +504,10 @@ class Lab:
             raise
 
     def _chk(self, v: Any) -> Any:
-        self._tick()
+        """The size check on an f-string or an unpacking display. Not counted as a step (neither was before it was
+        checked; the loop around it still is), but the deadline still applies."""
+        if time.perf_counter() > self._deadline:
+            raise self._deny("limit:time", f"time limit exceeded ({self.seconds:g} s)")
         return self._check(v)
 
     def _bin_check(self, op: str, a: Any, b: Any, tick: bool = True) -> None:

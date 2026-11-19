@@ -1,5 +1,7 @@
-"""The compute device in one place: clearing its cache, how much memory it has free, measuring what a step used,
-its name in cache keys, and Apple's MPS (Metal) checks.
+"""Device helpers shared by the deep tools: clearing a device's cache, measuring what a step used, the device's name
+in cache keys, and everything for Apple's MPS (Metal). The CUDA-only code that was already there (free VRAM in
+batching, the float32-or-half choice in lm.auto_dtype, llama-server's placement in program/backends) stays where
+it was, unchanged, with an MPS branch beside it.
 
 CUDA and CPU behave exactly as before this module existed. MPS is opt-in (`--device mps`): `--device auto` still
 picks CUDA, else the CPU, on every machine, Macs included. Before a model is put on MPS:
@@ -30,7 +32,6 @@ import torch
 from .. import macos
 
 RESERVE_MPS = 1 << 30          # unified memory: kept for macOS and other programs, on top of Metal's own limit
-RESERVE_RAM = 2 * 2**30        # as batching.RESERVE_CPU
 SELF_TEST_VERSION = 1          # bump when the self-test's checks change: earlier results are not reused
 LOGIT_TOL = 1e-3               # float32 CPU vs MPS, per logit (a tiny model's logits are about 0.1 to 1)
 
@@ -71,15 +72,6 @@ def name(device: Any) -> str:
 
 # -- memory -------------------------------------------------------------------------------------------------------
 
-def _ram_available() -> int:
-    try:
-        import psutil  # type: ignore
-
-        return int(psutil.virtual_memory().available)
-    except ImportError:
-        return 4 * 2**30
-
-
 def mps_limit() -> Optional[int]:
     """The memory Metal lets this process's GPU work use: PyTorch's figure where it has one, else macOS's."""
     f = getattr(torch.mps, "recommended_max_memory", None)
@@ -103,8 +95,10 @@ def mps_used() -> int:
 def mps_free_bytes() -> int:
     """Free memory for new MPS tensors: the smaller of what Metal's limit leaves and what the RAM has (the CPU and the
     GPU share it), each less its reserve."""
+    from . import batching as BT
+
     limit = mps_limit()
-    ram = _ram_available() - RESERVE_RAM
+    ram = BT.ram_available() - BT.RESERVE_CPU
     if limit is None:
         return max(0, ram)
     return max(0, min(limit - mps_used() - RESERVE_MPS, ram))
@@ -225,7 +219,8 @@ def run_self_test(device: str = "mps") -> dict[str, Any]:
     try:
         s = torch.linalg.svdvals(torch.randn(8, 8, generator=g).to(device))
         ok = bool(torch.isfinite(s.cpu()).all())
-        _check(checks, "fallback", ok, "an op MPS lacks (SVD) runs through the CPU fallback")
+        _check(checks, "fallback", ok, "an op MPS lacks (SVD) runs through the CPU fallback" if kind(device) == "mps"
+               else f"an SVD runs on {kind(device)} (native here; on MPS it needs the CPU fallback)")
     except Exception as e:                               # noqa: BLE001
         _check(checks, "fallback", False, f"an op MPS lacks (SVD) failed: {type(e).__name__}: {str(e)[:120]}. "
                "Set PYTORCH_ENABLE_MPS_FALLBACK=1 before Python starts (wsr sets it when it is imported before "
@@ -252,21 +247,31 @@ def _self_test_key() -> str:
     return hashlib.sha256(s.encode()).hexdigest()[:20]
 
 
+_SELF_TESTS: dict[str, dict[str, Any]] = {}          # this process's results, by machine and versions
+
+
 def self_test(cache: bool = True) -> dict[str, Any]:
-    """`run_self_test("mps")`, kept per chip, macOS, torch, transformers and wsr version."""
+    """`run_self_test("mps")`, once per process, and a pass kept on disk per chip, macOS, torch, transformers and wsr
+    version. A failure is not kept on disk: it may be passing (memory pressure, another program on the GPU), so the
+    next run tests again."""
     from .. import cache as C
 
-    f = C.base() / "device" / f"mps-selftest-{_self_test_key()}.json"
+    key = _self_test_key()
+    if cache and key in _SELF_TESTS:
+        return _SELF_TESTS[key]
+    f = C.base() / "device" / f"mps-selftest-{key}.json"
     if cache and C.enabled() and f.is_file():
         try:
             got = json.loads(f.read_text(encoding="utf-8"))
-            if got.get("version") == SELF_TEST_VERSION:
+            if got.get("version") == SELF_TEST_VERSION and got.get("passed"):
+                _SELF_TESTS[key] = got
                 return got
         except (OSError, ValueError):
             pass
     res = run_self_test("mps")
     res["machine"] = macos.describe()
-    if cache and C.enabled():
+    _SELF_TESTS[key] = res
+    if cache and C.enabled() and res.get("passed"):
         try:
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(json.dumps(res, indent=1), encoding="utf-8")

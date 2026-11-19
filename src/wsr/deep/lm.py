@@ -146,6 +146,21 @@ def _mps_dtype(path: Path, bf16: Optional[bool] = None) -> str:
     return "bfloat16" if bf16 else "float16"
 
 
+def _cpu_precision(lm: "LM", path: Path, auto: bool) -> None:
+    """After a fallback from MPS: float32, as any CPU run, when the precision was chosen automatically and float32
+    fits the RAM; a half precision picked for Metal's smaller share is slow on the CPU and less precise."""
+    from . import batching as BT
+    from . import device as D
+
+    if not auto or next(lm.model.parameters()).dtype == torch.float32:
+        return
+    need = _weight_bytes_fp32(path)
+    if need is not None and need * 1.25 + (768 << 20) <= BT.ram_available() - BT.RESERVE_CPU:
+        lm.model.float()
+    else:
+        D.note("float32 does not fit the RAM: the CPU keeps the half precision chosen for MPS")
+
+
 def _mps_ready(device: str) -> str:
     """The device a request for MPS ends up on: "mps" when it can be used and the self-test passes, "cpu" (with the
     reason printed) when the self-test fails. A machine where MPS cannot be used at all is an error, as a missing
@@ -245,6 +260,7 @@ class LM:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         if device.startswith("mps"):                     # opt-in only: auto never picks MPS
             device = _mps_ready(device)
+        auto = dtype == "auto"
         if dtype == "auto":
             dtype = auto_dtype(Path(str(path)), device)
         dt = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
@@ -266,6 +282,7 @@ class LM:
                 D.note(f"on MPS {why}; running on the CPU instead")
                 lm.model.to("cpu")
                 D.empty_cache("mps")
+                _cpu_precision(lm, Path(str(path)), auto)
         return lm
 
     # -- structure ------------------------------------------------------------

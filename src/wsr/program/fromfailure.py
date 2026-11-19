@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from ..deep.contrast import fresh_variants, variants
 from . import objective as O
+from .attempts import ATTEMPTS
 from .profile import FAILURES, Runner, _family, _test_group
 
 GROUP_OF = {"EMPTY": "blank", "LOOP": "loop", "TRUNCATED_LOOP": "loop", "REFUSAL": "refusal", "LANGUAGE": "language",
@@ -133,10 +134,10 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
                  heldout_share: float = 0.5, seed: int = 0, deep: bool = False, name: Optional[str] = None,
                  expect_lang: Optional[str] = None, consent=None, confirm_share: float = 0.25,
                  playbook: bool = True, steering: str = "fallback",
-                 agent_attempts: Optional[int] = -1) -> dict[str, Any]:
-    """`playbook`, `steering`, `agent_attempts` (None: no agent; -1: an agent with the default attempts may follow):
-    the run the goal is built for, which sets how many candidates its validation set judges and so how many failing
-    items it needs."""
+                 agent_attempts: Optional[int] = ATTEMPTS) -> dict[str, Any]:
+    """`playbook`, `steering`, `agent_attempts` (None: no agent; by default an agent with its default attempts may
+    follow): the run the goal is built for, which sets how many candidates its validation set judges and so how
+    many failing items it needs."""
     rng = random.Random(seed)
     res: dict[str, Any] = {"steps": []}
     step = res["steps"].append
@@ -276,14 +277,13 @@ def from_failure(lm, *, out_dir: Path, protocol: O.Protocol, model: str,
                                                      "dataset"}
 
     # 4. stratified split (confirmation first, when there are enough failing items); 5. the goal file
-    from .attempts import ATTEMPTS
     from .evaluate import candidate_slots, min_failing
     from .profile import DEEP_KIND
 
     slots = candidate_slots(playbook=playbook,
                             steer_pass=playbook and steering != "off" and DEEP_KIND.get(label) in ("refusal",
                                                                                                   "complied"),
-                            agent_attempts=ATTEMPTS if agent_attempts == -1 else agent_attempts)
+                            agent_attempts=agent_attempts)
     min_val = max(MIN_FAILING_CONFIRMATION, min_failing(slots))
     cf, cw, no_conf = _three_way(fail_items, work_items, heldout_share, confirm_share, rng, min_val=min_val)
     if no_conf:
