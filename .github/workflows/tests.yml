@@ -1,0 +1,58 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Triage and everything else that needs no dependencies. Tests that need torch skip themselves here.
+  core:
+    name: core (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.12"]
+        include:
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install (core, no dependencies, plus test tools)
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: python -m ruff check src tests
+      - name: Tests
+        run: python -m pytest -q -ra
+
+  # Diagnosis, surgery, steering and wsr program on CPU torch, with the tiny models the tests build themselves.
+  # The CUDA comparison test skips (no GPU on the runner).
+  deep:
+    name: deep (CPU torch, Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU torch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install (deep extra, both agent SDKs, plus test tools)
+        run: python -m pip install -e ".[dev,deep,yaml,agent,agent-openai]"
+      - name: Tests
+        run: python -m pytest -q -ra

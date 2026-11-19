@@ -221,4 +221,5 @@ Known limits:
 - Multi-stage surgery in the playbook (the agent has it: `commit_edit`).
 - Resuming an agent run inside `wsr program`.
 - A llama.cpp control-vector export for `add` steerings.
-- Continuous integration and a changelog.
+- A changelog. (Continuous integration runs the tests on every push: the core tests on Linux and Windows without
+  optional dependencies, and the deep tests on CPU torch. The CUDA comparison test runs only on a machine with a GPU.)

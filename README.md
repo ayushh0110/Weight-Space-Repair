@@ -1,5 +1,7 @@
 # wsr — Weight-Space Repair
 
+[![tests](https://github.com/ayushh0110/Weight-Space-Repair/actions/workflows/tests.yml/badge.svg)](https://github.com/ayushh0110/Weight-Space-Repair/actions/workflows/tests.yml)
+
 > No model fails silently.
 
 When an open-weight model gives a bad reply (blank, looping, the wrong language, a refusal of a harmless
