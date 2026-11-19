@@ -28,7 +28,7 @@ jobs:
         include:
           - os: windows-latest
             python: "3.12"
-          - os: macos-14
+          - os: macos-latest
             python: "3.12"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,7 +65,7 @@ jobs:
   # stand-ins in tests/test_device.py; MPS on a real Mac is checked by scripts/check_mps.py (an "MPS report" issue).
   deep-macos:
     name: deep (macOS, CPU torch, Python 3.12)
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
