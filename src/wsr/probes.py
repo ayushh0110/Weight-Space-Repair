@@ -85,7 +85,7 @@ class Endpoint:
         and the probes chain dozens of requests.
         """
         if not hasattr(self, "_reach"):
-            req = urllib.request.Request(self.url + "/", headers={"User-Agent": "wsr-triage"})
+            req = urllib.request.Request(self.url + "/", headers={"User-Agent": "wsr"})
             if self.api_key:
                 req.add_header("Authorization", f"Bearer {self.api_key}")
             try:
@@ -107,7 +107,7 @@ class Endpoint:
             raise EndpointError("probe time budget exhausted")
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.url + path, data=data, method=method,
-                                     headers={"Content-Type": "application/json", "User-Agent": "wsr-triage"})
+                                     headers={"Content-Type": "application/json", "User-Agent": "wsr"})
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
         return urllib.request.urlopen(req, timeout=min(timeout or self.timeout, remaining))

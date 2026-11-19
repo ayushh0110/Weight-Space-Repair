@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "wsr-triage"
+name = "wsr"
 dynamic = ["version"]          # from src/wsr/__init__.py (__version__), the one place it is set
 description = "Weight-Space Repair: find out why an open-weight model failed, and fix it at the right level, from a setting to a verified weight edit."
 readme = "README.md"

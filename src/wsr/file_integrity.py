@@ -310,7 +310,7 @@ def hf_paths_info(repo: str, paths: Iterable[str], revision: str = "main", timeo
     body = urllib.parse.urlencode([("paths", p) for p in paths]).encode()
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/x-www-form-urlencoded",
-                                          "User-Agent": "wsr-triage"})
+                                          "User-Agent": "wsr"})
     tok = os.environ.get("HF_TOKEN")
     if tok:
         req.add_header("Authorization", f"Bearer {tok}")

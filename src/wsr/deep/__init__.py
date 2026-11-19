@@ -8,6 +8,6 @@ directions (refusal, end-of-turn, language, repetition), and what the
 implicated weight matrices look like. For GGUF users it also measures how far
 each quantised tensor is from the full-precision one (quant.py).
 
-Needs ``torch`` and ``transformers`` (``pip install wsr-triage[deep]``); the
+Needs ``torch`` and ``transformers`` (``pip install wsr[deep]``); the
 rest of ``wsr`` does not.
 """

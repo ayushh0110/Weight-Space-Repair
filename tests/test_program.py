@@ -951,7 +951,7 @@ def test_cli_usage_errors_exit_2_and_recommended_fixes_exit_0(tmp_path, capsys):
 
 
 def test_wsr_cache_works_without_torch(tmp_path):
-    """`pip install wsr-triage` has no dependencies: the cache command must not import torch."""
+    """`pip install wsr` has no dependencies: the cache command must not import torch."""
     import os
     import subprocess
     import sys

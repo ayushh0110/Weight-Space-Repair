@@ -49,9 +49,9 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           v_re="${version//./\\.}"
           ls -l dist
-          test -f "dist/wsr_triage-${version}-py3-none-any.whl" \
+          test -f "dist/wsr-${version}-py3-none-any.whl" \
             || { echo "::error::tag ${GITHUB_REF_NAME} does not match __version__ in src/wsr/__init__.py"; exit 1; }
-          test -f "dist/wsr_triage-${version}.tar.gz"
+          test -f "dist/wsr-${version}.tar.gz"
           grep -Eq "^## \[${v_re}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}\s*$" CHANGELOG.md \
             || { echo "::error::CHANGELOG.md needs a heading '## [${version}] - YYYY-MM-DD' with the release date"; exit 1; }
           grep -Eq "^version: \"?${v_re}\"?\s*$" CITATION.cff \
@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/wsr-triage
+      url: https://test.pypi.org/p/wsr
     permissions:
       id-token: write       # Trusted Publishing and attestations, nothing else
     steps:
@@ -99,7 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi            # required reviewer: you (Settings > Environments); deployment tags: v*
-      url: https://pypi.org/p/wsr-triage
+      url: https://pypi.org/p/wsr
     permissions:
       id-token: write
     steps:
@@ -136,7 +136,7 @@ jobs:
             found                    { print }
           ' CHANGELOG.md > notes.md
           test -s notes.md
-          printf '\nInstall: `pip install wsr-triage==%s`\n' "$version" >> notes.md
+          printf '\nInstall: `pip install wsr==%s`\n' "$version" >> notes.md
           flags=""
           case "$version" in *[a-z]*) flags="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \

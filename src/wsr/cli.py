@@ -1238,7 +1238,7 @@ def _need_torch() -> None:
         import torch  # noqa: F401
         import transformers  # noqa: F401
     except ImportError as e:
-        raise ValueError(f"deep triage needs torch and transformers ({e}); pip install 'wsr-triage[deep]'") from e
+        raise ValueError(f"deep triage needs torch and transformers ({e}); pip install 'wsr[deep]'") from e
 
 
 def cmd_deep(args: argparse.Namespace) -> int:

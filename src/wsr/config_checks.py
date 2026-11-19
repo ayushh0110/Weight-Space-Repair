@@ -301,7 +301,7 @@ def render(template: str, messages: list[dict], spec: ModelSpec, add_generation_
         import jinja2
         from jinja2.sandbox import ImmutableSandboxedEnvironment
     except ImportError as e:
-        raise TemplateError("jinja2 not installed (pip install wsr-triage[templates])") from e
+        raise TemplateError("jinja2 not installed (pip install wsr[templates])") from e
     from datetime import datetime
 
     def raise_exception(msg: str) -> None:
@@ -477,7 +477,7 @@ def check_upstream_template(spec: ModelSpec, repo: str, timeout: float = 20) -> 
     upstream: Optional[str] = None
     for fname in ("chat_template.jinja", "tokenizer_config.json"):
         url = f"https://huggingface.co/{repo}/resolve/{rev}/{fname}"
-        req = urllib.request.Request(url, headers={"User-Agent": "wsr-triage"})
+        req = urllib.request.Request(url, headers={"User-Agent": "wsr"})
         if os.environ.get("HF_TOKEN"):
             req.add_header("Authorization", f"Bearer {os.environ['HF_TOKEN']}")
         try:

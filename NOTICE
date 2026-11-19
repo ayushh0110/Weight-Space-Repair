@@ -1,4 +1,4 @@
-wsr-triage includes code ported from the following MIT-licensed projects.
+wsr includes code ported from the following MIT-licensed projects.
 
 llm-output-guard — https://github.com/edwinsatya/llm-output-guard
   Detector algorithms and default thresholds in src/wsr/output.py (EMPTY,
