@@ -16,6 +16,9 @@ from .findings import CAUSE_PRIORITY, Cause, Finding, Layer, Severity
 GROUPS: dict[str, set[str]] = {
     "blank": {"EMPTY", "EMPTY_OUTPUT", "TRUNCATED_EMPTY", "TOO_SHORT", "REASONING_EXHAUSTED"},
     "loop": {"TAIL_LOOP", "REPETITION", "AGENT_LOOP"},
+    # A loop inside the reasoning, kept apart from "loop": the causes of an answer that runs past its end
+    # (stop tokens, EOS, BOS) do not explain it, and the weight-level classifiers never see this code.
+    "reasoning_loop": {"REASONING_LOOP"},
     "garbage": {"SYMBOL_SOUP", "LOW_ENTROPY", "TOKEN_SALAD", "GLUED_WORDS", "SCRIPT_GLUE", "BROKEN_UTF8",
                 "OUTPUT_PARSE_REJECTED",
                 "REPETITION_AVOIDANCE", "PENALTY_SHAPE_LOSS"},
@@ -116,6 +119,21 @@ EXPLAINS: dict[str, set[str]] = {
     "KV_CACHE_QUANTISED": {"garbage", "loop", "structure"},
     "CONTEXT_SHIFTED": {"loop", "language", "structure", "garbage", "template_leak", "blank"},
 }
+# What can explain a loop inside the reasoning: the answer-loop causes above minus EOS_MISMATCH,
+# NO_STOP_TOKENS, STOP_ID_OUT_OF_RANGE, STOP_PROBE_RUNON and SERVER_NO_BOS, which are about where the turn
+# ends; the reasoning closes with its own marker, not with EOS. Listed by hand, so a new answer-loop cause
+# does not join silently. (TEMPLATE_MISSING and TEMPLATE_RENDER_ERROR explain every group already.)
+REASONING_LOOP_CAUSES = {
+    "DOUBLE_BOS", "SERVER_DOUBLE_BOS", "TEMPLATE_STALE", "TEMPLATE_CONFLICT", "SERVER_TEMPLATE_DIFFERS",
+    "LOW_BIT_SMALL_MODEL", "PRETOKENIZER_DEFAULT", "SOFTCAP_MISSING", "ROPE_OVERRIDE_DIFFERS",
+    "KV_CACHE_QUANTISED", "REPEAT_PENALTY_HIGH", "REPEAT_PENALTY_BELOW_ONE", "MIN_P_HIGH",
+    "PROMPT_EXCEEDS_CONTEXT", "INPUT_TRUNCATED", "PROMPT_FILLS_CONTEXT", "OLLAMA_DEFAULT_CONTEXT",
+    "CONTEXT_ABOVE_TRAINED", "CONTEXT_SHIFTED", "PROMPT_CACHE_CHANGES_OUTPUT", "REASONING_RUNAWAY",
+}
+for _code in REASONING_LOOP_CAUSES:
+    EXPLAINS[_code] = EXPLAINS[_code] | {"reasoning_loop"}
+del _code
+
 _CAP_CODES = {"TRUNCATED", "AT_LIMIT", "NEAR_LIMIT", "TOOL_CALL_TRUNCATED"}
 # File findings that say nothing about the bytes the server actually loaded.
 _NOT_CORRUPTION = {"NO_WEIGHTS", "UPSTREAM_UNREACHABLE", "UPSTREAM_MISSING"}
@@ -124,6 +142,8 @@ _UNEXPLAINED_HINT = {
     "vision": "vision: run `wsr probe --only vision` to check the server reads images at all",
     "template_leak": "template_leak: control tokens / extra turns with no template or EOS cause found",
     "loop": "loop: no static cause; run `--differential` (greedy vs sampled, penalties, constraint, context)",
+    "reasoning_loop": "reasoning_loop: run `--differential` to see whether thinking off, greedy decoding or "
+                      "neutral penalties break the loop",
     "garbage": "garbage: re-download the file, then compare backends (CPU vs GPU) and quants with --alt",
     "blank": "blank: check the reasoning parser and stop strings; run `wsr probe --only smoke,stop`",
     "language": "language: check that the system prompt survives (context size) and the template's system role",
@@ -162,7 +182,7 @@ def decide(findings: list[Finding], *, full_precision_reference: bool = False) -
     # A run-on (loop or talking past the turn end) always ends at the cap, so
     # the cap is a consequence there, not a cause.
     # Garbage, too, runs until the cap stops it.
-    has_loop = bool(observed & {"loop", "template_leak", "garbage"})
+    has_loop = bool(observed & {"loop", "template_leak", "garbage", "reasoning_loop"})
 
     candidates = [f for f in findings if f.failed and f.cause not in (Cause.SYMPTOM, Cause.NONE)]
     scored = []

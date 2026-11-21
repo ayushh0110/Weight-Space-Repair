@@ -124,6 +124,37 @@ The new file checks raise no false alarm on the three real GGUF files. Sources: 
 transformers [#36822](https://github.com/huggingface/transformers/issues/36822);
 [vLLM generation_config](https://github.com/vllm-project/vllm/pull/11164/files).
 
+### Reasoning loops: the Sparks baseline
+
+Qwen3.5-0.8B (ggml-org Q8_0 GGUF on llama-server, one sample per prompt), thinking on, with the settings of the
+Sparks base-model runs: temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.5, a 32,768-token cap. The first
+8 MATH-500 problems in order:
+
+| | hit the cap | correct (equivalent answers counted) |
+|---|---|---|
+| thinking on | 6 of 8 | 2 of 8 |
+| thinking off, nothing else changed | 0 of 8 | 5 of 8 |
+
+5 of the 6 capped replies loop inside the reasoning (a line repeated 38 to 213 times); the sixth is still working
+at the cap. The loops start after about 2,300, 4,200, 6,400, 7,500 and 19,300 tokens. Before `REASONING_LOOP`
+triage said `REASONING_EXHAUSTED` with "raise max_tokens", which does not end a loop; it now names the loop and
+says to turn thinking off.
+
+To set the detector, 40 more replies with the same sampling and an 8,192-token cap: 16 GSM8K, 12 IFEval,
+8 XSTest safe prompts and 4 chat prompts, alternating temperature 1.0 (the model card's thinking setting) and 0.6,
+so each temperature saw a different 20 of the same mix. Each reply was labelled by reading it:
+
+| temperature | replies | hit the cap | loops | looped, then answered |
+|---|---|---|---|---|
+| 1.0 | 20 | 8 | 0 | 0 |
+| 0.6 | 20 | 13 | 11 | 1 |
+
+On all 16 loops and 27 healthy traces (4 replies had too little reasoning to judge), loops score 0.86 to 1.0 and
+healthy reasoning at most 0.33, against a threshold of 0.6; the traces are the test fixture. Not a replication of
+the Sparks numbers: a different runtime and quantisation, 8 problems, one sample, and the temperature split is
+across different prompts, not paired. The model card warns that the 0.8B "is more prone to entering thinking loops"
+in thinking mode and runs it without thinking by default.
+
 ### Partly proven
 
 | Case | What wsr says | Why it is not proven |

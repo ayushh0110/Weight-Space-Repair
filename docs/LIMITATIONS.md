@@ -48,6 +48,17 @@ Known limits:
 - The language check needs the expected language (`--expect-lang`, or an item's `lang`); it is not inferred from
   the request, and replies under 25 words are not judged. `--expect-script` checks the writing system instead.
 - `--scan-values` (NaN / Inf in safetensors weights) needs numpy; without it the scan is reported as skipped.
+- **Reasoning loops are calibrated on one model.** `REASONING_LOOP` was set on Qwen3.5-0.8B traces only (math,
+  instruction and chat prompts, 16 loops and 27 healthy traces; loops score 0.86-1.0, healthy reasoning at most
+  0.33, threshold 0.6). It
+  compares whole lines, so reasoning written without line breaks is not judged, and a loop whose lines change
+  every turn (a counter, a new number each time) can pass as fresh text. Where the loop starts is an estimate
+  from the line it repeats, give or take a few lines, and its token position uses the reply's own token count.
+- **A thinking-mode loop is slow to reproduce in `wsr deep`.** deep regenerates the reply from the start, on
+  PyTorch (about 13 tokens a second for Qwen3.5-0.8B on a 4 GB GTX 1650, against about 97 on llama-server), and
+  Sparks' loops start after 2,000 to 20,000 tokens. The repair stage judges at most 4,096 tokens, so it cannot
+  yet test a fix for a loop that starts later. Starting deep from inside the failing reply would fix both; it is
+  not built.
 
 ## Quantisation
 

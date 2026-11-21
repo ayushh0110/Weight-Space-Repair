@@ -136,5 +136,17 @@
     "cause": "sampling",
     "fix": "Enable DRY explicitly (dry_multiplier 0.8) and a mild repeat penalty (1.05).",
     "source": "https://runaihome.com/blog/local-llm-repeating-gibberish-fix-2026/"
+  },
+  {
+    "id": "qwen35-0.8b-thinking-loops",
+    "title": "Qwen3.5-0.8B is prone to loops in thinking mode; its model card runs it non-thinking by default",
+    "model": "qwen3\\.?5[-_ ]?0\\.8b",
+    "symptoms": [
+      "REASONING_LOOP"
+    ],
+    "cause": "known_bug",
+    "level": "model",
+    "fix": "Documented by Qwen: in thinking mode, with the recommended sampling, the 0.8B is more prone to thinking loops than the other Qwen3.5 models. Use non-thinking mode (chat_template_kwargs={'enable_thinking': false}), the card's default for this size; if you need thinking, tune the sampling for your task and stream, so a loop can be stopped early.",
+    "source": "https://huggingface.co/Qwen/Qwen3.5-0.8B"
   }
 ]

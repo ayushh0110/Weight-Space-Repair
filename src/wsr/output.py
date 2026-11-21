@@ -233,6 +233,178 @@ def _tail_loop_inner(text: str, tail_words: int, max_period: int, min_repeats: i
     return periodic_detail(words(text)[-tail_words:], max_period, min_repeats), mode
 
 
+# --------------------------------------------------------------------------
+# Reasoning loops: the thinking channel, judged on its own
+# --------------------------------------------------------------------------
+# A thinking model can loop inside its reasoning for thousands of tokens and hit
+# the cap before it writes any answer. The answer detectors above never see that
+# text. Reasoning loops are also longer than answer loops: a 15-line block
+# repeating, or two near-identical variants of one block taking turns, so the
+# test here is line recurrence (healthy reasoning rarely restates a long line it
+# wrote a little earlier) as well as an exact cycle of up to 40 lines.
+# check_output() does not use this, so the classifiers built on it (deep,
+# program, the agent's judge) are unchanged.
+
+@dataclass
+class ReasoningLoop:
+    score: float = 0.0
+    mode: str = ""                       # "cycle" (an exact block repeating to the end) or "recurrence"
+    period: int = 0                      # lines in the repeating block (cycle mode)
+    repeats: int = 0
+    recurrence: float = 0.0              # share of the recent long lines that repeat one written just before
+    lines: int = 0                       # non-empty lines judged (0: too little reasoning to judge)
+    onset_char: Optional[int] = None     # roughly where the loop starts: a character offset in the reasoning
+    block_chars: int = 0                 # characters in one turn of the loop, roughly
+    sample: str = ""                     # the line repeated most
+
+
+RL_WINDOW = 120         # recent non-empty lines judged
+RL_RECENT = 40          # ...and the most recent of them alone: a loop that began just before the cap
+RL_LOOKBACK = 300       # how far back a recent line may find its earlier copy
+RL_MIN_LONG = 15        # characters: short lines ("Wait.", "Hmm.") recur in healthy reasoning too
+RL_MIN_LINES = 30       # fewer recent long lines than this: too little to judge
+RL_MAX_LINES = 4000     # bound the work on a very long trace
+RL_THRESHOLD = 0.6
+
+
+def _rl_lines(text: str) -> list[tuple[int, str]]:
+    """(character offset, normalised text) of each non-empty line. The last line is dropped when the text
+    stops mid-line (generation was cut there)."""
+    out: list[tuple[int, str]] = []
+    o = 0
+    for raw in text.splitlines(keepends=True):
+        s = " ".join(_LIST_MARK.sub("", raw.rstrip("\r\n") + " ").split()).lower()
+        if s:
+            out.append((o, s))
+        o += len(raw)
+    if out and not text.endswith(("\n", "\r")):
+        out.pop()
+    return out[-RL_MAX_LINES:]
+
+
+def _rl_onset(long_lines: list[tuple[int, str]], block: int = 40, start_share: float = 0.8,
+              hold_share: float = 0.6) -> Optional[int]:
+    """Offset of the first long line from which the reasoning keeps repeating itself to the end: the first
+    40-line stretch that is mostly repeats, with every later stretch still at least 60% repeats."""
+    n = len(long_lines)
+    if n < block:
+        return None
+    rep = [0] * n
+    seen: dict[str, int] = {}
+    for i, (_, s) in enumerate(long_lines):
+        j = seen.get(s)
+        rep[i] = 1 if j is not None and i - j <= RL_LOOKBACK else 0
+        seen[s] = i
+    pre = [0]
+    for x in rep:
+        pre.append(pre[-1] + x)
+    shares = [(pre[k + block] - pre[k]) / block for k in range(n - block + 1)]
+    suffix_min = shares[:]
+    for k in range(len(shares) - 2, -1, -1):
+        suffix_min[k] = min(shares[k], suffix_min[k + 1])
+    for k, s in enumerate(shares):
+        if s >= start_share and suffix_min[k] >= hold_share:
+            return long_lines[k][0]
+    return None
+
+
+def _rl_recurrence(lines: list[tuple[int, str]], size: int) -> tuple[Optional[float], dict[str, int]]:
+    """Share of the long lines among the last `size` lines that repeat a line written in the RL_LOOKBACK lines
+    before them (None: fewer than RL_MIN_LINES long lines to judge), and how often each long line appears."""
+    first = max(0, len(lines) - size)
+    seen = {s for _, s in lines[max(0, first - RL_LOOKBACK):first] if len(s) >= RL_MIN_LONG}
+    hits = total = 0
+    counts: dict[str, int] = {}
+    for _, s in lines[first:]:
+        if len(s) < RL_MIN_LONG:
+            continue
+        total += 1
+        hits += s in seen
+        seen.add(s)
+        counts[s] = counts.get(s, 0) + 1
+    return (hits / total if total >= RL_MIN_LINES else None), counts
+
+
+def reasoning_loop_detail(text: str) -> ReasoningLoop:
+    lines = _rl_lines(text or "")
+    window = lines[-RL_WINDOW:]
+    whole, counts = _rl_recurrence(lines, RL_WINDOW)
+    if whole is None:
+        return ReasoningLoop()
+    recent, _ = _rl_recurrence(lines, RL_RECENT)
+    recurrence = max(whole, recent or 0.0)
+    cyc = periodic_detail([s for _, s in window], 40, 3)
+    res = ReasoningLoop(recurrence=round(recurrence, 3),
+                        lines=RL_RECENT if recent is not None and recent > whole else len(window),
+                        sample=max(counts, key=counts.get)[:80] if counts else "")
+    if cyc.score >= recurrence:
+        res.score, res.mode, res.period, res.repeats = cyc.score, "cycle", cyc.period, cyc.repeats
+    else:
+        res.score, res.mode = recurrence, "recurrence"
+    if res.score > RL_THRESHOLD:
+        onset = _rl_onset([ln for ln in lines if len(ln[1]) >= RL_MIN_LONG])
+        if onset is None and cyc.period:
+            onset = window[len(window) - cyc.repeats * cyc.period][0]
+        res.onset_char = onset
+        k = cyc.period if res.mode == "cycle" and cyc.period else 20
+        tail = window[-k:]
+        res.block_chars = len(text) - tail[0][0] if tail else 0
+    return res
+
+
+def check_reasoning(reasoning: str, *, cut: bool, answered: bool,
+                    reasoning_tokens: Optional[int] = None) -> list[Finding]:
+    """REASONING_LOOP on the reasoning text of a reply (empty list when there is too little reasoning to judge).
+
+    It fails only when the loop cost the answer: the reply hit the cap, or no answer came. A loop the model
+    escaped on its own before answering is reported as information, never as a failure.
+    reasoning_tokens: the reasoning's length in tokens when known (the token estimates use it).
+    """
+    if not reasoning or not reasoning.strip():
+        return []
+    rl = reasoning_loop_detail(reasoning)
+    if not rl.lines:
+        return []
+    ev: dict[str, Any] = {"mode": rl.mode, "score_threshold": RL_THRESHOLD, "recurrence": rl.recurrence,
+                          "lines": rl.lines}
+    if rl.period:
+        ev.update(period=rl.period, repeats=rl.repeats)
+    looped = rl.score > RL_THRESHOLD
+    if not looped:
+        return [Finding("REASONING_LOOP", Layer.OUTPUT, Severity.PASS, "the reasoning does not repeat itself",
+                        cause=Cause.SYMPTOM, score=round(rl.score, 3), evidence=ev, source="wsr")]
+    # Characters per token, from the reply's own count when it is plausible (text runs 1.5-8 characters per token);
+    # a count that does not fit the text (another field, a provider quirk) falls back to the usual 4.
+    cpt = len(reasoning) / reasoning_tokens if reasoning_tokens else 0.0
+    if not 1.5 <= cpt <= 8.0:
+        cpt, reasoning_tokens = 4.0, None
+    if rl.onset_char is not None:
+        ev["onset_tokens"] = round(rl.onset_char / cpt)
+        ev["onset_share"] = round(rl.onset_char / len(reasoning), 3)
+        # Enough tokens for a fresh run to reach the loop and repeat it three times, in whole thousands.
+        need = rl.onset_char / cpt + max(1000.0, 3 * rl.block_chars / cpt)
+        ev["suggest_max_new"] = int(-(-need // 1000) * 1000)
+    ev["tokens_estimated"] = reasoning_tokens is None
+    if rl.mode == "cycle":
+        what = f"the same {rl.period}-line block x{rl.repeats} at the end"
+    else:
+        what = f"{rl.recurrence:.0%} of its last {rl.lines} lines repeat a line it wrote just before"
+    where = (f", from about token {ev['onset_tokens']:,} ({ev['onset_share']:.0%} of the way in)"
+             if "onset_tokens" in ev else "")
+    ev["sample"] = rl.sample
+    if not (cut or not answered):
+        return [Finding("REASONING_LOOP", Layer.OUTPUT, Severity.INFO,
+                        f"the reasoning repeated itself ({what}) but finished and answered", cause=Cause.SYMPTOM,
+                        score=round(rl.score, 3), evidence=ev, source="wsr")]
+    return [Finding(
+        "REASONING_LOOP", Layer.OUTPUT, Severity.FAIL,
+        f"the reasoning is stuck in a loop: {what}{where} (e.g. {rl.sample!r})",
+        cause=Cause.SYMPTOM, score=round(rl.score, 3), evidence=ev, source="wsr",
+        fix="more tokens will not end a loop: turn thinking off for this call (chat_template_kwargs="
+            "{'enable_thinking': false}; Ollama think=false) or set a reasoning budget, and rerun with "
+            "--differential to see which change breaks it")]
+
+
 def compression_ratio(text: str, window: int = 1024, max_sample: int = 4000, min_match: int = 4) -> float:
     """Greedy LZ77 pass: emitted tokens / input characters. Lower = more redundant."""
     s = text[:max_sample]

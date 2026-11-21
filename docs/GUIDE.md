@@ -728,6 +728,7 @@ Layer 7: weight-level diagnosis on a full-precision HF model (needs torch).
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
 | `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first) |
 | `--no-thinking` |  | render the template with enable_thinking=false |
+| `--thinking` |  | render the template with enable_thinking=true: models whose template thinks only when asked (Qwen3.5-0.8B) otherwise run without thinking, so a thinking-mode failure does not reproduce |
 | `--base` |  | base model directory, to measure how much fine-tuning changed the culprits |
 | `--gguf` |  | the quantised file in use: quantisation error of the implicated tensors |
 | `--out` |  | write the surgery hand-off package here |
@@ -754,6 +755,7 @@ Surgery: diagnose (as wsr deep), then find and verify the smallest weight edit t
 | `--dtype` `auto\|float32\|bfloat16\|float16` | `auto` | auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16 |
 | `--device` | `auto` | auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first) |
 | `--no-thinking` |  | render the template with enable_thinking=false |
+| `--thinking` |  | render the template with enable_thinking=true: models whose template thinks only when asked (Qwen3.5-0.8B) otherwise run without thinking, so a thinking-mode failure does not reproduce |
 | `--base` |  | base model directory, to measure how much fine-tuning changed the culprits |
 | `--gguf` |  | the quantised file in use: quantisation error of the implicated tensors |
 | `--out` |  | write the surgery hand-off package here |

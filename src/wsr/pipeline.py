@@ -98,6 +98,40 @@ def _confirm_prefill(rep: Report, text: str, messages: Optional[list[dict]]) -> 
             f.message += " (confirmed: the reply starts with the prefill)"
 
 
+# The longest reference run the repair stage judges (surgery.playbook.MAX_REF_NEW; a test keeps them equal).
+# Kept here so triage does not import torch.
+REPAIR_MAX_NEW = 4096
+
+
+def _reasoning_loop_found(rep: Report) -> Optional[Finding]:
+    return next((f for f in rep.findings if f.code == "REASONING_LOOP" and f.failed), None)
+
+
+def _reword_for_reasoning_loop(rep: Report) -> None:
+    """The cap was reached because the reasoning loops: more tokens would only loop longer."""
+    if not _reasoning_loop_found(rep):
+        return
+    for f in rep.findings:
+        if f.code == "REASONING_EXHAUSTED" and f.failed:
+            f.message += " (the reasoning was looping: see REASONING_LOOP)"
+            f.fix = ("raising max_tokens will not help, the reasoning loops: turn thinking off for this call "
+                     "(chat_template_kwargs={'enable_thinking': false}; Ollama think=false) or set a reasoning "
+                     "budget, then rerun to confirm")
+
+
+def _deep_hint(loop: Finding) -> str:
+    n = loop.evidence.get("suggest_max_new")
+    size = (f"--max-new {n}" if n else "a --max-new past the point where the reasoning starts to loop")
+    hint = (f"if you need thinking on and the loop survives greedy decoding and neutral penalties, reproduce it "
+            f"in thinking mode: `wsr deep <model-dir> --messages <file> --kind loop --thinking {size}`. deep "
+            "regenerates the reply from its start, many times, on PyTorch (often far slower than a server): "
+            "expect hours, and a new run may loop at a different point or not at all")
+    if n and n > REPAIR_MAX_NEW:
+        hint += (f". This loop starts too late for the repair stage, which judges at most {REPAIR_MAX_NEW} "
+                 "tokens, so it cannot test a fix for it yet")
+    return hint
+
+
 def triage(inp: TriageInput) -> Report:
     rep = Report()
     rep.extend(inp.extra_findings)
@@ -253,6 +287,8 @@ def triage(inp: TriageInput) -> Report:
         rep.extend(differential(inp.endpoint, messages, inp.params, failing, alts=inp.alts,
                                 expect_lang=inp.expect_lang))
 
+    _reword_for_reasoning_loop(rep)
+
     # 6. known issues
     conds = set(inp.conditions)
     p = inp.params
@@ -271,6 +307,8 @@ def triage(inp: TriageInput) -> Report:
         conds.add("prefill_markup")
     if "REASONING_EXHAUSTED" in codes or any(c.startswith("DIFF_FLIP:thinking_off") for c in codes):
         conds.add("reasoning_exhausted")
+    if "REASONING_LOOP" in codes:
+        conds.add("reasoning_loop")
     if any(f.code == "TEMPLATE_MATCHES_UPSTREAM" for f in rep.findings):
         conds.add("template_verified")
     model = " ".join(x for x in (inp.model_name, inp.endpoint.model if inp.endpoint else "",
@@ -284,6 +322,9 @@ def triage(inp: TriageInput) -> Report:
     clean_static = not any(f.failed for f in rep.findings if f.layer in (Layer.FILE, Layer.CONFIG, Layer.REQUEST))
     rep.verdict = decide(rep.findings, full_precision_reference=_is_full_precision(spec, inp.model_dir)
                          and clean_static)
+    loop = _reasoning_loop_found(rep)
+    if loop is not None and isinstance(rep.verdict.get("next_steps"), list):
+        rep.verdict["next_steps"].append(_deep_hint(loop))
     return rep
 
 

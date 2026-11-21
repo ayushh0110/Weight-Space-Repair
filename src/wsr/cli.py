@@ -338,7 +338,12 @@ def _deep_opts(d: argparse.ArgumentParser) -> None:
     d.add_argument("--dtype", default="auto", choices=["auto", "float32", "bfloat16", "float16"],
                    help="auto: float32 where it fits (CPU, or a GPU with room), else bfloat16 / float16")
     d.add_argument("--device", default="auto", help="auto (CUDA when available, else the CPU), cpu, cuda, cuda:1 ..., mps (Apple GPU, opt-in: checked first)")
-    d.add_argument("--no-thinking", action="store_true", help="render the template with enable_thinking=false")
+    think = d.add_mutually_exclusive_group()
+    think.add_argument("--no-thinking", action="store_true", help="render the template with enable_thinking=false")
+    think.add_argument("--thinking", action="store_true",
+                       help="render the template with enable_thinking=true: models whose template thinks only when "
+                            "asked (Qwen3.5-0.8B) otherwise run without thinking, so a thinking-mode failure does "
+                            "not reproduce")
     d.add_argument("--base", help="base model directory, to measure how much fine-tuning changed the culprits")
     d.add_argument("--gguf", help="the quantised file in use: quantisation error of the implicated tensors")
     d.add_argument("--out", help="write the surgery hand-off package here")
@@ -1241,6 +1246,33 @@ def _need_torch() -> None:
         raise ValueError(f"deep triage needs torch and transformers ({e}); pip install 'wsr[deep]'") from e
 
 
+def _thinking_kwargs(args: argparse.Namespace) -> Optional[dict]:
+    """The template switch --thinking / --no-thinking ask for (None: the template's own default)."""
+    if getattr(args, "no_thinking", False):
+        return {"enable_thinking": False}
+    if getattr(args, "thinking", False):
+        return {"enable_thinking": True}
+    return None
+
+
+def _warn_if_switch_ignored(lm: Any, messages: list[dict], tk: Optional[dict]) -> bool:
+    """Render the prompt with and without the switch: identical means this template ignores it, and the flag
+    would change nothing without saying so. Returns True when it warned."""
+    if not tk or not getattr(lm.tok, "chat_template", None):
+        return False
+    try:
+        a = lm.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        b = lm.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **tk)
+    except Exception:   # a template that cannot render these messages fails later with its own error
+        return False
+    if a != b:
+        return False
+    flag = "--no-thinking" if tk.get("enable_thinking") is False else "--thinking"
+    print(f"warning: this model's chat template ignores enable_thinking, so {flag} changes nothing: the prompt "
+          "renders the same with and without it", file=sys.stderr)
+    return True
+
+
 def cmd_deep(args: argparse.Namespace) -> int:
     _need_torch()
     from .deep.lm import LM
@@ -1248,10 +1280,12 @@ def cmd_deep(args: argparse.Namespace) -> int:
 
     messages = _messages_arg(args)
     lm = LM.load(args.model_dir, dtype=args.dtype, device=args.device)
+    tk = _thinking_kwargs(args)
+    _warn_if_switch_ignored(lm, messages, tk)
     base = LM.load(args.base, dtype=args.dtype, device=args.device) if args.base else None
     res = diagnose(lm, messages, kind=args.kind, failing=tuple(args.failing), passing=tuple(args.passing),
                    expect_lang=args.expect_lang, max_new=args.max_new,
-                   template_kwargs={"enable_thinking": False} if args.no_thinking else None, base=base,
+                   template_kwargs=tk, base=base,
                    gguf=args.gguf, reference_dir=args.model_dir if args.gguf else None, known=not args.no_known,
                    probes=not args.no_probes,
                    out_dir=Path(args.out) if args.out else None)
@@ -1275,8 +1309,9 @@ def cmd_repair(args: argparse.Namespace) -> int:
     if (args.agent_only or args.resume) and not args.agent:
         raise ValueError("--agent-only and --resume are for the agent: add --agent")
     provider = _agent_provider(args) if args.agent and not args.check else None    # no SDK, key or model: now
-    tk = {"enable_thinking": False} if args.no_thinking else None
+    tk = _thinking_kwargs(args)
     lm = LM.load(args.model_dir, dtype=args.dtype, device=args.device)
+    _warn_if_switch_ignored(lm, messages, tk)
     res = diagnose(lm, messages, kind=args.kind, failing=tuple(args.failing), passing=tuple(args.passing),
                    expect_lang=args.expect_lang, max_new=args.max_new, template_kwargs=tk,
                    known=not args.no_known, probes=not args.no_probes, out_dir=out / "deep")

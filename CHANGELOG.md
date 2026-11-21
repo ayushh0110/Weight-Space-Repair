@@ -9,6 +9,34 @@ every release needs its own `## [x.y.z] - YYYY-MM-DD` heading here before it is 
 
 ## [Unreleased]
 
+### Added
+
+- **`REASONING_LOOP`**: triage now reads the reasoning channel (`reasoning_content`, Ollama `thinking`, Anthropic
+  thinking blocks) for loops, which the answer detectors never saw. It catches a block of up to 40 lines repeating
+  and a reasoning that keeps restating lines it wrote just before. It fails only when the loop cost the answer
+  (cap reached or no answer), and reports roughly where the loop starts. It is its own symptom group, so causes
+  about where the turn ends (stop tokens, EOS, BOS) cannot explain it. The detectors used by `wsr deep`,
+  `wsr program` and the agent's judge are unchanged.
+- **`wsr deep --thinking`** (and `wsr repair --thinking`): render the chat template with `enable_thinking=true`.
+  Without it, a model whose template thinks only when asked (Qwen3.5-0.8B) runs without thinking, so a
+  thinking-mode failure cannot reproduce. Both `--thinking` and `--no-thinking` now warn when the template renders
+  the same prompt with and without the switch.
+- A known issue for Qwen3.5-0.8B's thinking loops, from its model card.
+- **`DIFF_INCOMPLETE`**: when the time budget (`--budget`) runs out during the differential, triage says which
+  reruns did not finish, instead of dropping them silently.
+
+### Changed
+
+- When the reasoning loops, the `REASONING_EXHAUSTED` fix no longer says to raise `max_tokens` (a loop does not end
+  with more tokens); it says to turn thinking off or set a reasoning budget. The verdict adds a `wsr deep --thinking`
+  step with a `--max-new` sized from where the loop starts, and says when that is past the 4,096 tokens the repair
+  stage can judge.
+- The differential runs `thinking_off` first when the reasoning itself failed, and credits it, greedy, sampled,
+  neutral penalties and a shorter context with fixing a reasoning loop.
+- `SERVER_NO_BOS` is information, not a warning, for Qwen-family models, which use no BOS token by design. Before,
+  it could be offered as the cause of a loop or blank reply on every Qwen model served by llama-server.
+- The `detector:<group>` grader rejects `reasoning_loop`, which it cannot see.
+
 ## [0.1.0] - 2026-11-20
 
 The first release.

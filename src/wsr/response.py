@@ -302,6 +302,15 @@ def check_response(response: Any, *, max_tokens: Optional[int] = None, near_limi
                                     f"completion used {n.completion_tokens}/{max_tokens} tokens", Cause.REQUEST,
                                     raise_fix, **ev))
 
+    # The reasoning channel, judged on its own: a loop there never reaches the answer detectors.
+    if n.reasoning_text.strip():
+        from .output import check_reasoning
+
+        answered = bool(n.text.strip() or n.tool_calls)
+        cut = f in TRUNCATED_REASONS or nat in TRUNCATED_REASONS
+        out.extend(check_reasoning(n.reasoning_text, cut=cut, answered=answered,
+                                   reasoning_tokens=n.reasoning_tokens or (None if answered else n.completion_tokens)))
+
     # Input truncation: the server's own count is the signal (LLMDoctor).
     if sent_prompt_tokens and n.prompt_tokens is not None:
         ratio = n.prompt_tokens / sent_prompt_tokens

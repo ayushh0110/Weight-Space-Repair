@@ -41,8 +41,11 @@ def check_name(name: Optional[str]) -> None:
         _compiled(name.split(":", 1)[1])
     if head == "detector":
         g = name.split(":", 1)[1] if ":" in name else ""
-        if g != "any" and g not in GROUPS:
-            raise ValueError(f"detector grader needs a group: detector:any or one of {', '.join(sorted(GROUPS))}")
+        # reasoning_loop is triage-only: the grader classifies reasoning and answer as one text, where an
+        # answer loop shows as "loop", so a reasoning_loop grader would pass every reply.
+        groups = sorted(set(GROUPS) - {"reasoning_loop"})
+        if g != "any" and g not in groups:
+            raise ValueError(f"detector grader needs a group: detector:any or one of {', '.join(groups)}")
 
 
 def _compiled(pattern: str) -> "re.Pattern[str]":

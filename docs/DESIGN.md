@@ -61,6 +61,17 @@ Deterministic detectors for degenerate 200-OK output; every detector returns a
 | PROMPT_ECHO | share of output 5-word runs (12-char runs for CJK) found verbatim in prompt, abstain < 40 tokens | 0.6 |
 | AGENT_LOOP | exact cycle over agent-turn fingerprints | — |
 
+One detector of our own runs on the reasoning channel (`reasoning_content`, Ollama `thinking`, Anthropic thinking
+blocks), which the signals above never see. It is called from `response.check_response`, so triage and every
+differential rerun use it, and it is not part of `check_output`, so the classifiers of `wsr deep`, `wsr program`
+and the agent's judge are unchanged. Those already judge reasoning and answer as one text (the llama-server
+backend joins them on purpose; the PyTorch path decodes one stream, think tags included), where a reasoning loop
+at the end shows as `loop` when its period is short enough for TAIL_LOOP.
+
+| Signal | Algorithm | Default |
+|---|---|---|
+| REASONING_LOOP | last 120 non-empty lines, list markers stripped; the largest of (a) exact periodicity, block ≤ 40 lines repeating ≥ 3× to the end, and (b) recurrence: share of the long lines (≥ 15 chars) that repeat one of the 300 lines before, over the last 120 lines and over the last 40 alone (a loop that began just before the cap); at least 30 long lines to judge. Fails only when the reply hit the cap or has no answer; a loop the model escapes before answering is info. Onset: first 40-line stretch that is ≥ 80 % repeats with every later stretch ≥ 60 % | 0.6 |
+
 Plus presets (chat, strictJson, longForm, lenient) and threshold calibration at a
 target FPR from the user's own logs.
 
@@ -172,6 +183,7 @@ Added after live testing against llama-server (Gemma 4 E2B Q4_0, thinking on):
 | Image sent in an `images` field an OpenAI endpoint drops; model asks for the image | live finding | `media.check_media`, `IMAGE_NOT_SEEN`, differential `images_as_parts` |
 | image_url as a bare string, bad / cut base64, remote URL the server cannot fetch, no projector | live finding | `media.check_media`, `response` (`IMAGE_REJECTED`) |
 | Server accepts images but the model does not see them, or misreads them (mismatched mmproj) | live finding | `probes.vision` |
+| Thinking loops inside the reasoning until the cap, no answer (Qwen3.5-0.8B, MATH-500, the Sparks settings: 5 of 8 replies) | live finding | `output.check_reasoning` (`REASONING_LOOP`, own symptom group), differential `thinking_off` first |
 
 Two verdict rules came out of the live runs. A differential flip counts only
 if it reproduces (original fails again, variant passes again); otherwise it is

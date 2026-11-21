@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import string
 import time
 import urllib.error
@@ -111,6 +112,10 @@ class Endpoint:
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
         return urllib.request.urlopen(req, timeout=min(timeout or self.timeout, remaining))
+
+    def budget_spent(self, slack: float = 1.0) -> bool:
+        """The time budget for endpoint calls (--budget) is used up, or a call just ran into its end."""
+        return self._deadline - time.monotonic() <= slack
 
     def chat_stream(self, messages: list[dict], **params: Any) -> list[str]:
         """The raw stream lines (SSE or NDJSON); a dropped connection keeps what arrived."""
@@ -349,6 +354,11 @@ def probe_reasoning(ep: Endpoint) -> list[Finding]:
     return out
 
 
+# Families whose tokenizers add no BOS on purpose (tokenizer_config add_bos_token false). Matched on the
+# model name and the server's model path only, never the template: Llama fine-tunes use ChatML too.
+_NO_BOS_FAMILY = re.compile(r"qwen|qwq", re.I)
+
+
 def probe_bos(ep: Endpoint) -> list[Finding]:
     """llama-server: tokenise the rendered prompt exactly as the server does and count leading BOS."""
     if ep.detect_backend() != "llama-server":
@@ -377,6 +387,11 @@ def probe_bos(ep: Endpoint) -> list[Finding]:
                     Cause.CONFIG, "the template writes BOS and the tokenizer adds another: remove it from the "
                     "template, or set tokenizer.ggml.add_bos_token=false", source="troubleshooting guides")]
     if lead == 0:
+        name = f"{ep.model} {ep.props().get('model_path') or ''}"
+        if _NO_BOS_FAMILY.search(name):
+            # Qwen tokenizers add no BOS by design (add_bos_token false): nothing is missing.
+            return [_pf("SERVER_NO_BOS", Severity.INFO, f"the server's prompt has no {bos!r} at the start, as "
+                        "expected: Qwen-family models use no BOS token", source="troubleshooting guides")]
         return [_pf("SERVER_NO_BOS", Severity.WARN, f"the server's prompt has no {bos!r} at the start", Cause.CONFIG,
                     "most models need BOS: check tokenizer.ggml.add_bos_token and the template",
                     source="troubleshooting guides")]
@@ -814,14 +829,14 @@ def _variants(messages: list[dict], params: dict) -> list[tuple[str, Cause, list
         # Penalties also punish closing tokens already seen (``` , }, EOS): unclosed structure,
         # or an answer that stops after one item because every next token was used.
         v.append(("penalties_neutral", Cause.SAMPLING, messages, neutral, {"loop", "garbage", "language",
-                                                                          "structure", "blank"}))
+                                                                          "structure", "blank", "reasoning_loop"}))
     t = params.get("temperature")
     if t is None or t > 0:
         v.append(("greedy", Cause.SAMPLING, messages, dict(params, temperature=0, seed=0),
-                  {"loop", "garbage", "language"}))
+                  {"loop", "garbage", "language", "reasoning_loop"}))
     else:
         v.append(("sampled", Cause.SAMPLING, messages, dict(params, temperature=0.7, top_p=0.95, seed=1),
-                  {"loop"}))
+                  {"loop", "reasoning_loop"}))
     unconstrained = {k: x for k, x in params.items() if k not in ("response_format", "format", "grammar",
                                                                    "json_schema", "guided_json")}
     if unconstrained != params:
@@ -840,7 +855,8 @@ def _variants(messages: list[dict], params: dict) -> list[tuple[str, Cause, list
         last = short[-1]
         c = str(last.get("content", ""))
         last["content"] = c[: len(c) // 4] + "\n...\n" + c[-len(c) // 4:]
-        v.append(("shorter_context", Cause.REQUEST, short, params, {"loop", "blank", "language", "structure"}))
+        v.append(("shorter_context", Cause.REQUEST, short, params, {"loop", "blank", "language", "structure",
+                                                                    "reasoning_loop"}))
     return v
 
 
@@ -859,13 +875,20 @@ def differential(ep: Endpoint, messages: list[dict], params: dict, failing: set[
     off = ep.no_think_params()
     already_off = all(params.get(k) == v for k, v in off.items())
     if ep.reasoning is not False and not already_off:
-        runs.append(("thinking_off", Cause.REQUEST, ep, messages, {**params, **ep.no_think_params()},
-                     {"blank", "loop", "structure"}))
+        think = ("thinking_off", Cause.REQUEST, ep, messages, {**params, **ep.no_think_params()},
+                 {"blank", "loop", "structure", "reasoning_loop"})
+        # When the reasoning itself failed (looped, or used the whole budget), thinking off is the most telling
+        # rerun and the quickest one: run it first, before the budget goes on reruns that think for as long.
+        if failing & {"REASONING_LOOP", "REASONING_EXHAUSTED"}:
+            runs.insert(0, think)
+        else:
+            runs.append(think)
     moved = images_as_parts(messages, params) if ep.api != "ollama" else None
     if moved:
         runs.append(("images_as_parts", Cause.REQUEST, ep, moved[0], moved[1], {"vision", "blank", "refusal"}))
     for alt in alts or []:
         runs.append((f"alt:{alt.model}@{alt.url}", Cause.QUANTISATION, alt, messages, params, set(want)))
+    stopped: list[str] = []            # reruns the time budget cut off
     for name, cause, target, m, p, ex in runs:
         if not (ex & want):
             continue
@@ -873,6 +896,8 @@ def differential(ep: Endpoint, messages: list[dict], params: dict, failing: set[
             _, fs, text = run_and_classify(target, m, p, expect_lang=expect_lang)
         except EndpointError as e:
             out.append(_pf(f"DIFF_ERROR:{name}", Severity.SKIP, str(e)))
+            if target.budget_spent() or ep.budget_spent():
+                stopped.append(name)
             continue
         still = _groups_of(_failing(fs)) & want
         # A variant can fix one symptom and leave another (penalties off fixes
@@ -886,6 +911,8 @@ def differential(ep: Endpoint, messages: list[dict], params: dict, failing: set[
                 _, fs_again, _ = run_and_classify(target, m, p, expect_lang=expect_lang)
             except EndpointError as e:
                 out.append(_pf(f"DIFF_ERROR:{name}", Severity.SKIP, str(e)))
+                if target.budget_spent() or ep.budget_spent():
+                    stopped.append(f"{name} (its confirmation)")
                 continue
             if not (_groups_of(_failing(fs_orig)) & fixed) or _groups_of(_failing(fs_again)) & fixed:
                 out.append(_pf(f"DIFF_UNSTABLE:{name}", Severity.INFO,
@@ -900,6 +927,14 @@ def differential(ep: Endpoint, messages: list[dict], params: dict, failing: set[
         else:
             out.append(_pf(f"DIFF_SAME:{name}", Severity.INFO, f"'{name}': failure persists ({', '.join(sorted(still))})",
                            source="differential (product report)"))
+    if stopped:
+        # Each cut-off rerun is a SKIP above, which the report hides: say once, visibly, what did not run.
+        budgets = sorted({f"{e.budget_s:g}" for e in [ep, *(alts or [])]})
+        out.append(_pf("DIFF_INCOMPLETE", Severity.WARN,
+                       f"the differential stopped early: the time budget for endpoint calls ({' / '.join(budgets)} s) "
+                       f"ran out, so {len(stopped)} rerun(s) did not finish: {', '.join(stopped)}",
+                       fix="rerun with a larger --budget: each rerun can take as long as the failing reply did",
+                       source="differential (product report)", not_run=stopped))
     return out
 
 
