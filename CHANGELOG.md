@@ -13,7 +13,8 @@ every release needs its own `## [x.y.z] - YYYY-MM-DD` heading here before it is 
 
 - **`REASONING_LOOP`**: triage now reads the reasoning channel (`reasoning_content`, Ollama `thinking`, Anthropic
   thinking blocks) for loops, which the answer detectors never saw. It catches a block of up to 40 lines repeating
-  and a reasoning that keeps restating lines it wrote just before. It fails only when the loop cost the answer
+  and a reasoning that writes the same lines a third time and more (a draft copied out once does not count). It
+  fails only when the loop cost the answer
   (cap reached or no answer), and reports roughly where the loop starts. It is its own symptom group, so causes
   about where the turn ends (stop tokens, EOS, BOS) cannot explain it. The detectors used by `wsr deep`,
   `wsr program` and the agent's judge are unchanged.

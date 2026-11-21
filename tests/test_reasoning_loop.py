@@ -2,9 +2,10 @@
 
 Real traces (tests/data/reasoning_traces.json.gz, gzipped JSON): Qwen3.5-0.8B Q8_0 on llama-server, thinking on,
 top-p 0.95, top-k 20, presence penalty 1.5. Eight are the Sparks setting on MATH-500 (temperature 0.6, 32,768-token
-cap); the rest are GSM8K, IFEval, XSTest (safe prompts) and chat prompts at temperature 1.0 and 0.6 with an
-8,192-token cap. Each is labelled by reading it: a loop, healthy (finished, or hit the cap still working) or
-escaped (looped, then answered). Each keeps its last 150 lines, which is what the detector judges.
+cap); the rest are 40 GSM8K, IFEval, XSTest (safe prompts) and chat prompts, each at temperature 1.0 and at 0.6,
+with an 8,192-token cap. Each is labelled by reading it: a loop, healthy (finished, or hit the cap still working)
+or escaped (looped, then answered). Each keeps its last 420 lines: the 120-line window and the 300-line lookback
+the detector reads, so every score is the full reply's. Replies with too little reasoning to judge are left out.
 """
 import gzip
 import json
@@ -40,15 +41,29 @@ def _looping_reasoning(head=100, block=6, turns=30):
 # -- the detector -----------------------------------------------------------------------------------------
 
 def test_fixture_has_both_kinds():
-    assert len(LOOPS) >= 15 and len(HEALTHY) >= 25 and ESCAPED
+    assert len(LOOPS) >= 25 and len(HEALTHY) >= 50 and len(ESCAPED) >= 2
     assert {t["label"] for t in TRACES} == {"loop", "healthy", "escaped"}
 
 
 def test_the_late_loop_is_caught():
-    # c005: the loop began about 100 lines before the cap, too late to fill the 120-line window.
-    t = next(t for t in LOOPS if t["name"].endswith("c005"))
+    # The loop began about 100 lines before the cap, too late to fill the 120-line window.
+    t = next(t for t in TRACES if t["name"] == "gsm8k-t0.6-c005")
+    assert t["label"] == "loop"
     assert reasoning_loop_detail(t["reasoning"]).lines == 40
     assert check_reasoning(t["reasoning"], cut=True, answered=False)[0].severity == Severity.FAIL
+
+
+def test_a_copied_draft_is_not_a_loop():
+    # Real: the model hit the cap while copying its draft out as the final version, so every line appears twice.
+    t = next(t for t in TRACES if t["name"] == "ifeval-t1.0-c025")
+    assert t["label"] == "healthy" and t["finish"] == "length"
+    assert check_reasoning(t["reasoning"], cut=True, answered=False)[0].severity == Severity.PASS
+    draft = _unique_lines(60)
+    f, = check_reasoning("\n".join(draft + ["Final version:"] + draft) + "\n", cut=True, answered=False)
+    assert f.severity == Severity.PASS and f.score == 0
+    # A third pass over the same lines is a loop.
+    f, = check_reasoning("\n".join(draft + draft + draft) + "\n", cut=True, answered=False)
+    assert f.severity == Severity.FAIL
 
 
 @pytest.mark.parametrize("t", ESCAPED, ids=lambda t: t["name"])

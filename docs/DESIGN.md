@@ -70,7 +70,7 @@ at the end shows as `loop` when its period is short enough for TAIL_LOOP.
 
 | Signal | Algorithm | Default |
 |---|---|---|
-| REASONING_LOOP | last 120 non-empty lines, list markers stripped; the largest of (a) exact periodicity, block ≤ 40 lines repeating ≥ 3× to the end, and (b) recurrence: share of the long lines (≥ 15 chars) that repeat one of the 300 lines before, over the last 120 lines and over the last 40 alone (a loop that began just before the cap); at least 30 long lines to judge. Fails only when the reply hit the cap or has no answer; a loop the model escapes before answering is info. Onset: first 40-line stretch that is ≥ 80 % repeats with every later stretch ≥ 60 % | 0.6 |
+| REASONING_LOOP | last 120 non-empty lines, list markers stripped; the largest of (a) exact periodicity, block ≤ 40 lines repeating ≥ 3× to the end, and (b) recurrence: share of the long lines (≥ 15 chars) already written twice in the 300 lines before (a draft copied out once does not count), over the last 120 lines and over the last 40 alone (a loop that began just before the cap); at least 30 long lines to judge. Fails only when the reply hit the cap or has no answer; a loop the model escapes before answering is info. Onset: first 40-line stretch that is ≥ 80 % repeats with every later stretch ≥ 60 % | 0.55 |
 
 Plus presets (chat, strictJson, longForm, lenient) and threshold calibration at a
 target FPR from the user's own logs.

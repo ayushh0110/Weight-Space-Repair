@@ -240,8 +240,9 @@ def _tail_loop_inner(text: str, tail_words: int, max_period: int, min_repeats: i
 # the cap before it writes any answer. The answer detectors above never see that
 # text. Reasoning loops are also longer than answer loops: a 15-line block
 # repeating, or two near-identical variants of one block taking turns, so the
-# test here is line recurrence (healthy reasoning rarely restates a long line it
-# wrote a little earlier) as well as an exact cycle of up to 40 lines.
+# test here is line recurrence (healthy reasoning rarely writes the same long line
+# a third time within a few hundred lines; copying a draft out once is healthy) as
+# well as an exact cycle of up to 40 lines.
 # check_output() does not use this, so the classifiers built on it (deep,
 # program, the agent's judge) are unchanged.
 
@@ -264,7 +265,9 @@ RL_LOOKBACK = 300       # how far back a recent line may find its earlier copy
 RL_MIN_LONG = 15        # characters: short lines ("Wait.", "Hmm.") recur in healthy reasoning too
 RL_MIN_LINES = 30       # fewer recent long lines than this: too little to judge
 RL_MAX_LINES = 4000     # bound the work on a very long trace
-RL_THRESHOLD = 0.6
+# Set on 81 labelled Qwen3.5-0.8B replies (tests/data/reasoning_traces.json.gz holds them): the 25 loops score
+# 0.66-1.0 and the healthy replies that hit the cap at most 0.41, so the threshold sits between the two.
+RL_THRESHOLD = 0.55
 
 
 def _rl_lines(text: str) -> list[tuple[int, str]]:
@@ -309,18 +312,23 @@ def _rl_onset(long_lines: list[tuple[int, str]], block: int = 40, start_share: f
 
 
 def _rl_recurrence(lines: list[tuple[int, str]], size: int) -> tuple[Optional[float], dict[str, int]]:
-    """Share of the long lines among the last `size` lines that repeat a line written in the RL_LOOKBACK lines
-    before them (None: fewer than RL_MIN_LINES long lines to judge), and how often each long line appears."""
+    """Share of the long lines among the last `size` lines that the reasoning has already written twice in the
+    RL_LOOKBACK lines before them (None: fewer than RL_MIN_LINES long lines to judge), and how often each long
+    line appears in the window. Twice, not once: a draft copied out as the final version repeats every line once,
+    which is healthy; a loop says the same thing a third time and more."""
     first = max(0, len(lines) - size)
-    seen = {s for _, s in lines[max(0, first - RL_LOOKBACK):first] if len(s) >= RL_MIN_LONG}
+    seen: dict[str, int] = {}
+    for _, s in lines[max(0, first - RL_LOOKBACK):first]:
+        if len(s) >= RL_MIN_LONG:
+            seen[s] = seen.get(s, 0) + 1
     hits = total = 0
     counts: dict[str, int] = {}
     for _, s in lines[first:]:
         if len(s) < RL_MIN_LONG:
             continue
         total += 1
-        hits += s in seen
-        seen.add(s)
+        hits += seen.get(s, 0) >= 2
+        seen[s] = seen.get(s, 0) + 1
         counts[s] = counts.get(s, 0) + 1
     return (hits / total if total >= RL_MIN_LINES else None), counts
 

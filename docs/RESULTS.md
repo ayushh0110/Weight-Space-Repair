@@ -143,23 +143,31 @@ says to turn thinking off.
 Live, `wsr triage --differential` on problem 5 of these 8 (same settings, a 12,288-token cap so each rerun takes
 about 2 minutes; one llama-server slot; 29 minutes in all): the reply loops from about token 9,100, and the verdict
 is REQUEST from `DIFF_FLIP:thinking_off`: turning only thinking off removes both the blank reply and the loop, and
-the flip reproduces. Greedy decoding, neutral penalties and the prompt cache off all loop again, so it is not the
-sampling. `SERVER_NO_BOS` no longer warns on this Qwen model.
+the flip reproduces. Greedy decoding, neutral penalties and the prompt cache off all loop again: removing the
+presence penalty does not help, and greedy is the low-temperature end, which loops the most (below).
+`SERVER_NO_BOS` no longer warns on this Qwen model.
 
-To set the detector, 40 more replies with the same sampling and an 8,192-token cap: 16 GSM8K, 12 IFEval,
-8 XSTest safe prompts and 4 chat prompts, alternating temperature 1.0 (the model card's thinking setting) and 0.6,
-so each temperature saw a different 20 of the same mix. Each reply was labelled by reading it:
+Temperature, paired: 40 more prompts (16 GSM8K, 12 IFEval, 8 XSTest safe prompts, 4 chat prompts), each run at
+temperature 1.0 and at 0.6 with everything else the same (top-p 0.95, top-k 20, presence penalty 1.5, an 8,192-token
+cap, the same seed). 1.0 with these settings is the model card's thinking-mode recommendation for text; 0.6 is what
+the Sparks runs used, and what the card used for its own thinking-mode benchmarks. Each reply labelled by reading
+it:
 
-| temperature | replies | hit the cap | loops | looped, then answered |
-|---|---|---|---|---|
-| 1.0 | 20 | 8 | 0 | 0 |
-| 0.6 | 20 | 13 | 11 | 1 |
+| | temperature 1.0 | temperature 0.6 | only at 0.6 | only at 1.0 | exact sign test |
+|---|---|---|---|---|---|
+| looped until the cap | 0 of 40 | 20 of 40 | 20 | 0 | p = 2e-6 |
+| hit the cap (looping or still working) | 18 | 25 | 9 | 2 | p = 0.07 |
+| answered | 23 | 15 | 2 | 10 | p = 0.04 |
 
-On all 16 loops and 27 healthy traces (4 replies had too little reasoning to judge), loops score 0.86 to 1.0 and
-healthy reasoning at most 0.33, against a threshold of 0.6; the traces are the test fixture. Not a replication of
-the Sparks numbers: a different runtime and quantisation, 8 problems, one sample, and the temperature split is
-across different prompts, not paired. The model card warns that the 0.8B "is more prone to entering thinking loops"
-in thinking mode and runs it without thinking by default.
+Two more replies looped and then answered (one at each temperature). At 1.0 the cap is still hit 18 times, by
+reasoning that is still working, so 1.0 does not make the 8,192-token budget enough; it stops the loops.
+
+The detector, on all 81 labelled replies with enough reasoning to judge (the test fixture): the 25 loops score 0.66
+to 1.0, the healthy replies that hit the cap at most 0.41 (one that was copying its draft out as the final
+version), and the threshold is 0.55. A line counts as repeated from its third appearance, so a draft copied out
+once does not. Not a replication of the Sparks numbers: a different runtime and quantisation, one sample per prompt,
+40 prompts. The model card warns that the 0.8B "is more prone to entering thinking loops" in thinking mode and runs
+it without thinking by default.
 
 ### Partly proven
 

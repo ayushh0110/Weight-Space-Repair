@@ -49,8 +49,8 @@ Known limits:
   the request, and replies under 25 words are not judged. `--expect-script` checks the writing system instead.
 - `--scan-values` (NaN / Inf in safetensors weights) needs numpy; without it the scan is reported as skipped.
 - **Reasoning loops are calibrated on one model.** `REASONING_LOOP` was set on Qwen3.5-0.8B traces only (math,
-  instruction and chat prompts, 16 loops and 27 healthy traces; loops score 0.86-1.0, healthy reasoning at most
-  0.33, threshold 0.6). It
+  instruction and chat prompts: 25 loops and 54 healthy replies; loops score 0.66-1.0, healthy replies that hit
+  the cap at most 0.41, threshold 0.55). It
   compares whole lines, so reasoning written without line breaks is not judged, and a loop whose lines change
   every turn (a counter, a new number each time) can pass as fresh text. Where the loop starts is an estimate
   from the line it repeats, give or take a few lines, and its token position uses the reply's own token count.
