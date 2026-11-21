@@ -140,6 +140,12 @@ at the cap. The loops start after about 2,300, 4,200, 6,400, 7,500 and 19,300 to
 triage said `REASONING_EXHAUSTED` with "raise max_tokens", which does not end a loop; it now names the loop and
 says to turn thinking off.
 
+Live, `wsr triage --differential` on problem 5 of these 8 (same settings, a 12,288-token cap so each rerun takes
+about 2 minutes; one llama-server slot; 29 minutes in all): the reply loops from about token 9,100, and the verdict
+is REQUEST from `DIFF_FLIP:thinking_off`: turning only thinking off removes both the blank reply and the loop, and
+the flip reproduces. Greedy decoding, neutral penalties and the prompt cache off all loop again, so it is not the
+sampling. `SERVER_NO_BOS` no longer warns on this Qwen model.
+
 To set the detector, 40 more replies with the same sampling and an 8,192-token cap: 16 GSM8K, 12 IFEval,
 8 XSTest safe prompts and 4 chat prompts, alternating temperature 1.0 (the model card's thinking setting) and 0.6,
 so each temperature saw a different 20 of the same mix. Each reply was labelled by reading it:

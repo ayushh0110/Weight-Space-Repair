@@ -333,6 +333,23 @@ def test_live_triage_blames_thinking_for_the_loop(fake_server):
     assert rep.verdict["verdict"] == "request"
     assert rep.verdict["primary"]["code"] == "DIFF_FLIP:thinking_off"
     assert not rep.verdict["unexplained_groups"]
+    # Found live: the flip's stock fix ended "or raise max_tokens", which a loop makes wrong.
+    assert "raise max_tokens" not in rep.verdict["primary"]["fix"]
+    assert "more tokens will not help" in rep.verdict["next_steps"][0]
+
+
+def test_a_thinking_off_flip_for_a_plain_blank_keeps_its_fix(fake_server):
+    from conftest import completion as c
+
+    def h(b):   # thinks past the cap without looping, answers with thinking off
+        if (b.get("chat_template_kwargs") or {}).get("enable_thinking") is False:
+            return c("196 has nine positive divisors.", "stop", completion_tokens=12)
+        return c("", "length", completion_tokens=b.get("max_tokens") or 500,
+                 reasoning_content="\n".join(_unique_lines(200)) + "\n")
+    rep = triage(TriageInput(endpoint=_ep(fake_server(h)), messages=MSGS, params=PARAMS, probes=[],
+                             run_differential=True))
+    assert rep.verdict["primary"]["code"] == "DIFF_FLIP:thinking_off"
+    assert "raise max_tokens" in rep.verdict["primary"]["fix"]
 
 
 def test_a_budget_that_runs_out_is_reported(fake_server):

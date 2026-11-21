@@ -117,6 +117,10 @@ def _reword_for_reasoning_loop(rep: Report) -> None:
             f.fix = ("raising max_tokens will not help, the reasoning loops: turn thinking off for this call "
                      "(chat_template_kwargs={'enable_thinking': false}; Ollama think=false) or set a reasoning "
                      "budget, then rerun to confirm")
+        elif f.code == "DIFF_FLIP:thinking_off" and "reasoning_loop" in f.evidence.get("explains", []):
+            f.fix = ("the reasoning loops, so more tokens will not help: turn thinking off for this call "
+                     "(chat_template_kwargs={'enable_thinking': false}; Ollama think=false), or set a reasoning "
+                     "budget if you need thinking")
 
 
 def _deep_hint(loop: Finding) -> str:

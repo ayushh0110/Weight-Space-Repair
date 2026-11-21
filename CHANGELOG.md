@@ -27,8 +27,8 @@ every release needs its own `## [x.y.z] - YYYY-MM-DD` heading here before it is 
 
 ### Changed
 
-- When the reasoning loops, the `REASONING_EXHAUSTED` fix no longer says to raise `max_tokens` (a loop does not end
-  with more tokens); it says to turn thinking off or set a reasoning budget. The verdict adds a `wsr deep --thinking`
+- When the reasoning loops, the `REASONING_EXHAUSTED` fix and the `thinking_off` flip's fix no longer say to raise
+  `max_tokens` (a loop does not end with more tokens); they say to turn thinking off or set a reasoning budget. The verdict adds a `wsr deep --thinking`
   step with a `--max-new` sized from where the loop starts, and says when that is past the 4,096 tokens the repair
   stage can judge.
 - The differential runs `thinking_off` first when the reasoning itself failed, and credits it, greedy, sampled,
