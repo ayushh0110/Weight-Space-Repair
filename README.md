@@ -21,10 +21,9 @@ data the fix never saw, and then once more on a fresh confirmation set.
 | where in the weights? | `wsr deep` | layer, head or neuron, tested against random controls | `deep` extra (torch) |
 | can it be fixed? | `wsr repair`, `wsr fix`, `wsr program` | a patch, steering or settings, or why there is none | `deep` extra (torch) |
 
-**status: beta, small models only.** deep diagnosis and `wsr program` with the agent are tested on models up to
-1.5B params, weight repair up to 1B (Qwen2.5-0.5B and 1.5B, Llama-3.2-1B, Qwen3.5-0.8B). every number here comes
-from one 4 GB GTX 1650 laptop. [LIMITATIONS.md](https://github.com/ayushh0110/Weight-Space-Repair/blob/main/docs/LIMITATIONS.md)
-lists what isn't tested.
+**status: beta.** tested on Qwen2.5-0.5B and 1.5B, Llama-3.2-1B and Qwen3.5-0.8B, and every number here was
+measured on one 4 GB GTX 1650 laptop. notes on scope are in
+[LIMITATIONS.md](https://github.com/ayushh0110/Weight-Space-Repair/blob/main/docs/LIMITATIONS.md)
 
 ## try it in a minute
 
