@@ -9,7 +9,7 @@ serving settings).
 import os as _os
 import sys as _sys
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # On a Mac, PyTorch's MPS backend lacks some ops (an SVD, for one); with this set they run on the CPU instead of
 # failing. PyTorch reads it when torch is first imported, so it is set here, before any wsr module imports torch,

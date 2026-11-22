@@ -9,6 +9,8 @@ every release needs its own `## [x.y.z] - YYYY-MM-DD` heading here before it is 
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-22
+
 ### Added
 
 - **`REASONING_LOOP`**: triage now reads the reasoning channel (`reasoning_content`, Ollama `thinking`, Anthropic
@@ -97,5 +99,6 @@ The first release.
 - Continuous integration: core tests on Linux, Windows and macOS with no optional dependencies, deep tests on CPU
   torch on Linux and macOS.
 
-[Unreleased]: https://github.com/ayushh0110/Weight-Space-Repair/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ayushh0110/Weight-Space-Repair/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ayushh0110/Weight-Space-Repair/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ayushh0110/Weight-Space-Repair/releases/tag/v0.1.0

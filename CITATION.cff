@@ -10,8 +10,8 @@ abstract: >-
 type: software
 authors:
   - given-names: Ayush
-version: 0.1.0
-date-released: 2026-11-20
+version: 0.1.1
+date-released: 2026-11-22
 license: MIT
 repository-code: "https://github.com/ayushh0110/Weight-Space-Repair"
 keywords:
