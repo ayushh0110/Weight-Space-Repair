@@ -141,9 +141,10 @@ _NOT_CORRUPTION = {"NO_WEIGHTS", "UPSTREAM_UNREACHABLE", "UPSTREAM_MISSING"}
 _UNEXPLAINED_HINT = {
     "vision": "vision: run `wsr probe --only vision` to check the server reads images at all",
     "template_leak": "template_leak: control tokens / extra turns with no template or EOS cause found",
-    "loop": "loop: no static cause; run `--differential` (greedy vs sampled, penalties, constraint, context)",
-    "reasoning_loop": "reasoning_loop: run `--differential` to see whether thinking off, greedy decoding or "
-                      "neutral penalties break the loop",
+    "loop": "loop: no static cause; run `--differential` (greedy, sampled or warmer, penalties, constraint, "
+            "context)",
+    "reasoning_loop": "reasoning_loop: run `--differential` to see whether thinking off, a warmer temperature, "
+                      "greedy decoding or neutral penalties break the loop",
     "garbage": "garbage: re-download the file, then compare backends (CPU vs GPU) and quants with --alt",
     "blank": "blank: check the reasoning parser and stop strings; run `wsr probe --only smoke,stop`",
     "language": "language: check that the system prompt survives (context size) and the template's system role",

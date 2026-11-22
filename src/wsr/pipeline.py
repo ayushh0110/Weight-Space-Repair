@@ -18,7 +18,7 @@ from .output import check_output
 from .media import check_media, content_text, has_images
 from .probes import (Endpoint, EndpointError, differential, is_penalised, penalty_ab, probe_determinism,
                      run_probes)
-from .request_checks import check_request
+from .request_checks import check_request, max_tokens_of, ollama_options
 from .response import check_response
 from .verdict import decide
 
@@ -71,7 +71,7 @@ def _prompt_tokens_estimate(messages: list[dict]) -> int:
 def _stop_string_cut(norm, params: dict) -> list[Finding]:
     from .output import truncation_score
 
-    stop = params.get("stop") or (params.get("options") or {}).get("stop")
+    stop = params.get("stop") or ollama_options(params).get("stop")
     if not stop or norm.finish_reason not in ("stop", "end_turn", "STOP") or norm.tool_calls:
         return []
     t = norm.text.strip()
@@ -126,7 +126,8 @@ def _reword_for_reasoning_loop(rep: Report) -> None:
 def _deep_hint(loop: Finding) -> str:
     n = loop.evidence.get("suggest_max_new")
     size = (f"--max-new {n}" if n else "a --max-new past the point where the reasoning starts to loop")
-    hint = (f"if you need thinking on and the loop survives greedy decoding and neutral penalties, reproduce it "
+    hint = (f"if you need thinking on and the loop survives greedy decoding, a warmer temperature and neutral "
+            f"penalties, reproduce it "
             f"in thinking mode: `wsr deep <model-dir> --messages <file> --kind loop --thinking {size}`. deep "
             "regenerates the reply from its start, many times, on PyTorch (often far slower than a server): "
             "expect hours, and a new run may loop at a different point or not at all")
@@ -230,11 +231,12 @@ def triage(inp: TriageInput) -> Report:
                                         cause=Cause.RUNTIME))
     text = ""
     if raw is not None:
-        max_tokens = inp.params.get("max_tokens") or (inp.params.get("options") or {}).get("num_predict")
+        opts = ollama_options(inp.params)
+        max_tokens = max_tokens_of(inp.params)
         sent = _prompt_tokens_estimate(messages) if messages else None
         norm, resp = check_response(raw, max_tokens=max_tokens, tools=inp.params.get("tools"),
                                     sent_prompt_tokens=sent if sent and sent > 500 else None,
-                                    context_window=(inp.params.get("options") or {}).get("num_ctx"))
+                                    context_window=opts.get("num_ctx"))
         rep.extend(resp)
         from .runtime_checks import check_context_shift
         rep.extend(check_context_shift(norm.prompt_tokens, norm.completion_tokens,
@@ -296,7 +298,7 @@ def triage(inp: TriageInput) -> Report:
     # 6. known issues
     conds = set(inp.conditions)
     p = inp.params
-    opts = p.get("options") or {}
+    opts = ollama_options(p)
     if any(k in p for k in ("format", "response_format", "grammar", "json_schema")):
         conds.add("constrained")
     if any(k in p or k in opts for k in ("repeat_penalty", "repetition_penalty", "frequency_penalty",
@@ -327,7 +329,11 @@ def triage(inp: TriageInput) -> Report:
     rep.verdict = decide(rep.findings, full_precision_reference=_is_full_precision(spec, inp.model_dir)
                          and clean_static)
     loop = _reasoning_loop_found(rep)
-    if loop is not None and isinstance(rep.verdict.get("next_steps"), list):
+    # A sampling setting that breaks the loop (greedy, warmer, neutral penalties) keeps thinking on: no need to
+    # reproduce it in the weights.
+    sampling_fix = any(f.code.startswith("DIFF_FLIP:") and f.cause == Cause.SAMPLING
+                       and "reasoning_loop" in f.evidence.get("explains", []) for f in rep.findings)
+    if loop is not None and not sampling_fix and isinstance(rep.verdict.get("next_steps"), list):
         rep.verdict["next_steps"].append(_deep_hint(loop))
     return rep
 

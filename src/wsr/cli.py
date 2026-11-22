@@ -61,15 +61,24 @@ def _read_json(path: str) -> Any:
     return _loads(_read_text(path), path)
 
 
+def _check_messages(m: Any, src: str) -> list[dict]:
+    """A messages array as the checks expect it: a non-empty list of objects, each with a role."""
+    if not isinstance(m, list) or not m:
+        raise ValueError(f"{src}: expected a messages array (or an object with one)")
+    for i, x in enumerate(m):
+        if not isinstance(x, dict) or not isinstance(x.get("role"), str):
+            raise ValueError(f"{src}: message {i} is not an object with a role, e.g. "
+                             '{"role": "user", "content": "..."}')
+    return m
+
+
 def _messages_arg(args: argparse.Namespace, *, required: bool = True) -> Optional[list[dict]]:
     """The failing conversation: --messages FILE (an array, or an object with "messages"), or --prompt with
     --system."""
     if getattr(args, "messages", None):
         m = _read_json(args.messages)
         m = m.get("messages") if isinstance(m, dict) else m
-        if not isinstance(m, list) or not m:
-            raise ValueError(f"{args.messages}: expected a messages array (or an object with one)")
-        return m
+        return _check_messages(m, args.messages)
     if getattr(args, "prompt", None):
         system = [{"role": "system", "content": args.system}] if getattr(args, "system", None) else []
         return system + [{"role": "user", "content": args.prompt}]
@@ -89,7 +98,12 @@ def _read_response(path: str) -> tuple[Any, list]:
 
 
 def _read_text(path: str) -> str:
-    return sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"{path}: not UTF-8 text") from None
 
 
 def _emit(rep: Report, args: argparse.Namespace) -> int:
@@ -183,14 +197,18 @@ def cmd_triage(args: argparse.Namespace) -> int:
     resp_raw, stream_fs = _read_response(args.response) if args.response else (None, [])
     messages = None
     if args.messages:
-        messages = _read_json(args.messages)
+        m = _read_json(args.messages)
+        m = m.get("messages") if isinstance(m, dict) else m
+        messages = _check_messages(m, args.messages) if m != [] else None   # []: a saved reply, no prompt
     elif args.prompt or args.prompt_file:
         prompt = args.prompt if args.prompt else _read_text(args.prompt_file)
         messages = ([{"role": "system", "content": args.system}] if args.system else []) + \
             [{"role": "user", "content": prompt}]
     params: dict[str, Any] = _read_json(args.request) if args.request else {}
+    if not isinstance(params, dict):
+        raise ValueError(f"{args.request}: expected a JSON object (the request body or its parameters)")
     if isinstance(params.get("messages"), list) and messages is None:
-        messages = params.pop("messages")
+        messages = _check_messages(params.pop("messages"), args.request)
     params.pop("model", None)
     params.pop("stream", None)
     for k in ("temperature", "max_tokens", "top_p", "repeat_penalty"):
@@ -1268,8 +1286,17 @@ def _warn_if_switch_ignored(lm: Any, messages: list[dict], tk: Optional[dict]) -
     if a != b:
         return False
     flag = "--no-thinking" if tk.get("enable_thinking") is False else "--thinking"
-    print(f"warning: this model's chat template ignores enable_thinking, so {flag} changes nothing: the prompt "
-          "renders the same with and without it", file=sys.stderr)
+    try:   # the opposite value: a template that honours the switch but already defaults to this one renders apart
+        c = lm.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                       **{k: not v if isinstance(v, bool) else v for k, v in tk.items()})
+    except Exception:
+        c = a
+    if c != a:
+        print(f"note: {flag} changes nothing here: this model's chat template already defaults to it",
+              file=sys.stderr)
+    else:
+        print(f"warning: this model's chat template ignores enable_thinking, so {flag} changes nothing: the "
+              "prompt renders the same with and without it", file=sys.stderr)
     return True
 
 

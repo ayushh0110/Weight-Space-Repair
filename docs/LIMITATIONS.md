@@ -59,6 +59,13 @@ Known limits:
   Sparks' loops start after 2,000 to 20,000 tokens. The repair stage judges at most 4,096 tokens, so it cannot
   yet test a fix for a loop that starts later. Starting deep from inside the failing reply would fix both; it is
   not built.
+- **The warmer rerun judges one prompt on two samples.** For a loop at a temperature from just above 0 to 0.8, the
+  differential reruns the request at temperature 1.0 and nothing else changed. A flip needs the warm reply to end
+  the loop twice (on the request's seed and the next one) while the original loops again, so it says this
+  prompt escapes at 1.0, not how often: a loop that comes and goes by chance can still pass. It does not run
+  when the request sets no temperature (the server's default is not known), above 0.8 (too close to 1.0 to tell
+  from a new sample), or when greedy decoding already breaks the loop. It tries 1.0 only, not the model card's
+  own settings, which triage does not read.
 
 ## Quantisation
 

@@ -60,7 +60,7 @@ def _int(v: Any) -> Optional[int]:
         return None
     if isinstance(v, int):
         return v
-    if isinstance(v, float) and v == int(v):
+    if isinstance(v, float) and v.is_integer():     # False for nan and inf, which int() cannot take
         return int(v)
     return None
 
@@ -77,9 +77,14 @@ def _text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(p if isinstance(p, str) else (p.get("text") or "") for p in content
+        return "".join(p if isinstance(p, str) else _text(p.get("text")) for p in content
                        if isinstance(p, (str, dict)) and (isinstance(p, str) or p.get("type", "text") == "text"))
     return ""
+
+
+def _obj(x: Any) -> dict:
+    """A sub-object of a response, or {} when a server or a saved file put something else there."""
+    return x if isinstance(x, dict) else {}
 
 
 def _as_dict(obj: Any) -> Optional[dict]:
@@ -120,10 +125,10 @@ def normalize(response: Any) -> NormalizedResponse:
             native = _norm(c["provider_specific_fields"].get("native_finish_reason"))
         calls = []
         for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            fn = _obj(_obj(tc).get("function"))
             calls.append({"name": fn.get("name"), "arguments": fn.get("arguments")})
         if msg.get("function_call"):
-            fc = msg["function_call"]
+            fc = _obj(msg["function_call"])
             calls.append({"name": fc.get("name"), "arguments": fc.get("arguments")})
         usage = d.get("usage") if isinstance(d.get("usage"), dict) else {}
         det = usage.get("completion_tokens_details")
@@ -148,12 +153,12 @@ def normalize(response: Any) -> NormalizedResponse:
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "text":
-                text.append(b.get("text") or "")
+                text.append(_text(b.get("text")))
             elif b.get("type") in ("thinking", "redacted_thinking"):
-                thinking.append(b.get("thinking") or "")
+                thinking.append(_text(b.get("thinking")))
             elif b.get("type") == "tool_use":
                 calls.append({"name": b.get("name"), "arguments": b.get("input")})
-        usage = d.get("usage") or {}
+        usage = _obj(d.get("usage"))
         return NormalizedResponse(
             "anthropic", text="".join(text), reasoning_text="".join(thinking),
             finish_reason=_norm(d.get("stop_reason")), tool_calls=calls,
@@ -163,24 +168,26 @@ def normalize(response: Any) -> NormalizedResponse:
 
     # Gemini generateContent
     if "candidates" in d or "promptFeedback" in d:
-        cands = d.get("candidates") or []
-        usage = d.get("usageMetadata") or {}
-        block = (d.get("promptFeedback") or {}).get("blockReason")
+        cands = d.get("candidates") if isinstance(d.get("candidates"), list) else []
+        usage = _obj(d.get("usageMetadata"))
+        block = _obj(d.get("promptFeedback")).get("blockReason")
         if not cands:
             return NormalizedResponse("gemini", finish_reason="safety" if block else None,
                                       native_finish_reason=_norm(block),
                                       prompt_tokens=_int(usage.get("promptTokenCount")),
                                       malformed=None if block else "no candidates")
-        c = cands[0]
+        c = _obj(cands[0])
         text, thinking, calls = [], [], []
-        for part in (c.get("content") or {}).get("parts") or []:
+        for part in _obj(c.get("content")).get("parts") or []:
+            if not isinstance(part, dict):
+                continue
             if "functionCall" in part:
-                fc = part["functionCall"]
+                fc = _obj(part["functionCall"])
                 calls.append({"name": fc.get("name"), "arguments": fc.get("args")})
             elif part.get("thought"):
-                thinking.append(part.get("text") or "")
+                thinking.append(_text(part.get("text")))
             elif "text" in part:
-                text.append(part["text"])
+                text.append(_text(part["text"]))
         fr = _norm(c.get("finishReason"))
         return NormalizedResponse(
             "gemini", text="".join(text), reasoning_text="".join(thinking),
@@ -193,16 +200,16 @@ def normalize(response: Any) -> NormalizedResponse:
     # Ollama native /api/chat and /api/generate
     if "done" in d or "done_reason" in d or "prompt_eval_count" in d:
         msg = d.get("message") if isinstance(d.get("message"), dict) else {}
-        text = msg.get("content") if msg else d.get("response", "")
+        text = _text(msg.get("content")) if msg else _text(d.get("response"))
         calls = []
         for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function", {})
+            fn = _obj(_obj(tc).get("function"))
             calls.append({"name": fn.get("name"), "arguments": fn.get("arguments")})
         fr = _norm(d.get("done_reason"))
         if fr is None and d.get("done") is True:
             fr = "stop"
         return NormalizedResponse(
-            "ollama", text=text or "", reasoning_text=(msg.get("thinking") or d.get("thinking") or ""),
+            "ollama", text=text, reasoning_text=_text(msg.get("thinking")) or _text(d.get("thinking")),
             finish_reason=fr, tool_calls=calls,
             prompt_tokens=_int(d.get("prompt_eval_count")), completion_tokens=_int(d.get("eval_count")),
         )
@@ -221,6 +228,7 @@ def check_response(response: Any, *, max_tokens: Optional[int] = None, near_limi
                    context_window: Optional[int] = None, tools: Optional[Sequence[dict]] = None
                    ) -> tuple[NormalizedResponse, list[Finding]]:
     """Classify a response. Never raises."""
+    max_tokens = _int(max_tokens)        # a request can carry anything here; only a whole number is a cap
     n = normalize(response)
     out: list[Finding] = []
     ev = dict(provider=n.provider, finish_reason=n.finish_reason, native_finish_reason=n.native_finish_reason,

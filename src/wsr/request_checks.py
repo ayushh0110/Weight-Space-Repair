@@ -22,6 +22,17 @@ def _f(code: str, sev: Severity, msg: str, fix: Optional[str] = None, cause: Cau
                    evidence={k: v for k, v in ev.items() if v is not None})
 
 
+def ollama_options(params: dict) -> dict:
+    """Ollama's ``options`` object, or {} when it is missing or not an object."""
+    o = params.get("options")
+    return o if isinstance(o, dict) else {}
+
+
+def max_tokens_of(params: dict) -> Any:
+    """The reply cap a request sets: max_tokens, or Ollama's options.num_predict."""
+    return params.get("max_tokens") or ollama_options(params).get("num_predict")
+
+
 def flatten_params(req: dict) -> dict[str, Any]:
     """Merge top-level, Ollama ``options`` and alias names into one dict."""
     p: dict[str, Any] = {}

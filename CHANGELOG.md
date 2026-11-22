@@ -22,9 +22,15 @@ every release needs its own `## [x.y.z] - YYYY-MM-DD` heading here before it is 
   Without it, a model whose template thinks only when asked (Qwen3.5-0.8B) runs without thinking, so a
   thinking-mode failure cannot reproduce. Both `--thinking` and `--no-thinking` now warn when the template renders
   the same prompt with and without the switch.
-- A known issue for Qwen3.5-0.8B's thinking loops, from its model card.
+- A known issue for Qwen3.5-0.8B's thinking loops, from its model card, with wsr's paired measurement: on 40
+  prompts in thinking mode, temperature 0.6 looped until the cap 20 times and the card's 1.0 never.
 - **`DIFF_INCOMPLETE`**: when the time budget (`--budget`) runs out during the differential, triage says which
   reruns did not finish, instead of dropping them silently.
+- **A warmer rerun** in the differential (`warmer`): for a loop at temperature 0.8 or below, the same request at
+  temperature 1.0. Greedy decoding only tested the colder end, and Qwen3.5-0.8B's thinking loops go at 1.0. It
+  is a flip only when the warm reply ends the loop on two seeds while the original loops again, and it is not
+  counted when the reply fails another way instead (garbage, another language, a refusal: `DIFF_WORSE:warmer`).
+  It is skipped when greedy already breaks the loop, so the two never give opposite fixes.
 
 ### Changed
 
@@ -33,10 +39,23 @@ every release needs its own `## [x.y.z] - YYYY-MM-DD` heading here before it is 
   step with a `--max-new` sized from where the loop starts, and says when that is past the 4,096 tokens the repair
   stage can judge.
 - The differential runs `thinking_off` first when the reasoning itself failed, and credits it, greedy, sampled,
-  neutral penalties and a shorter context with fixing a reasoning loop.
+  neutral penalties and a shorter context with fixing a reasoning loop. When a sampling setting breaks the loop
+  with thinking on, the verdict no longer suggests reproducing it with `wsr deep`.
 - `SERVER_NO_BOS` is information, not a warning, for Qwen-family models, which use no BOS token by design. Before,
-  it could be offered as the cause of a loop or blank reply on every Qwen model served by llama-server.
+  it could be offered as the cause of a loop or blank reply on every Qwen model served by llama-server. DeepSeek's
+  Qwen distills keep the warning: their tokenizer adds a BOS.
 - The `detector:<group>` grader rejects `reasoning_loop`, which it cannot see.
+
+### Fixed
+
+- A reply or request with the wrong type in a field no longer crashes triage: a number or list where text belongs
+  (Ollama `thinking`, Anthropic and Gemini parts), `options` that is not an object, a temperature or `max_tokens`
+  given as text, NaN. The field is ignored or read as text. A `--messages` or `--request` file that is not the
+  right shape, or not UTF-8, fails with its name and exit code 2 instead of a traceback.
+- `--no-thinking` on a template that already defaults to no thinking (Qwen3.5-0.8B) no longer says the template
+  ignores the switch.
+- The stream probe stops at `--budget`. The socket timeout only fires on silence, so a server that kept sending
+  could run past the budget; the probe is now skipped instead.
 
 ## [0.1.0] - 2026-11-20
 

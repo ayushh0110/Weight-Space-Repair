@@ -265,6 +265,8 @@ RL_LOOKBACK = 300       # how far back a recent line may find its earlier copy
 RL_MIN_LONG = 15        # characters: short lines ("Wait.", "Hmm.") recur in healthy reasoning too
 RL_MIN_LINES = 30       # fewer recent long lines than this: too little to judge
 RL_MAX_LINES = 4000     # bound the work on a very long trace
+RL_TURN_GUESS = 20      # lines in one turn of a loop with no exact period: a rough size, used only for
+                        # suggest_max_new, which adds at least 1,000 tokens and rounds up to whole thousands
 # Set on 81 labelled Qwen3.5-0.8B replies (tests/data/reasoning_traces.json.gz holds them): the 25 loops score
 # 0.66-1.0 and the healthy replies that hit the cap at most 0.41, so the threshold sits between the two.
 RL_THRESHOLD = 0.55
@@ -354,7 +356,7 @@ def reasoning_loop_detail(text: str) -> ReasoningLoop:
         if onset is None and cyc.period:
             onset = window[len(window) - cyc.repeats * cyc.period][0]
         res.onset_char = onset
-        k = cyc.period if res.mode == "cycle" and cyc.period else 20
+        k = cyc.period if res.mode == "cycle" and cyc.period else RL_TURN_GUESS
         tail = window[-k:]
         res.block_chars = len(text) - tail[0][0] if tail else 0
     return res

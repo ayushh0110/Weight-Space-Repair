@@ -7,6 +7,11 @@ How each part was built is in [DESIGN.md](DESIGN.md); what is not tested is in [
 
 - **Triage and deep diagnosis** name the cause of 15 failure types against a known answer: a live server, a bug
   planted in real weights, or a real failure with a control that rules out chance.
+- **Reasoning loops, at the Sparks settings.** Qwen3.5-0.8B with thinking on at temperature 0.6 loops inside its
+  reasoning until the cap on 5 of the first 8 MATH-500 problems, and on 20 of 40 other prompts, against 0 of 40 at
+  temperature 1.0, the model card's thinking setting (p = 2e-6). Triage now reads the reasoning for loops
+  (`REASONING_LOOP`: the 25 loops and 54 healthy replies it was set on do not overlap in score) and, live, traces
+  the loop to the thinking switch and to the temperature. One runtime and quantisation, one sample per prompt.
 - **Repair** fixed planted and real failures on Qwen2.5-0.5B and Llama-3.2-1B, and refused, with reasons, to ship
   fixes whose side effects were too large.
 - **Under the current acceptance rules** (an exact sign test, a minimum gain, a confirmation set evaluated once,
@@ -53,7 +58,7 @@ How each part was built is in [DESIGN.md](DESIGN.md); what is not tested is in [
 | Semantic canary | 32 deterministic items (arithmetic, units, sequences, comparisons, facts, instruction formats) with computed or hand-checked answers; only items the original gets right count; at most 1 may be lost |
 | Agents | Claude Opus 5.5 (through a test-only driver for the Kiro CLI, not part of wsr), Gemini 3.8 Flash (AI Studio's OpenAI-compatible endpoint), Nemotron 3 Ultra (OpenRouter free tier), Gemma 4 E2B (local, llama-server on the CPU) |
 | Hardware | GTX 1650 4 GB, CUDA 12.4, float32 by default (float16 for 1.5B), 15 GB RAM |
-| Automated tests | 484 passing, including regression tests built from real model replies |
+| Automated tests | 706 passing, including regression tests built from real model replies |
 
 ## Triage and deep diagnosis: proven against a known answer
 
@@ -146,6 +151,11 @@ is REQUEST from `DIFF_FLIP:thinking_off`: turning only thinking off removes both
 the flip reproduces. Greedy decoding, neutral penalties and the prompt cache off all loop again: removing the
 presence penalty does not help, and greedy is the low-temperature end, which loops the most (below).
 `SERVER_NO_BOS` no longer warns on this Qwen model.
+
+The `warmer` rerun, live on the same problem and request (the differential's code with its other reruns switched
+off): at temperature 1.0 the reasoning did not loop on seed 1004 or 1005, and at 0.6 the original looped again, so
+the verdict is `DIFF_FLIP:warmer` for the reasoning loop. The blank reply remains: at 1.0 both replies still ran to
+the 12,288-token cap without an answer. The detector judged both warm replies; they were not read by hand.
 
 Temperature, paired: 40 more prompts (16 GSM8K, 12 IFEval, 8 XSTest safe prompts, 4 chat prompts), each run at
 temperature 1.0 and at 0.6 with everything else the same (top-p 0.95, top-k 20, presence penalty 1.5, an 8,192-token

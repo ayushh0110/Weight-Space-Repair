@@ -277,6 +277,9 @@ def test_qwen35_08b_known_issue_explains_the_loop():
     codes = {f.code for f in rep.findings}
     assert "KNOWN_ISSUE:qwen35-0.8b-thinking-loops" in codes
     assert not rep.verdict["unexplained_groups"]
+    for name in ("qwen3.5:0.8b", "unsloth/Qwen3.5-0.8B-GGUF"):        # Ollama's tag, a GGUF repo
+        assert "KNOWN_ISSUE:qwen35-0.8b-thinking-loops" in {f.code for f in _offline(
+            LOOPS[0]["reasoning"], model_name=name).findings}
     assert "KNOWN_ISSUE:qwen35-0.8b-thinking-loops" not in {f.code for f in _offline(
         LOOPS[0]["reasoning"], model_name="Qwen3.5-9B").findings}
 
@@ -382,6 +385,198 @@ def test_no_budget_line_when_everything_ran(fake_server):
     assert not any(f.code == "DIFF_INCOMPLETE" for f in out)
 
 
+# -- the warmer rerun ------------------------------------------------------------------------------------
+
+SOUP = "}{][#@$%^&*~|<>" * 40          # SYMBOL_SOUP: garbage
+
+
+def _looping():
+    return completion("", "length", completion_tokens=8000, reasoning_content=_looping_reasoning())
+
+
+def warm_server(at_1=None, thinking_off_fixes=False, greedy_fixes=False):
+    """Loops in its reasoning below temperature 1.0; at 1.0 it gives `at_1(body)` (an answer by default)."""
+    def h(b):
+        t = b.get("temperature")
+        if thinking_off_fixes and (b.get("chat_template_kwargs") or {}).get("enable_thinking") is False:
+            return completion("The answer is 9.", "stop", completion_tokens=40)
+        if greedy_fixes and t == 0:
+            return completion("196 = 2^2 * 7^2, so it has 3 * 3 = 9 divisors.", "stop", completion_tokens=40)
+        if t == 1.0:
+            return at_1(b) if at_1 else completion(
+                "196 = 2^2 * 7^2, so it has 3 * 3 = 9 divisors.", "stop", completion_tokens=900,
+                reasoning_content="\n".join(_unique_lines(80)) + "\n")
+        return _looping()
+    return h
+
+
+WARM_PARAMS = {**PARAMS, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5, "seed": 7}
+CAPPED = {"REASONING_LOOP", "REASONING_EXHAUSTED", "EMPTY"}
+
+
+def _no_thinking_switch(server):
+    e = _ep(server)
+    e.reasoning = False         # isolates the temperature: no thinking_off rerun
+    return e
+
+
+def _warm_calls(s):
+    return [c for c in s.calls if c.get("temperature") == 1.0]
+
+
+def test_a_warmer_temperature_that_ends_the_loop_is_a_flip(fake_server):
+    s = fake_server(warm_server())
+    out = differential(_no_thinking_switch(s), MSGS, WARM_PARAMS, CAPPED)
+    flip = next(f for f in out if f.code == "DIFF_FLIP:warmer")
+    assert flip.cause == Cause.SAMPLING and flip.severity == Severity.FAIL
+    assert set(flip.evidence["explains"]) == {"blank", "reasoning_loop"}
+    assert flip.evidence["temperature"] == [0.6, 1.0]
+    assert "0.6 to 1" in flip.message and "two samples" in flip.message
+    assert "temperature 1.0" in flip.fix and "raise max_tokens" not in flip.fix
+    # Only the temperature changes; the confirmation is a second sample (the next seed), not a replay.
+    first, again = _warm_calls(s)
+    original = next(c for c in s.calls if c.get("temperature") == 0.6 and "presence_penalty" in c)
+    assert {k: v for k, v in first.items() if k != "temperature"} == \
+        {k: v for k, v in original.items() if k != "temperature"}
+    assert first["seed"] == 7 and again["seed"] == 8
+
+
+def test_the_warmer_rerun_comes_right_after_greedy(fake_server):
+    s = fake_server(loop_server())          # only thinking off ends this loop
+    out = differential(_ep(s), MSGS, WARM_PARAMS, CAPPED)
+    temps = [c.get("temperature") for c in s.calls]
+    assert temps.index(1.0) == temps.index(0) + 1
+    assert any(f.code == "DIFF_SAME:warmer" for f in out)
+    assert s.calls[0]["chat_template_kwargs"] == {"enable_thinking": False}   # thinking_off still first
+
+
+@pytest.mark.parametrize("params", [
+    {k: v for k, v in WARM_PARAMS.items() if k != "temperature"},   # server default: unknown
+    {**WARM_PARAMS, "temperature": 0},                               # greedy: the "sampled" rerun covers it
+    {**WARM_PARAMS, "temperature": 0.9},                             # too close to 1.0 to tell from a resample
+    {**WARM_PARAMS, "temperature": 1.0},
+    {**WARM_PARAMS, "temperature": 1.3},
+    {**WARM_PARAMS, "temperature": True},
+])
+def test_no_warmer_rerun_outside_its_range(fake_server, params):
+    s = fake_server(warm_server())
+    out = differential(_no_thinking_switch(s), MSGS, params, CAPPED)
+    assert not any(":warmer" in f.code for f in out)
+    if params.get("temperature") != 1.0:
+        assert not _warm_calls(s)
+
+
+def test_no_warmer_rerun_without_a_loop(fake_server):
+    s = fake_server(lambda b: completion("I can't help with that.", "stop"))
+    differential(_no_thinking_switch(s), MSGS, WARM_PARAMS, {"EMPTY", "REFUSAL_TEXT"})
+    assert not _warm_calls(s)
+
+
+def test_no_warmer_rerun_when_greedy_already_breaks_the_loop(fake_server):
+    s = fake_server(warm_server(greedy_fixes=True))
+    out = differential(_no_thinking_switch(s), MSGS, WARM_PARAMS, CAPPED)
+    assert any(f.code == "DIFF_FLIP:greedy" for f in out)
+    assert not _warm_calls(s) and not any(":warmer" in f.code for f in out)
+
+
+def test_a_loop_traded_for_garbage_is_not_a_fix(fake_server):
+    s = fake_server(warm_server(at_1=lambda b: completion(SOUP, "stop", completion_tokens=300)))
+    out = differential(_no_thinking_switch(s), MSGS, WARM_PARAMS, CAPPED)
+    worse = next(f for f in out if f.code == "DIFF_WORSE:warmer")
+    assert worse.severity == Severity.INFO and "garbage" in worse.message
+    assert not any(f.code == "DIFF_FLIP:warmer" for f in out)
+    assert len(_warm_calls(s)) == 1                       # no confirmation spent on it
+
+
+def test_one_escape_at_the_warmer_temperature_is_not_a_cause(fake_server):
+    s = fake_server(warm_server(at_1=lambda b: completion("The answer is 9.", "stop", completion_tokens=40)
+                                if b.get("seed") == 7 else _looping()))
+    out = differential(_no_thinking_switch(s), MSGS, WARM_PARAMS, CAPPED)
+    un = next(f for f in out if f.code == "DIFF_UNSTABLE:warmer")
+    assert "second sample" in un.message
+    assert not any(f.code == "DIFF_FLIP:warmer" for f in out)
+
+
+def test_a_reply_the_cap_cuts_at_the_warmer_temperature_still_ends_the_loop(fake_server):
+    def cut(b):    # healthy reasoning, then an answer the cap cuts off
+        return completion("196 = 2^2 * 7^2, so the number of divisors is (2+1)(2+1), which", "length",
+                          completion_tokens=8000, reasoning_content="\n".join(_unique_lines(80)) + "\n")
+    out = differential(_no_thinking_switch(fake_server(warm_server(at_1=cut))), MSGS, WARM_PARAMS, CAPPED)
+    flip = next(f for f in out if f.code == "DIFF_FLIP:warmer")
+    assert "reasoning_loop" in flip.evidence["explains"]
+
+
+def test_a_loop_in_the_answer_gets_the_warmer_rerun_too(fake_server):
+    s = fake_server(lambda b: completion("Cats are popular pets around the world.", "stop") if
+                    b.get("temperature") == 1.0 else completion("x " * 300, "stop"))
+    out = differential(_no_thinking_switch(s), MSGS, {**WARM_PARAMS, "temperature": 0.7}, {"TAIL_LOOP"})
+    flip = next(f for f in out if f.code == "DIFF_FLIP:warmer")
+    assert flip.evidence["explains"] == ["loop"]
+
+
+def test_live_triage_names_the_temperature_when_only_it_ends_the_loop(fake_server):
+    s = fake_server(warm_server())
+    rep = triage(TriageInput(endpoint=_no_thinking_switch(s), messages=MSGS, params=WARM_PARAMS, probes=[],
+                             run_differential=True))
+    assert rep.verdict["verdict"] == "sampling"
+    assert rep.verdict["primary"]["code"] == "DIFF_FLIP:warmer"
+    assert not rep.verdict["unexplained_groups"]
+    assert "temperature 1.0" in rep.verdict["next_steps"][0]
+    assert "(0.6 to 1.0, two samples)" in rep.verdict["primary"]["message"]
+    # Thinking stays on at 1.0, so there is nothing to reproduce in the weights.
+    assert not any("wsr deep" in s for s in rep.verdict["next_steps"])
+
+
+def test_the_deep_step_stays_when_only_thinking_off_ends_the_loop(fake_server):
+    rep = triage(TriageInput(endpoint=_ep(fake_server(loop_server())), messages=MSGS, params=WARM_PARAMS,
+                             probes=[], run_differential=True))
+    assert rep.verdict["primary"]["code"] == "DIFF_FLIP:thinking_off"
+    assert "wsr deep" in rep.verdict["next_steps"][-1]
+
+
+def test_thinking_off_stays_primary_when_both_end_the_loop(fake_server):
+    s = fake_server(warm_server(thinking_off_fixes=True))
+    rep = triage(TriageInput(endpoint=_ep(s), messages=MSGS, params=WARM_PARAMS, probes=[], run_differential=True))
+    assert rep.verdict["primary"]["code"] == "DIFF_FLIP:thinking_off"
+    assert any(c["code"] == "DIFF_FLIP:warmer" for c in rep.verdict["contributing"])
+
+
+def test_the_warmer_rerun_reads_ollamas_options_temperature():
+    from wsr.probes import _warm_run
+    params = {"options": {"temperature": 0.6, "num_predict": 8000}}
+    name, _, p, _ = _warm_run(params, {"reasoning_loop"})
+    body = Endpoint("http://127.0.0.1:1", "qwen3.5:0.8b", api="ollama")._ollama_body(MSGS, p)
+    assert name == "warmer" and body["options"]["temperature"] == 1.0      # the top-level value wins
+    assert _warm_run({"options": {"temperature": 1.0}}, {"reasoning_loop"}) is None
+
+
+def test_the_second_sample_moves_an_ollama_options_seed_too():
+    from wsr.probes import _reseeded
+    p = _reseeded({"options": {"seed": 42, "temperature": 1.0}})
+    assert Endpoint("http://127.0.0.1:1", "m", api="ollama")._ollama_body(MSGS, p)["options"]["seed"] == 43
+    assert _reseeded({"seed": 7, "options": {"seed": 42}})["seed"] == 8        # the top-level seed is the one sent
+
+
+def test_an_ollama_body_survives_options_that_are_not_an_object():
+    body = Endpoint("http://127.0.0.1:1", "m", api="ollama")._ollama_body(MSGS, {"options": "x", "temperature": 0.6})
+    assert body["options"] == {"temperature": 0.6}
+
+
+def test_a_second_warm_sample_that_fails_another_way_says_so(fake_server):
+    s = fake_server(warm_server(at_1=lambda b: completion("The answer is 9.", "stop", completion_tokens=40)
+                                if b.get("seed") == 7 else completion(SOUP, "stop", completion_tokens=300)))
+    un = next(f for f in differential(_no_thinking_switch(s), MSGS, WARM_PARAMS, CAPPED)
+              if f.code == "DIFF_UNSTABLE:warmer")
+    assert "failed another way (garbage)" in un.message and "looped again" not in un.message
+
+
+@pytest.mark.parametrize("seed, want", [(7, 8), (0, 1), (1004.0, 1005), (-1, -1), (None, None), (True, True)])
+def test_the_second_sample_moves_to_the_next_seed(seed, want):
+    from wsr.probes import _reseeded
+    p = {"temperature": 1.0} if seed is None else {"temperature": 1.0, "seed": seed}
+    assert _reseeded(p).get("seed") == want
+
+
 # -- the BOS probe ---------------------------------------------------------------------------------------
 
 class _BosEndpoint(Endpoint):
@@ -408,8 +603,11 @@ def test_no_bos_is_expected_on_qwen(model, path):
     assert f.code == "SERVER_NO_BOS" and f.severity == Severity.INFO and not f.failed
 
 
-def test_no_bos_still_warns_on_other_models():
-    f, = probe_bos(_BosEndpoint("llama-3.2-1b", 0, "/models/Llama-3.2-1B.gguf"))
+@pytest.mark.parametrize("model,path", [("llama-3.2-1b", "/models/Llama-3.2-1B.gguf"),
+                                        ("DeepSeek-R1-Distill-Qwen-1.5B", ""),     # DeepSeek's tokenizer: a BOS
+                                        ("local", "/models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf")])
+def test_no_bos_still_warns_on_other_models(model, path):
+    f, = probe_bos(_BosEndpoint(model, 0, path))
     assert f.code == "SERVER_NO_BOS" and f.severity == Severity.WARN and f.cause == Cause.CONFIG
 
 
@@ -462,6 +660,15 @@ def test_a_template_that_ignores_the_switch_is_reported(capsys):
     assert _warn_if_switch_ignored(_LM(_Tok(honours=False)), msgs, {"enable_thinking": False})
     assert "--no-thinking changes nothing" in capsys.readouterr().err
     assert not _warn_if_switch_ignored(_LM(_Tok(honours=False)), msgs, None)
+
+
+def test_a_flag_that_matches_the_templates_default_is_not_called_ignored(capsys):
+    from wsr.cli import _warn_if_switch_ignored
+    # _Tok(honours=True) thinks only when asked, like Qwen3.5-0.8B: --no-thinking is already its default.
+    assert _warn_if_switch_ignored(_LM(_Tok(honours=True)), [{"role": "user", "content": "hi"}],
+                                   {"enable_thinking": False})
+    err = capsys.readouterr().err
+    assert "already defaults to it" in err and "ignores" not in err
 
 
 def test_the_real_qwen35_template_honours_thinking():

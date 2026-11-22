@@ -48,6 +48,7 @@ from typing import Any, Callable, Optional
 from .findings import Cause, Finding, Layer, Severity
 from .media import content_text, has_images, images_as_parts
 from .output import check_output
+from .request_checks import max_tokens_of, ollama_options
 from .response import check_response, normalize
 
 
@@ -131,6 +132,10 @@ class Endpoint:
             with self._open("POST", path, body, None) as r:
                 for raw in r:
                     lines.append(raw.decode("utf-8", "replace"))
+                    # The socket timeout only fires on silence: a stream that keeps sending would run past
+                    # --budget. Stop at the deadline; the probe is skipped, not reported as a cut stream.
+                    if time.monotonic() > self._deadline:
+                        raise EndpointError(f"POST {path} (stream): the time budget ran out mid-stream")
         except urllib.error.HTTPError as e:
             return ["data: " + (e.read().decode("utf-8", "replace") or json.dumps({"error": {"code": e.code}}))]
         except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -152,7 +157,8 @@ class Endpoint:
 
     def _ollama_body(self, messages: list[dict], params: dict) -> dict:
         params = dict(params)
-        opts = dict(params.pop("options", {}) or {})
+        opts = dict(ollama_options(params))
+        params.pop("options", None)
         for k in ("temperature", "top_p", "top_k", "min_p", "seed", "repeat_penalty", "num_ctx", "stop"):
             if k in params:
                 opts[k] = params.pop(k)
@@ -239,7 +245,7 @@ _PENALTY_KEYS = ("repeat_penalty", "repetition_penalty", "frequency_penalty", "p
 
 def is_penalised(params: dict) -> bool:
     """A repetition penalty strong enough to distort the reply (llama.cpp / OpenAI / Ollama spellings)."""
-    p = {**(params.get("options") or {}), **params}
+    p = {**ollama_options(params), **params}
     rp = p.get("repeat_penalty", p.get("repetition_penalty"))
     if isinstance(rp, (int, float)) and rp > 1.15:
         return True
@@ -258,7 +264,7 @@ def run_and_classify(ep: Endpoint, messages: list[dict], params: dict, *, expect
                      tools: Optional[list] = None, preset: str = "chat", echo: bool = False
                      ) -> tuple[Any, list[Finding], str]:
     raw, _ = ep.chat(messages, **dict(params))
-    max_tokens = params.get("max_tokens") or (params.get("options") or {}).get("num_predict")
+    max_tokens = max_tokens_of(params)
     n, resp = check_response(raw, max_tokens=max_tokens, tools=tools)
     out: list[Finding] = []
     if n.text.strip() or not n.tool_calls:
@@ -357,6 +363,7 @@ def probe_reasoning(ep: Endpoint) -> list[Finding]:
 # Families whose tokenizers add no BOS on purpose (tokenizer_config add_bos_token false). Matched on the
 # model name and the server's model path only, never the template: Llama fine-tunes use ChatML too.
 _NO_BOS_FAMILY = re.compile(r"qwen|qwq", re.I)
+_HAS_BOS_ANYWAY = re.compile(r"deepseek", re.I)   # DeepSeek-R1-Distill-Qwen: DeepSeek's tokenizer, which adds a BOS
 
 
 def probe_bos(ep: Endpoint) -> list[Finding]:
@@ -388,7 +395,7 @@ def probe_bos(ep: Endpoint) -> list[Finding]:
                     "template, or set tokenizer.ggml.add_bos_token=false", source="troubleshooting guides")]
     if lead == 0:
         name = f"{ep.model} {ep.props().get('model_path') or ''}"
-        if _NO_BOS_FAMILY.search(name):
+        if _NO_BOS_FAMILY.search(name) and not _HAS_BOS_ANYWAY.search(name):
             # Qwen tokenizers add no BOS by design (add_bos_token false): nothing is missing.
             return [_pf("SERVER_NO_BOS", Severity.INFO, f"the server's prompt has no {bos!r} at the start, as "
                         "expected: Qwen-family models use no BOS token", source="troubleshooting guides")]
@@ -821,6 +828,11 @@ def run_probes(ep: Endpoint, only: Optional[list[str]] = None) -> list[Finding]:
 
 # -- differential -----------------------------------------------------------------
 
+def _temperature(params: dict) -> Any:
+    """The request's temperature: top level, or in Ollama's options (a top-level value wins when sent)."""
+    return params["temperature"] if "temperature" in params else ollama_options(params).get("temperature")
+
+
 def _variants(messages: list[dict], params: dict) -> list[tuple[str, Cause, list[dict], dict, set[str]]]:
     """(factor, cause if it flips, messages, params, groups it can explain)."""
     v = []
@@ -830,8 +842,9 @@ def _variants(messages: list[dict], params: dict) -> list[tuple[str, Cause, list
         # or an answer that stops after one item because every next token was used.
         v.append(("penalties_neutral", Cause.SAMPLING, messages, neutral, {"loop", "garbage", "language",
                                                                           "structure", "blank", "reasoning_loop"}))
-    t = params.get("temperature")
-    if t is None or t > 0:
+    t = _temperature(params)
+    numeric = isinstance(t, (int, float)) and not isinstance(t, bool)
+    if not numeric or t > 0:        # none, or not a number, is the server's default: sampled
         v.append(("greedy", Cause.SAMPLING, messages, dict(params, temperature=0, seed=0),
                   {"loop", "garbage", "language", "reasoning_loop"}))
     else:
@@ -860,6 +873,38 @@ def _variants(messages: list[dict], params: dict) -> list[tuple[str, Cause, list
     return v
 
 
+# The warmer rerun. Too low a temperature can keep a model in a loop: Qwen3.5-0.8B in thinking mode looped until
+# the cap on 20 of 40 prompts at temperature 0.6 and on none at 1.0, its model card's thinking setting
+# (docs/RESULTS.md). Greedy decoding only tests the colder end.
+WARM_TEMPERATURE = 1.0
+WARM_FROM_AT_MOST = 0.8   # nearer to 1.0 the rerun is little more than a fresh sample of the same setting
+# A warmer reply may not fail in a new way: a loop traded for garbage, another language, a refusal, a loop in
+# the other channel or an empty reply is not a fix. A reply the cap cuts ("structure") is no worse than the loop.
+_WARM_MAY_ADD = {"structure"}
+
+
+def _warm_run(params: dict, want: set[str]) -> Optional[tuple[str, Cause, dict, set[str]]]:
+    """Only the temperature, raised to 1.0, when a loop fails at a temperature well below it."""
+    t = _temperature(params)
+    if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= WARM_FROM_AT_MOST:
+        return None   # greedy has its "sampled" rerun; with no temperature the server's default is unknown
+    ex = {"loop", "reasoning_loop"}
+    if "reasoning_loop" in want:
+        ex.add("blank")   # the loop used up the budget, so an answer at 1.0 ends the blank reply too
+    return ("warmer", Cause.SAMPLING, dict(params, temperature=WARM_TEMPERATURE), ex)
+
+
+def _reseeded(params: dict) -> dict:
+    """The same request on the next seed: a second, independent sample rather than a replay of the first.
+    The new seed goes at the top level, which wins over Ollama's options when the request is sent."""
+    s = params["seed"] if "seed" in params else ollama_options(params).get("seed")
+    if isinstance(s, float) and s.is_integer():
+        s = int(s)
+    if isinstance(s, int) and not isinstance(s, bool) and s >= 0:
+        return dict(params, seed=s + 1)
+    return params     # no seed (or a random one): every run is a new sample already
+
+
 def differential(ep: Endpoint, messages: list[dict], params: dict, failing: set[str], *,
                  alts: Optional[list[Endpoint]] = None, expect_lang: Optional[str] = None) -> list[Finding]:
     """Rerun flipping one factor at a time; report each factor that makes the failure disappear."""
@@ -870,6 +915,12 @@ def differential(ep: Endpoint, messages: list[dict], params: dict, failing: set[
         return []
     out: list[Finding] = []
     runs = [(name, cause, ep, m, p, ex) for name, cause, m, p, ex in _variants(messages, params)]
+    warm_run = _warm_run(params, want)
+    if warm_run:
+        # Right after greedy, so the two ends of the temperature range are tested together.
+        w_name, w_cause, w_params, w_ex = warm_run
+        at = next((i + 1 for i, r in enumerate(runs) if r[0] == "greedy"), len(runs))
+        runs.insert(at, (w_name, w_cause, ep, messages, w_params, w_ex))
     if ep.detect_backend() == "llama-server" and params.get("cache_prompt") is not False:
         runs.append(("cache_off", Cause.RUNTIME, ep, messages, {**params, "cache_prompt": False}, set(want)))
     off = ep.no_think_params()
@@ -889,9 +940,12 @@ def differential(ep: Endpoint, messages: list[dict], params: dict, failing: set[
     for alt in alts or []:
         runs.append((f"alt:{alt.model}@{alt.url}", Cause.QUANTISATION, alt, messages, params, set(want)))
     stopped: list[str] = []            # reruns the time budget cut off
+    flipped: set[str] = set()
     for name, cause, target, m, p, ex in runs:
         if not (ex & want):
             continue
+        if name == "warmer" and "greedy" in flipped:
+            continue   # greedy already breaks it: a warmer rerun could only add an opposite fix
         try:
             _, fs, text = run_and_classify(target, m, p, expect_lang=expect_lang)
         except EndpointError as e:
@@ -903,27 +957,54 @@ def differential(ep: Endpoint, messages: list[dict], params: dict, failing: set[
         # A variant can fix one symptom and leave another (penalties off fixes
         # the word salad, the reply still hits the cap): credit what it fixed.
         fixed = (want - still) & ex
+        warm = name == "warmer"
+        if fixed and warm:
+            worse = _groups_of(_failing(fs)) - want - _WARM_MAY_ADD
+            if worse:
+                out.append(_pf("DIFF_WORSE:warmer", Severity.INFO,
+                               f"'warmer' (temperature {_temperature(params):g} to {WARM_TEMPERATURE:.1f}) ends the "
+                               f"{', '.join(sorted(fixed))} failure, but the reply fails another way "
+                               f"({', '.join(sorted(worse))}): not a fix", source="differential (product report)"))
+                continue
         if fixed:
             # Confirm: one flaky run is not a cause. The original must fail again
-            # and the variant must pass again.
+            # and the variant must pass again. A sampled factor (temperature) is
+            # judged on a second sample, not a replay of the first.
+            again = _reseeded(p) if warm else p
             try:
                 _, fs_orig, _ = run_and_classify(ep, messages, params, expect_lang=expect_lang)
-                _, fs_again, _ = run_and_classify(target, m, p, expect_lang=expect_lang)
+                _, fs_again, _ = run_and_classify(target, m, again, expect_lang=expect_lang)
             except EndpointError as e:
                 out.append(_pf(f"DIFF_ERROR:{name}", Severity.SKIP, str(e)))
                 if target.budget_spent() or ep.budget_spent():
                     stopped.append(f"{name} (its confirmation)")
                 continue
-            if not (_groups_of(_failing(fs_orig)) & fixed) or _groups_of(_failing(fs_again)) & fixed:
+            again_groups = _groups_of(_failing(fs_again))
+            orig_failed = bool(_groups_of(_failing(fs_orig)) & fixed)
+            again_worse = again_groups - want - _WARM_MAY_ADD if warm else set()
+            if not orig_failed or again_groups & fixed or again_worse:
+                if not warm:
+                    why = "the failure comes and goes on its own (nondeterministic server or prompt cache)"
+                elif not orig_failed:
+                    why = "the original did not fail again, so the failure comes and goes on its own"
+                elif again_groups & fixed:
+                    why = "the second sample at the warmer temperature looped again: one escape is not a cause"
+                else:
+                    why = (f"the second sample at the warmer temperature ended it but failed another way "
+                           f"({', '.join(sorted(again_worse))})")
                 out.append(_pf(f"DIFF_UNSTABLE:{name}", Severity.INFO,
-                               f"'{name}' flipped once but did not reproduce: the failure comes and goes on its own "
-                               "(nondeterministic server or prompt cache)", source="differential (product report)"))
+                               f"'{name}' flipped once but did not reproduce: {why}",
+                               source="differential (product report)"))
                 continue
+            flipped.add(name)
             left = f"; {', '.join(sorted(still))} remains" if still else ""
+            what = (f"the temperature ({_temperature(params):g} to {WARM_TEMPERATURE:.1f}, two samples)" if warm
+                    else f"'{name}'")
             out.append(_pf(f"DIFF_FLIP:{name}", Severity.FAIL,
-                           f"changing only '{name}' makes the {', '.join(sorted(fixed))} failure disappear{left}",
+                           f"changing only {what} makes the {', '.join(sorted(fixed))} failure disappear{left}",
                            cause, _flip_fix(name), source="differential (product report)",
-                           explains=sorted(fixed), sample=text[:160]))
+                           explains=sorted(fixed), sample=text[:160],
+                           temperature=[_temperature(params), WARM_TEMPERATURE] if warm else None))
         else:
             out.append(_pf(f"DIFF_SAME:{name}", Severity.INFO, f"'{name}': failure persists ({', '.join(sorted(still))})",
                            source="differential (product report)"))
@@ -1012,6 +1093,8 @@ def _flip_fix(name: str) -> str:
         "penalties_neutral": "drop the repeat / frequency / presence penalties (use 1.0-1.05)",
         "greedy": "sampling settings cause it: lower temperature, check min_p / top_p",
         "sampled": "greedy loops but sampling escapes: use temperature 0.6-0.8 with DRY or a mild penalty",
+        "warmer": "the loop goes at temperature 1.0: raise the temperature (within the model card's recommended "
+                  "range) and check on a few prompts that the answers stay correct",
         "constraint_off": "constrained decoding causes it: relax the grammar / schema and validate afterwards",
         "system_prompt_off": "the system prompt causes it: check what it asks for (language, format, refusals); "
                              "if it asks for nothing like this, the template may mishandle the system role",

@@ -184,6 +184,7 @@ Added after live testing against llama-server (Gemma 4 E2B Q4_0, thinking on):
 | image_url as a bare string, bad / cut base64, remote URL the server cannot fetch, no projector | live finding | `media.check_media`, `response` (`IMAGE_REJECTED`) |
 | Server accepts images but the model does not see them, or misreads them (mismatched mmproj) | live finding | `probes.vision` |
 | Thinking loops inside the reasoning until the cap, no answer (Qwen3.5-0.8B, MATH-500, the Sparks settings: 5 of 8 replies) | live finding | `output.check_reasoning` (`REASONING_LOOP`, own symptom group), differential `thinking_off` first |
+| Too low a temperature keeps a loop going (Qwen3.5-0.8B thinking: 20 of 40 prompts loop until the cap at 0.6, none at 1.0) | paired live finding | differential `warmer` (temperature 1.0, right after `greedy`) |
 
 Two verdict rules came out of the live runs. A differential flip counts only
 if it reproduces (original fails again, variant passes again); otherwise it is
@@ -192,6 +193,22 @@ rerun is not a cause. A cause the response itself confirms (the reply
 starts with the request's prefill) ranks with a flip, above static hypotheses.
 And a variant that fixes one symptom but not another is credited with what it
 fixed (penalties off cures the word avoidance; the reply still hits the cap).
+
+The warmer rerun is held to more than that, because temperature changes what
+the model samples and not only how. It runs only for a loop at temperature
+0.8 or below (nearer to 1.0 it is little more than a new sample), changes
+nothing but the temperature, and is skipped when greedy already breaks the
+loop, so the verdict never says both "lower the temperature" and "raise it".
+Its confirmation is a second sample on the next seed, not a replay of the
+first, so on a deterministic server one lucky draw cannot confirm itself. A
+warm reply that ends the loop but fails another way (garbage, another
+language, a refusal, a loop in the other channel, an empty answer) is
+`DIFF_WORSE:warmer`, not a fix; a reply the cap cuts is no worse than the loop
+and does not count against it. When the warm reply to a reasoning loop also
+answers, it is credited with the blank reply too, since the loop used the
+budget. A flip for a
+sampling setting keeps thinking on, so the verdict then leaves out the
+`wsr deep --thinking` step.
 
 ### Why local recurrence, not TTR or Zipf
 

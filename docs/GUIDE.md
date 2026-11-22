@@ -55,13 +55,22 @@ explains the failure:
 | 1 File | safetensors and GGUF structure, truncated or partial downloads, shard index, NaN / Inf values (`--scan-values`), size and sha256 against the Hub (`--hash`, `--upstream`) |
 | 2 Config | chat template missing, failing or stale against upstream; EOS vs end-of-turn token; double BOS; tokenizer vs embedding size; low-bit quantisation; memory fit; GGUF pre-tokenizer, soft-capping, fp16 overflow risk; server launch flags (`--server-args`, Ollama's environment): KV-cache quantisation, flash attention, context split across slots, context shift, RoPE overrides |
 | 3 Request | penalties, temperature, min_p, stop strings, max_tokens, Ollama's context, constrained decoding; images: a dropped `images` field, malformed image parts, bad or cut base64, remote URLs, a server without vision |
-| 3 Response | finish reasons (OpenAI, Anthropic, Gemini, Ollama), reasoning that used up the budget, content filters, refusal fields, input truncation, tool-call schemas; SSE and NDJSON streams cut short or malformed |
+| 3 Response | finish reasons (OpenAI, Anthropic, Gemini, Ollama), reasoning that used up the budget, reasoning stuck in a loop (`REASONING_LOOP`: OpenAI `reasoning_content`, Ollama `thinking`, Anthropic thinking blocks), content filters, refusal fields, input truncation, tool-call schemas; SSE and NDJSON streams cut short or malformed |
 | 4 Output | empty, short, repetition and tail loops (word and CJK), low entropy, truncation, symbol soup, token salad, broken UTF-8, repetition avoidance under a penalty, control-token leaks, invented turns, reasoning leaks, refusal text (three readings: a refusal, a non-answer, or an answer, also behind a disclaimer), JSON and schema, script and language, prompt echo, agent loops |
 | 5 Probes | live checks of the server (below), and with `--differential` one-factor reruns: the failing request again with one thing changed at a time, each flip confirmed by a second run |
 | 6 Known issues | documented model and runtime bugs, matched on model, backend, conditions and symptoms (`src/wsr/known_issues.json`; add your own with `--known-issues`) |
 
 Probes (`--probes` or `wsr probe --only`): `reasoning`, `bos`, `smoke`, `stop`, `finish`, `tools`, `stream`,
 `vision`, `determinism`, `cache`, `context`, `concurrency`. The last four are slow and off unless named.
+
+**The differential** (`--differential`) reruns only what can explain the failing symptoms: neutral penalties,
+greedy decoding (or, for a greedy request, temperature 0.7), a warmer temperature, constrained decoding off, the
+system prompt, stop strings or the prefill removed, a shorter prompt, the prompt cache off, thinking off, images
+as content parts, and each `--alt` endpoint. A flip (`DIFF_FLIP`) counts only when the original fails again and
+the change passes again; otherwise it is `DIFF_UNSTABLE`. When the reasoning itself failed, thinking off runs
+first. The warmer rerun (`warmer`) is for a loop at temperature 0.8 or below: the same request at 1.0, confirmed
+on the next seed, skipped when greedy already breaks the loop, and `DIFF_WORSE:warmer` when the loop ends but the
+reply fails another way. If `--budget` runs out first, `DIFF_INCOMPLETE` lists the reruns that did not finish.
 
 **The verdict** names one cause with its evidence and the exact fix: `file`, `config`, `request`, `sampling`,
 `runtime`, `quantisation`, `provider` (a filter, a refusal field, a rate limit), `known_bug`, `weight_level`,
