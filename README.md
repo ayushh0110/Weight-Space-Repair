@@ -21,6 +21,11 @@ data the fix never saw, and then once more on a fresh confirmation set.
 | where in the weights? | `wsr deep` | layer, head or neuron, tested against random controls | `deep` extra (torch) |
 | can it be fixed? | `wsr repair`, `wsr fix`, `wsr program` | a patch, steering or settings, or why there is none | `deep` extra (torch) |
 
+real reply from the Sparks setup (Qwen3.5-0.8B, thinking on, temp 0.6, 32k cap) that ran to the cap with no answer.
+triage names the loop, where it starts and the fix, offline and no GPU
+
+![wsr triage on a Qwen3.5-0.8B reply looping inside its reasoning](https://raw.githubusercontent.com/ayushh0110/Weight-Space-Repair/main/docs/images/triage-reasoning-loop.png)
+
 **status: beta.** tested on Qwen2.5-0.5B and 1.5B, Llama-3.2-1B and Qwen3.5-0.8B, and every number here was
 measured on one 4 GB GTX 1650 laptop. notes on scope are in
 [LIMITATIONS.md](https://github.com/ayushh0110/Weight-Space-Repair/blob/main/docs/LIMITATIONS.md)
@@ -55,6 +60,12 @@ VERDICT: REQUEST
     - raise max_tokens (currently 256) or lower the reasoning effort / thinking budget
     - apply the fix and rerun `wsr triage` with the same prompt to confirm the flip
 ========================================================================
+```
+
+the reply in the picture above is in the repo too
+
+```bash
+wsr triage --response examples/reasoning_loop/response.json --request examples/reasoning_loop/request.json
 ```
 
 against your own server, with reruns that change one thing at a time to find what flips the failure
